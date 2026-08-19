@@ -1,0 +1,324 @@
+"""Shared contracts for agents, Session context, approval, and audit."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field, is_dataclass
+from enum import Enum
+from typing import Any
+
+
+class Route(str, Enum):
+    ISSUE = "ISSUE"
+    PULL_REQUEST = "PULL_REQUEST"
+    CI_DIAGNOSIS = "CI_DIAGNOSIS"
+    REPO_QA = "REPO_QA"
+    CODE_CHANGE = "CODE_CHANGE"
+
+
+class ApprovalIntent(str, Enum):
+    """The user's natural-language intent toward an open proposal."""
+
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
+    REVISE = "REVISE"
+    QUESTION = "QUESTION"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+class AccessLevel(str, Enum):
+    READ = "READ"
+    WRITE = "WRITE"
+    DESTRUCTIVE = "DESTRUCTIVE"
+
+
+class Recommendation(str, Enum):
+    APPROVE = "APPROVE"
+    REQUEST_CHANGES = "REQUEST_CHANGES"
+    NEEDS_HUMAN_REVIEW = "NEEDS_HUMAN_REVIEW"
+
+
+@dataclass(frozen=True)
+class SessionScope:
+    """Immutable ownership boundary for one live, session-aware service."""
+
+    account_key: str
+    repository_key: str
+    session_id: str
+
+
+@dataclass(frozen=True)
+class ResolvedReference:
+    """A repository entity resolved from the user's request and Session context."""
+
+    type: str
+    id: str
+
+
+@dataclass(frozen=True)
+class ContextMemory:
+    """A bounded Memory item selected for one agent invocation."""
+
+    memory_id: str
+    scope: str
+    kind: str
+    content: str
+
+
+@dataclass(frozen=True)
+class RoutingContext:
+    """Ephemeral, untrusted Session projection supplied to MainAgent/domain agents."""
+
+    scope: SessionScope
+    repository_full_name: str
+    working_state: dict[str, Any] = field(default_factory=dict)
+    summary: str = ""
+    history_units: tuple[dict[str, Any], ...] = ()
+    user_memories: tuple[ContextMemory, ...] = ()
+    repository_memories: tuple[ContextMemory, ...] = ()
+    selection_metadata: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class AgentGuidance:
+    """Validated, non-authoritative auxiliary data for a domain agent."""
+
+    user_memories: tuple[ContextMemory, ...] = ()
+    repository_memories: tuple[ContextMemory, ...] = ()
+    resolved_references: tuple[ResolvedReference, ...] = ()
+
+    @property
+    def empty(self) -> bool:
+        return not (self.user_memories or self.repository_memories or self.resolved_references)
+
+
+@dataclass(frozen=True)
+class RepositoryRef:
+    owner: str
+    name: str
+
+    @classmethod
+    def parse(cls, value: str) -> RepositoryRef:
+        cleaned = value.strip().removesuffix(".git").strip("/")
+        parts = cleaned.split("/")
+        if len(parts) != 2 or not all(parts):
+            raise ValueError("repository must be the unambiguous 'owner/name' form")
+        if any(part in {".", ".."} for part in parts):
+            raise ValueError("invalid repository")
+        return cls(*parts)
+
+    def __str__(self) -> str:
+        return f"{self.owner}/{self.name}"
+
+
+@dataclass(frozen=True)
+class MainDecision:
+    target_agent: str | None = None
+    entity_type: str | None = None
+    entity_id: str | None = None
+    request: str = ""
+    message: str = ""
+    clarify: bool = False
+    requested_fix: bool = False
+    requested_reply: bool = False
+
+
+@dataclass(frozen=True)
+class WorkflowTurnDecision:
+    """Classification of a user's natural-language turn on an open proposal."""
+
+    action: ApprovalIntent
+    instruction: str = ""
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class AgentSpec:
+    name: str
+    role: str
+    system_prompt: str
+    allowed_tools: frozenset[str]
+    output_schema: tuple[str, ...]
+    capabilities: frozenset[Route | str]
+    required_context: tuple[str, ...] = ()
+    routing_examples: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PlannedToolCall:
+    tool: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class VerificationCheck:
+    name: str
+    status: str
+    details: str
+    files: list[str] = field(default_factory=list)
+
+
+@dataclass
+class VerificationReport:
+    passed: bool
+    checks: list[VerificationCheck]
+    skipped: list[str] = field(default_factory=list)
+    attempts: int = 1
+
+
+@dataclass(frozen=True)
+class Replacement:
+    path: str
+    old: str
+    new: str
+
+
+@dataclass
+class ChangeRequest:
+    repository: str
+    description: str
+    base_branch: str = "main"
+    target_files: list[str] = field(default_factory=list)
+    replacements: list[Replacement] = field(default_factory=list)
+    proposed_files: dict[str, str] = field(default_factory=dict)
+    issue_number: int | None = None
+    suggested_title: str | None = None
+
+
+@dataclass
+class CandidatePatch:
+    summary: str
+    root_cause: str
+    changed_files: list[str]
+    patch: str
+    files: dict[str, str]
+    static_checks: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
+    verification_required: list[str] = field(default_factory=list)
+
+
+@dataclass
+class HumanReviewPackage:
+    change_summary: str
+    root_cause: str
+    files_changed: list[str]
+    important_diff: str
+    static_verification: VerificationReport
+    potential_risks: list[str]
+    suggested_pr_title: str
+    suggested_pr_description: str
+
+
+@dataclass
+class DraftResult:
+    entity_type: str
+    entity_id: str | None
+    title: str
+    body: str
+    note: str = ""
+
+
+@dataclass
+class RepoQAResult:
+    answer: str
+    files: list[str]
+    symbols: list[str]
+    reasoning: str
+
+
+@dataclass
+class PRReviewResult:
+    summary: str
+    important_changes: list[str]
+    risk_level: str
+    potential_issues: list[str]
+    test_assessment: str
+    recommendation: Recommendation
+
+
+@dataclass
+class CIDiagnosisResult:
+    failed_job: str
+    failure_summary: str
+    relevant_log: str
+    suspected_files: list[str]
+    probable_root_cause: str
+    suggested_fix: str
+    confidence: float
+
+
+class DomainAction(str, Enum):
+    ANSWER = "ANSWER"
+    CLARIFY = "CLARIFY"
+
+
+class IssueOperation(str, Enum):
+    LIST = "LIST"
+    GET = "GET"
+    SEARCH = "SEARCH"
+    SUMMARIZE = "SUMMARIZE"
+
+
+@dataclass(frozen=True)
+class IssueSummary:
+    number: int
+    title: str
+    state: str
+    labels: list[str]
+    author: str
+    updated_at: str
+    url: str
+
+
+@dataclass
+class IssueAgentResult:
+    action: DomainAction
+    operation: IssueOperation | None
+    answer: str
+    issues: list[IssueSummary]
+    issue_number: int | None = None
+    question: str = ""
+
+
+class PullRequestOperation(str, Enum):
+    LIST = "LIST"
+    GET = "GET"
+    SEARCH = "SEARCH"
+    SUMMARIZE = "SUMMARIZE"
+
+
+@dataclass(frozen=True)
+class PullRequestSummary:
+    number: int
+    title: str
+    state: str
+    author: str
+    head: str
+    base: str
+    draft: bool
+    updated_at: str
+    url: str
+
+
+@dataclass
+class PullRequestAgentResult:
+    action: DomainAction
+    operation: PullRequestOperation | None
+    answer: str
+    pull_requests: list[PullRequestSummary]
+    pr_number: int | None = None
+    requested_outcome: str | None = None
+    changed_files: list[str] = field(default_factory=list)
+    question: str = ""
+
+
+def to_plain(value: Any) -> Any:
+    """Convert dataclass/enum output to JSON-compatible builtins."""
+    if is_dataclass(value):
+        return to_plain(asdict(value))
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {key: to_plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [to_plain(item) for item in value]
+    return value
