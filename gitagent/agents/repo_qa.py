@@ -56,6 +56,9 @@ class RepoQAAgent:
             "repo_qa",
             session_id=session_id,
             operation=lambda context: self._answer(context, repository, question, guidance),
+            repository=repository,
+            goal=question,
+            guidance=guidance,
         )
 
     def _answer(

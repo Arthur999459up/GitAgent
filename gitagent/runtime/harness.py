@@ -139,14 +139,31 @@ class AgentHarness:
         *,
         session_id: str,
         operation: Callable[[AgentContext], T],
+        repository: str = "",
+        goal: str = "",
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        guidance: AgentGuidance | None = None,
     ) -> T:
-        context = self.context(agent_name, session_id)
+        context = self.context(
+            agent_name,
+            session_id,
+            repository=repository,
+            goal=goal,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            guidance=guidance,
+        )
         started = perf_counter()
         self.trace.emit(
             session_id=session_id,
             category=TraceCategory.AGENT,
             name=agent_name,
             status=TraceStatus.STARTED,
+            details={
+                "debug_event": "start",
+                "context": debug_context_snapshot(context),
+            },
         )
         try:
             result = operation(context)
@@ -158,6 +175,11 @@ class AgentHarness:
                 name=agent_name,
                 status=TraceStatus.FAILED,
                 message=str(exc),
+                details={
+                    "debug_event": "failed",
+                    "context": debug_context_snapshot(context),
+                    "error": debug_error_details(exc),
+                },
                 duration_ms=(perf_counter() - started) * 1000,
             )
             raise
@@ -166,7 +188,12 @@ class AgentHarness:
             category=TraceCategory.AGENT,
             name=agent_name,
             status=TraceStatus.COMPLETED,
-            details={"output_type": type(result).__name__},
+            details={
+                "debug_event": "completed",
+                "output_type": type(result).__name__,
+                "context": debug_context_snapshot(context),
+                "result": debug_value(result),
+            },
             duration_ms=(perf_counter() - started) * 1000,
         )
         return result
@@ -186,8 +213,10 @@ class AgentHarness:
             raise PermissionDenied(f"agent {spec.name} is not allowed to use {name}")
         started = perf_counter()
         trace_details = {
+            "agent": spec.name,
             "classification": tool.access.value,
             "arguments": self._safe_trace_arguments(arguments),
+            "debug_arguments": debug_value(arguments),
             "argument_keys": sorted(arguments),
         }
         self.trace.emit(
@@ -224,7 +253,7 @@ class AgentHarness:
                 name=name,
                 status=TraceStatus.DENIED if denied else TraceStatus.FAILED,
                 message=str(exc),
-                details=trace_details,
+                details={**trace_details, "error": debug_error_details(exc)},
                 duration_ms=(perf_counter() - started) * 1000,
             )
             raise
@@ -243,7 +272,7 @@ class AgentHarness:
             category=TraceCategory.TOOL_USE,
             name=name,
             status=TraceStatus.COMPLETED,
-            details=trace_details,
+            details={**trace_details, "result": debug_value(result)},
             duration_ms=(perf_counter() - started) * 1000,
         )
         return result
@@ -281,7 +310,7 @@ class AgentHarness:
             name=tool,
             status=TraceStatus.DENIED,
             message=reason,
-            details={"classification": access.value},
+            details={"agent": context.agent, "classification": access.value},
         )
 
     @staticmethod
@@ -333,6 +362,138 @@ class AgentHarness:
         missing = set(spec.output_schema) - keys
         if missing:
             raise ValidationError(f"agent {spec.name} omitted output fields: {', '.join(sorted(missing))}")
+
+
+def debug_context_snapshot(context: AgentContext) -> dict[str, Any]:
+    """Return bounded, non-executable agent state for developer diagnostics."""
+
+    pending = context.pending
+    pending_summary: dict[str, Any] | None = None
+    if pending is not None:
+        pending_summary = {
+            "summary": debug_value(getattr(pending, "summary", "")),
+            "specialist": getattr(pending, "specialist", None),
+            "calls": debug_value(getattr(pending, "calls", [])),
+        }
+    verification_summary: dict[str, Any] | None = None
+    if context.verification is not None:
+        verification_summary = {
+            "passed": bool(context.verification.passed),
+            "checks": debug_value(context.verification.checks),
+        }
+    change_request_summary: dict[str, Any] | None = None
+    if context.change_request is not None:
+        change_request_summary = {
+            "description": debug_value(context.change_request.description, key="summary"),
+            "target_files": debug_value(context.change_request.target_files),
+            "issue_number": context.change_request.issue_number,
+            "suggested_title": debug_value(context.change_request.suggested_title),
+        }
+    candidate_summary: dict[str, Any] | None = None
+    if context.code_candidate is not None:
+        candidate_summary = {
+            "summary": debug_value(context.code_candidate.summary, key="summary"),
+            "root_cause": debug_value(context.code_candidate.root_cause, key="summary"),
+            "changed_files": debug_value(context.code_candidate.changed_files),
+            "risks": debug_value(context.code_candidate.risks),
+            "verification_required": debug_value(context.code_candidate.verification_required),
+        }
+    return {
+        "agent": context.agent,
+        "repository": context.repository,
+        "goal": debug_value(context.goal, key="goal"),
+        "entity_type": context.entity_type,
+        "entity_id": context.entity_id,
+        "steps": context.steps,
+        "max_steps": context.max_steps,
+        "waiting": context.waiting,
+        "question": debug_value(context.question, key="question"),
+        "pending": pending_summary,
+        "finished": context.finished,
+        "error": debug_value(context.error, key="message"),
+        "final_message": debug_value(context.final_message, key="message"),
+        "result": debug_value(context.result),
+        "read_only": context.read_only,
+        "result_required": context.result_required,
+        "change_request": change_request_summary,
+        "code_candidate": candidate_summary,
+        "verification": verification_summary,
+        "reply_draft": "<present>" if context.reply_draft is not None else None,
+        "observations": [debug_observation(item) for item in context.observations[-40:]],
+    }
+
+
+def debug_observation(observation: Any) -> Any:
+    if not isinstance(observation, dict):
+        return debug_value(observation)
+    kind = str(observation.get("kind") or "")
+    payload = observation.get("payload")
+    if kind == "tool" and isinstance(payload, dict):
+        return {
+            "kind": "tool",
+            "tool": str(payload.get("tool") or ""),
+            "arguments": debug_value(payload.get("arguments", {})),
+            "data": debug_value(payload.get("data")),
+            "cached": bool(payload.get("cached", False)),
+        }
+    return {"kind": kind, "payload": debug_value(payload)}
+
+
+def debug_error_details(exc: BaseException) -> list[dict[str, Any]]:
+    """Expose error types/statuses without serializing provider request bodies or credentials."""
+
+    chain: list[dict[str, Any]] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(chain) < 6:
+        seen.add(id(current))
+        item: dict[str, Any] = {"type": type(current).__name__}
+        for attribute in ("status_code", "code"):
+            value = getattr(current, attribute, None)
+            if isinstance(value, (str, int)) and value != "":
+                item[attribute] = value
+        if current is exc:
+            item["message"] = debug_value(str(current), key="message")
+        chain.append(item)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def debug_value(value: Any, *, key: str = "", depth: int = 0) -> Any:
+    """Bound debug payloads and omit secret-like or source-heavy fields."""
+
+    if depth > 5:
+        return "<max depth>"
+    if is_dataclass(value):
+        return debug_value(asdict(value), key=key, depth=depth + 1)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        if key in {"api_key", "access_token", "secret", "password", "authorization", "github_token"}:
+            return "[REDACTED]"
+        if key == "content":
+            return f"<text {len(value)} chars>"
+        limit = 2_000 if key in {"message", "question", "summary", "goal", "body", "patch", "query"} else 1_000
+        return value if len(value) <= limit else value[:limit] + f"… <{len(value) - limit} chars omitted>"
+    if isinstance(value, dict):
+        if key == "files":
+            paths = [str(path)[:240] for path in list(value)[:30]]
+            return {"count": len(value), "paths": paths}
+        result: dict[str, Any] = {}
+        for index, (item_key, item_value) in enumerate(value.items()):
+            if index >= 30:
+                result["__omitted__"] = f"{len(value) - 30} more keys"
+                break
+            name = str(item_key)
+            result[name] = debug_value(item_value, key=name, depth=depth + 1)
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = list(value)
+        result = [debug_value(item, depth=depth + 1) for item in items[:30]]
+        if len(items) > 30:
+            result.append(f"<{len(items) - 30} more items>")
+        return result
+    return debug_value(str(value), key=key, depth=depth + 1)
 
 
 def tool_error(message: str, exc: Exception) -> ToolExecutionError:

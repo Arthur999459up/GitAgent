@@ -1,5 +1,5 @@
 from AGENT.GitAgent.gitagent.app.ui import TerminalUI
-from AGENT.GitAgent.gitagent.core.trace import TraceCategory, TraceEvent, TraceStatus
+from AGENT.GitAgent.gitagent.core.trace import TraceBus, TraceCategory, TraceEvent, TraceStatus
 from AGENT.GitAgent.tests.support import build_test_service, handle
 from rich.console import Console
 
@@ -81,3 +81,66 @@ def test_terminal_ui_labels_main_agent_tool_and_workflow_output():
     assert "repository.get_pr_diff" in rendered
     assert "code_change" in rendered
     assert "Router" not in rendered
+
+
+def test_trace_debug_filter_keeps_agent_owned_tools():
+    trace = TraceBus()
+    trace.emit(
+        session_id="session-debug-filter",
+        category=TraceCategory.AGENT,
+        name="issues",
+        status=TraceStatus.STARTED,
+        details={"debug_event": "start"},
+    )
+    trace.emit(
+        session_id="session-debug-filter",
+        category=TraceCategory.TOOL_USE,
+        name="github.get_issue",
+        status=TraceStatus.COMPLETED,
+        details={"agent": "issues", "result": {"number": 3}},
+    )
+    trace.emit(
+        session_id="session-debug-filter",
+        category=TraceCategory.AGENT,
+        name="coding",
+        status=TraceStatus.STARTED,
+        details={"debug_event": "start"},
+    )
+
+    events = trace.debug_events("session-debug-filter", "issues")
+    assert [(event.category.value, event.name) for event in events] == [
+        ("agent", "issues"),
+        ("tool_use", "github.get_issue"),
+    ]
+
+
+def test_terminal_ui_debug_history_renders_structured_agent_decision():
+    console = Console(record=True, width=160, color_system=None)
+    terminal = TerminalUI(console)
+    event = TraceEvent(
+        timestamp="2026-08-20T01:00:00+00:00",
+        session_id="session-debug-ui",
+        category=TraceCategory.AGENT,
+        name="issues",
+        status=TraceStatus.PROGRESS,
+        details={
+            "debug_event": "decision",
+            "step": 12,
+            "decision": {
+                "kind": "finish",
+                "message": "是否同意按上述方向修改？",
+            },
+            "context": {
+                "finished": False,
+                "question": "",
+            },
+        },
+    )
+
+    terminal.debug_history([event], session_id="session-debug-ui", agent="issues")
+
+    rendered = console.export_text()
+    assert "Agent Debug History" in rendered
+    assert '"kind": "finish"' in rendered
+    assert "是否同意按上述方向修改" in rendered
+    assert '"finished": false' in rendered

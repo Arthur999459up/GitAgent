@@ -62,6 +62,11 @@ class PRReviewAgent:
             "pr_review",
             session_id=session_id,
             operation=lambda context: self._review(context, repository, pr_number, guidance),
+            repository=repository,
+            goal=f"Review Pull Request #{pr_number}",
+            entity_type="pull_request",
+            entity_id=str(pr_number),
+            guidance=guidance,
         )
 
     def _review(

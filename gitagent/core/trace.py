@@ -90,7 +90,21 @@ class TraceBus:
             events = list(self._events)
         return events if session_id is None else [event for event in events if event.session_id == session_id]
 
+    def debug_events(self, session_id: str, agent: str | None = None) -> list[TraceEvent]:
+        """Return one Session's trace, optionally restricted to events owned by one agent."""
+
+        events = self.events(session_id)
+        if agent is None:
+            return events
+        return [
+            event
+            for event in events
+            if (event.category == TraceCategory.AGENT and event.name == agent)
+            or (event.category == TraceCategory.TOOL_USE and event.details.get("agent") == agent)
+            or (event.category == TraceCategory.WORKFLOW and event.details.get("agent") == agent)
+        ]
+
     def clear(self) -> None:
-        """清除会话事件，但保留已订阅的实时 UI。"""
+        """Clear process-local trace events while preserving live UI subscriptions."""
         with self._lock:
             self._events.clear()

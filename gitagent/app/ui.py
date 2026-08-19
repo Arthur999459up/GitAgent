@@ -161,7 +161,7 @@ class TerminalUI:
             return
         self.console.print(
             Panel.fit(
-                f"{len(events)} events · 完整 task id / 参数 / 耗时",
+                f"{len(events)} events · 完整 Session id / 参数 / 耗时",
                 title="[bold]Trace[/bold]",
                 title_align="left",
                 border_style="dim",
@@ -171,6 +171,41 @@ class TerminalUI:
         )
         for event in events:
             self._trace_verbose(event)
+
+    def debug_history(self, events: list[TraceEvent], *, session_id: str, agent: str | None = None) -> None:
+        """Render bounded developer history without feeding it back into any agent context."""
+
+        if not events:
+            target = f"Agent {agent}" if agent else "当前 Session"
+            self.text(f"{target} 没有可用的进程内 Debug History。", title="Debug", kind="info")
+            return
+        suffix = f" · agent={agent}" if agent else ""
+        self.console.print(
+            Panel.fit(
+                f"{len(events)} events · {session_id}{suffix}\n"
+                "[dim]只读诊断；源码正文/凭据会被省略或脱敏。[/dim]",
+                title="[bold]Agent Debug History[/bold]",
+                title_align="left",
+                border_style="cyan",
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+        )
+        for index, event in enumerate(events, 1):
+            payload = _debug_payload(event)
+            timestamp = event.timestamp[11:19] if len(event.timestamp) >= 19 else event.timestamp
+            label = _TRACE_LABELS[event.category][0]
+            title = f"{index:03d} · {timestamp} · {label} · {event.name} · {event.status.value}"
+            self.console.print(
+                Panel(
+                    Syntax(json.dumps(payload, ensure_ascii=False, indent=2), "json", word_wrap=True),
+                    title=title,
+                    title_align="left",
+                    border_style="dim",
+                    box=box.ROUNDED,
+                    padding=(0, 1),
+                )
+            )
 
     def _trace_verbose(self, event: TraceEvent) -> None:
         label, category_style = _TRACE_LABELS[event.category]
@@ -186,9 +221,37 @@ class TerminalUI:
         if arguments and event.status == TraceStatus.STARTED:
             summary = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
             line.append(f"  {summary[:240]}", style="dim")
+        if event.details.get("debug_event") == "decision":
+            decision = event.details.get("decision") or {}
+            kind = decision.get("kind") if isinstance(decision, dict) else None
+            if kind:
+                line.append(f" · decision={kind}", style="dim")
         if event.duration_ms is not None:
             line.append(f"  {_duration(event.duration_ms)}", style="dim")
         self.console.print(line)
+
+
+def _debug_payload(event: TraceEvent) -> dict[str, Any]:
+    details = event.details
+    payload: dict[str, Any] = {}
+    if event.message:
+        payload["message"] = event.message
+    if event.duration_ms is not None:
+        payload["duration_ms"] = round(event.duration_ms, 2)
+    if event.category == TraceCategory.AGENT:
+        for key in ("debug_event", "step", "decision", "context", "result", "error", "output_type"):
+            if key in details:
+                payload[key] = details[key]
+        return payload
+    if event.category == TraceCategory.TOOL_USE:
+        payload["agent"] = details.get("agent")
+        payload["arguments"] = details.get("debug_arguments", details.get("arguments", {}))
+        for key in ("classification", "result", "error"):
+            if key in details:
+                payload[key] = details[key]
+        return payload
+    payload.update(details)
+    return payload
 
 
 def _display_name(event: TraceEvent) -> str:

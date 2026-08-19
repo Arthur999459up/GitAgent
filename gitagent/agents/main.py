@@ -76,6 +76,8 @@ class MainAgent:
             "main",
             session_id=context.scope.session_id,
             operation=lambda agent_context: self._semantic_decision(agent_context, text, repository, context),
+            repository=repository,
+            goal=text,
         )
 
     def _semantic_decision(

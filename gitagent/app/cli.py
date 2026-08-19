@@ -190,7 +190,7 @@ def _repl(application: LiveApplication) -> int:
         Panel.fit(
             f"[bold]{application.repository}[/bold]  ·  {application.config.model}\n"
             f"[dim]session {application.session_id}[/dim]\n"
-            "[dim]自然语言提问 · /help 命令 · /trace 完整轨迹 · quit 退出[/dim]",
+            "[dim]自然语言提问 · /help 命令 · /trace 轨迹 · /debug Agent History · quit 退出[/dim]",
             title="[bold cyan]GitAgent[/bold cyan] [dim]v0.1.0[/dim]",
             title_align="left",
             border_style="cyan",
@@ -291,6 +291,8 @@ def _run_command(application: LiveApplication, request: str) -> None:
         ui.json(to_plain(events), title="Audit Log")
     elif command == "/trace":
         ui.trace_history(application.trace.events(argument or application.session_id))
+    elif command == "/debug":
+        _show_debug_history(application, argument)
     elif command == "/sessions":
         if argument:
             console.print("[yellow]用法：/sessions[/yellow]")
@@ -658,6 +660,29 @@ def _memory(application: LiveApplication, argument: str) -> None:
     console.print(table)
 
 
+def _show_debug_history(application: LiveApplication, argument: str) -> None:
+    parts = argument.split()
+    if len(parts) > 2:
+        console.print("[yellow]用法：/debug [agent] 或 /debug <session_id> [agent][/yellow]")
+        return
+    session_id = application.session_id
+    if session_id is None:
+        raise ValidationError("select a repository before reading Debug History")
+    agent: str | None = None
+    if len(parts) == 1:
+        if parts[0].startswith("session-"):
+            session_id = parts[0]
+        else:
+            agent = parts[0]
+    elif len(parts) == 2:
+        session_id, agent = parts
+        if not session_id.startswith("session-"):
+            console.print("[yellow]用法：/debug [agent] 或 /debug <session_id> [agent][/yellow]")
+            return
+    events = application.trace.debug_events(session_id, agent)
+    ui.debug_history(events, session_id=session_id, agent=agent)
+
+
 def _show_help() -> None:
     console.print(
         Panel(
@@ -682,6 +707,8 @@ def _show_help() -> None:
             "  /edit <要求>          修改当前待执行方案\n"
             "  /audit [session_id]   查看当前或指定 Session 审计记录\n"
             "  /trace [session_id]   回放当前或指定 Session 实时调用轨迹\n"
+            "  /debug [agent]        查看当前 Session 的 Agent Debug History\n"
+            "  /debug <session_id> [agent]  查看指定 Session/Agent 的 Debug History\n"
             "  quit                  退出\n\n"
             "[bold]输入[/bold]\n"
             "  Enter                 提交请求\n"

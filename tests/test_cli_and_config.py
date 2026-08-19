@@ -1,9 +1,13 @@
 """CLI/config smoke tests for the refactored application surface."""
 
+from types import SimpleNamespace
+
+import AGENT.GitAgent.gitagent.app.cli as cli_module
 import pytest
 from AGENT.GitAgent.gitagent.app.cli import build_parser
 from AGENT.GitAgent.gitagent.app.config import CLIConfig
 from AGENT.GitAgent.gitagent.core.models import DraftResult
+from AGENT.GitAgent.gitagent.core.trace import TraceBus, TraceCategory, TraceStatus
 
 
 def test_cli_parser_keeps_plain_gitagent_entrypoint():
@@ -34,3 +38,37 @@ def test_draft_result_is_a_user_visible_first_class_output():
     )
     assert draft.body == "Thanks for the report."
     assert "未发布" in draft.note
+
+
+def test_debug_command_filters_current_session_by_agent(monkeypatch):
+    trace = TraceBus()
+    session_id = "session-debug-cli"
+    trace.emit(
+        session_id=session_id,
+        category=TraceCategory.AGENT,
+        name="issues",
+        status=TraceStatus.STARTED,
+        details={"debug_event": "start"},
+    )
+    trace.emit(
+        session_id=session_id,
+        category=TraceCategory.AGENT,
+        name="coding",
+        status=TraceStatus.STARTED,
+        details={"debug_event": "start"},
+    )
+    captured = {}
+
+    def capture(events, *, session_id, agent):
+        captured["events"] = events
+        captured["session_id"] = session_id
+        captured["agent"] = agent
+
+    monkeypatch.setattr(cli_module.ui, "debug_history", capture)
+    application = SimpleNamespace(session_id=session_id, trace=trace)
+
+    cli_module._run_command(application, "/debug issues")
+
+    assert captured["session_id"] == session_id
+    assert captured["agent"] == "issues"
+    assert [event.name for event in captured["events"]] == ["issues"]

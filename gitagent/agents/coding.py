@@ -71,6 +71,11 @@ class CodingAgent:
             "coding",
             session_id=session_id,
             operation=lambda context: self._create(context, request, guidance),
+            repository=request.repository,
+            goal=request.description,
+            entity_type="issue" if request.issue_number is not None else None,
+            entity_id=str(request.issue_number) if request.issue_number is not None else None,
+            guidance=guidance,
         )
 
     def repair_candidate(
@@ -88,6 +93,11 @@ class CodingAgent:
             "coding",
             session_id=session_id,
             operation=lambda context: self._repair(context, request, candidate, errors, guidance),
+            repository=request.repository,
+            goal=f"Repair candidate: {request.description}",
+            entity_type="issue" if request.issue_number is not None else None,
+            entity_id=str(request.issue_number) if request.issue_number is not None else None,
+            guidance=guidance,
         )
 
     def _create(

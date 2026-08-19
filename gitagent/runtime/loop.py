@@ -15,7 +15,7 @@ from ..core.models import (
     WorkflowTurnDecision,
 )
 from ..core.trace import TraceCategory, TraceStatus
-from .harness import AgentContext, AgentHarness
+from .harness import AgentContext, AgentHarness, debug_context_snapshot, debug_error_details, debug_value
 from .mutation import (
     code_change_approval_summary,
     code_change_mutation_plan,
@@ -126,7 +126,7 @@ class AgentLoop:
             try:
                 self._execute_pending(context, agent, pending)
             except Exception as exc:  # noqa: BLE001 - mutation stops fail-closed
-                self._fail(context, f"approved action stopped fail-closed: {exc}")
+                self._fail(context, f"approved action stopped fail-closed: {exc}", exc=exc)
                 return
             context.pending = None
             return
@@ -146,8 +146,20 @@ class AgentLoop:
             try:
                 action = agent.decide(context)
             except Exception as exc:  # noqa: BLE001 - loop boundary records a fail-closed state
-                self._fail(context, f"agent decision failed: {exc}")
+                self._fail(context, f"agent decision failed: {exc}", exc=exc)
                 return
+            self.harness.trace.emit(
+                session_id=context.session_id,
+                category=TraceCategory.AGENT,
+                name=context.agent,
+                status=TraceStatus.PROGRESS,
+                details={
+                    "debug_event": "decision",
+                    "step": context.steps,
+                    "decision": _debug_action(action),
+                    "context": debug_context_snapshot(context),
+                },
+            )
             if not self._handle(context, agent, action):
                 return
 
@@ -171,7 +183,7 @@ class AgentLoop:
                 self._emit(context, TraceStatus.COMPLETED, message=context.final_message or "completed")
                 return False
         except Exception as exc:  # noqa: BLE001
-            self._fail(context, f"action failed: {exc}")
+            self._fail(context, f"action failed: {exc}", exc=exc)
             return False
         raise ValidationError(f"unknown action kind: {action.kind}")
 
@@ -302,24 +314,48 @@ class AgentLoop:
     def _observe(self, context: AgentContext, kind: str, payload: Any) -> None:
         context.observations.append({"kind": kind, "payload": payload})
 
-    def _fail(self, context: AgentContext, error: str) -> None:
+    def _fail(self, context: AgentContext, error: str, *, exc: BaseException | None = None) -> None:
         context.error = str(error)
         context.finished = True
-        self._emit(context, TraceStatus.FAILED, message=str(error))
+        self._emit(context, TraceStatus.FAILED, message=str(error), exc=exc)
 
-    def _emit(self, context: AgentContext, status: TraceStatus, message: str = "") -> None:
+    def _emit(
+        self,
+        context: AgentContext,
+        status: TraceStatus,
+        message: str = "",
+        *,
+        exc: BaseException | None = None,
+    ) -> None:
+        details: dict[str, Any] = {
+            "debug_event": status.value,
+            "steps": context.steps,
+            "goal": context.goal,
+            "repository": context.repository,
+            "context": debug_context_snapshot(context),
+        }
+        if exc is not None:
+            details["error"] = debug_error_details(exc)
         self.harness.trace.emit(
             session_id=context.session_id,
             category=TraceCategory.AGENT,
             name=context.agent,
             status=status,
             message=message,
-            details={
-                "steps": context.steps,
-                "goal": context.goal,
-                "repository": context.repository,
-            },
+            details=details,
         )
+
+
+def _debug_action(action: AgentAction) -> dict[str, Any]:
+    return {
+        "kind": action.kind.value,
+        "summary": debug_value(action.summary, key="summary"),
+        "tool": action.tool,
+        "arguments": debug_value(action.arguments),
+        "specialist": action.specialist,
+        "question": debug_value(action.question, key="question"),
+        "message": debug_value(action.message, key="message"),
+    }
 
 
 def rejection_feedback(context: AgentContext) -> str | None:

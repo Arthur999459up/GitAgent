@@ -123,6 +123,8 @@ def test_equivalent_read_is_served_from_context_cache_without_second_tool_execut
     assert observations[1]["payload"]["cached"] is True
     tool_trace = [event for event in harness.trace.events(context.session_id) if event.name == "github.list_issues"]
     assert len(tool_trace) == 2
+    assert tool_trace[0].details["agent"] == "test_agent"
+    assert tool_trace[-1].details["result"]["issues"]
 
 
 def test_read_only_context_cannot_create_a_write_proposal():
@@ -300,6 +302,40 @@ def test_ask_pauses_and_reply_resumes_as_observation():
     user_observations = [obs for obs in resumed.observations if obs["kind"] == "user"]
     assert assistant_observations[-1]["payload"] == "Which issue do you mean?"
     assert user_observations[-1]["payload"] == "issue #1"
+
+
+def test_debug_trace_records_decision_and_waiting_context():
+    _, harness = _harness()
+    loop = AgentLoop(harness)
+    agent = ScriptedAgent(AgentAction(AgentActionKind.ASK, summary="need confirmation", question="Continue?"))
+
+    context = loop.start(_context(harness, session_id="session-debug-ask"), agent)
+
+    events = harness.trace.debug_events(context.session_id, "test_agent")
+    decision = next(event for event in events if event.details.get("debug_event") == "decision")
+    waiting = next(event for event in events if event.details.get("debug_event") == "waiting")
+    assert decision.details["decision"]["kind"] == "ask"
+    assert decision.details["decision"]["question"] == "Continue?"
+    assert waiting.details["context"]["question"] == "Continue?"
+    assert waiting.details["context"]["finished"] is False
+
+
+def test_debug_trace_preserves_nested_error_types():
+    _, harness = _harness()
+    loop = AgentLoop(harness)
+
+    class FailingAgent(ScriptedAgent):
+        def decide(self, context: AgentContext) -> AgentAction:
+            try:
+                raise TimeoutError("provider timed out")
+            except TimeoutError as exc:
+                raise RuntimeError("model request failed") from exc
+
+    context = loop.start(_context(harness, session_id="session-debug-error"), FailingAgent())
+
+    failed = next(event for event in reversed(harness.trace.events(context.session_id)) if event.status.value == "failed")
+    assert [item["type"] for item in failed.details["error"]] == ["RuntimeError", "TimeoutError"]
+    assert failed.details["context"]["finished"] is True
 
 
 def test_default_step_budget_is_twenty():

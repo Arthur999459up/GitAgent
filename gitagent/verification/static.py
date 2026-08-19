@@ -28,6 +28,7 @@ class StaticVerifier:
             "static_verifier",
             session_id=session_id,
             operation=lambda context: self._verify(context, candidate, attempts),
+            goal=f"Static verification: {candidate.summary}",
         )
 
     @staticmethod

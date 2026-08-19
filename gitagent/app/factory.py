@@ -283,7 +283,6 @@ class LiveApplication:
         if previous is not service:
             previous.invalidate()
         self.service = service
-        self.trace.clear()
 
     def _rebuild_current_service(self) -> BaseException | None:
         scope = self._require_scope()

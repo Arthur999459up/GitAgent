@@ -65,10 +65,22 @@ class CIDiagnosisAgent:
         session_id: str,
         guidance: AgentGuidance | None = None,
     ) -> CIDiagnosisResult:
+        goal = (
+            f"Diagnose workflow run #{workflow_run_id}"
+            if workflow_run_id is not None
+            else f"Diagnose CI for PR #{pr_number}"
+            if pr_number is not None
+            else "Diagnose failing CI"
+        )
         return self.harness.run(
             "ci_diagnosis",
             session_id=session_id,
             operation=lambda context: self._diagnose(context, repository, pr_number, workflow_run_id, guidance),
+            repository=repository,
+            goal=goal,
+            entity_type="workflow_run" if workflow_run_id is not None else "pull_request" if pr_number is not None else None,
+            entity_id=str(workflow_run_id if workflow_run_id is not None else pr_number) if (workflow_run_id is not None or pr_number is not None) else None,
+            guidance=guidance,
         )
 
     def _diagnose(
