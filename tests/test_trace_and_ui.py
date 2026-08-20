@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
+import AGENT.GitAgent.gitagent.app.cli as cli_module
 from AGENT.GitAgent.gitagent.app.ui import TerminalUI
 from AGENT.GitAgent.gitagent.core.trace import TraceBus, TraceCategory, TraceEvent, TraceStatus
-from AGENT.GitAgent.tests.support import build_test_service, handle
+from AGENT.GitAgent.tests.support import StubMainReasoner, build_test_service, handle
 from rich.console import Console
 
 
@@ -52,6 +55,53 @@ def test_terminal_ui_does_not_repeat_waiting_question_in_compact_trace():
     rendered = console.export_text()
     assert "Issues" in rendered
     assert "是否进入代码修复流程" not in rendered
+
+
+def test_code_change_proposal_renders_one_confirmation_and_separates_pr_title_and_body(monkeypatch):
+    class ApplyIssueFixReasoner:
+        def complete_structured(self, **kwargs):
+            assert kwargs.get("tool_name") == "decide_action"
+            return {
+                "kind": "apply_code_change",
+                "summary": "prepare the issue fix",
+                "awaiting_user_confirmation": False,
+            }
+
+    service = build_test_service(agent_reasoner=ApplyIssueFixReasoner())
+    service.main_agent.reasoner = StubMainReasoner(
+        [
+            {
+                "target_agent": "issues",
+                "entity_type": "issue",
+                "entity_id": "2",
+                "request": "修复 Issue #2",
+                "message": "",
+                "clarify": False,
+                "requested_fix": True,
+                "requested_reply": False,
+            }
+        ]
+    )
+    proposal = handle(service, "修复 Issue #2")
+    captured: list[tuple[str, str]] = []
+
+    class CapturingUI:
+        def markdown(self, content, *, title, **kwargs):
+            del kwargs
+            captured.append((title, content))
+
+        def text(self, content, *, title, **kwargs):
+            del kwargs
+            captured.append((title, content))
+
+    monkeypatch.setattr(cli_module, "ui", CapturingUI())
+
+    cli_module._render_proposal(SimpleNamespace(service=service), proposal.output)
+
+    assert [title for title, _ in captured].count("需要你的确认") == 1
+    code_change = next(content for title, content in captured if title == "代码变更 · 待批准")
+    assert "### Draft PR 标题" in code_change
+    assert "### Draft PR 正文" in code_change
 
 
 def test_terminal_ui_labels_main_agent_tool_and_workflow_output():

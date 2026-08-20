@@ -24,6 +24,7 @@ from ..runtime import (
     AgentActionKind,
     AgentContext,
     AgentHarness,
+    code_change_review_package,
     rejection_feedback,
     render_observations,
 )
@@ -103,6 +104,10 @@ class IssueAgent:
             return self._publish_draft_decide(context)
         draft_pr = self._last_tool(context, "github.create_draft_pr")
         if draft_pr is not None:
+            issue_number = self._entity_number(context)
+            if issue_number is not None and context.code_candidate is not None and context.verification is not None:
+                context.reply_draft = self._code_change_issue_report(context, draft_pr)
+                return self._publish_draft_decide(context)
             return AgentAction(
                 AgentActionKind.FINISH,
                 summary="代码修复已发布为 Draft PR",
@@ -205,16 +210,68 @@ class IssueAgent:
         if issue_number is None:
             return AgentAction(AgentActionKind.ASK, question="发布回复前需要明确的 Issue 编号。")
         if self._last_tool(context, "github.post_comment") is not None:
+            draft_pr = self._last_tool(context, "github.create_draft_pr")
+            if draft_pr is not None:
+                return AgentAction(
+                    AgentActionKind.FINISH,
+                    summary="Draft PR 与 Issue 修改报告均已发布",
+                    message=(
+                        f"已创建修复 Draft PR #{draft_pr.get('number')}，"
+                        f"并发布修改报告到 Issue #{issue_number}。"
+                    ),
+                )
             return AgentAction(
                 AgentActionKind.FINISH,
                 summary="Issue 回复已发布",
                 message=f"已发布回复到 Issue #{issue_number}。",
             )
+        draft_pr = self._last_tool(context, "github.create_draft_pr")
+        summary = (
+            f"在 Issue #{issue_number} 发布 Draft PR 修改报告"
+            if draft_pr is not None
+            else f"在 Issue #{issue_number} 发布已确认的回复草稿"
+        )
         return AgentAction(
             AgentActionKind.TOOL,
             tool="github.post_comment",
             arguments={"issue_number": issue_number, "body": context.reply_draft},
-            summary=f"在 Issue #{issue_number} 发布已确认的回复草稿",
+            summary=summary,
+        )
+
+    @staticmethod
+    def _code_change_issue_report(context: AgentContext, draft_pr: dict[str, Any]) -> str:
+        if context.change_request is None or context.code_candidate is None or context.verification is None:
+            raise WorkflowError("Issue modification report requires the reviewed code-change artifacts")
+        review = code_change_review_package(
+            context.change_request,
+            context.code_candidate,
+            context.verification,
+        )
+        number = draft_pr.get("number")
+        url = str(draft_pr.get("html_url") or "").strip()
+        reference = f"[Draft PR #{number}]({url})" if url else f"Draft PR #{number}"
+        files = "\n".join(f"- `{path}`" for path in review.files_changed) or "- 无"
+        checks = (
+            "\n".join(
+                f"- {check.name}: **{check.status}** — {check.details}"
+                for check in review.static_verification.checks
+            )
+            or "- 未记录静态检查"
+        )
+        risks = "\n".join(f"- {risk}" for risk in review.potential_risks) or "- 未发现明确的静态风险"
+        follow_up = (
+            "\n".join(f"- {item}" for item in context.code_candidate.verification_required)
+            or "- 运行仓库测试并完成人工审阅"
+        )
+        return (
+            f"已创建 {reference}，现同步本次修改报告。\n\n"
+            f"## 修改摘要\n{review.change_summary}\n\n"
+            f"## 根因\n{review.root_cause}\n\n"
+            f"## 变更文件\n{files}\n\n"
+            f"## 静态验证\n{checks}\n\n"
+            f"## 风险\n{risks}\n\n"
+            f"## 后续验证\n{follow_up}\n\n"
+            "该 PR 当前仍为 Draft，合并前仍需人工审阅并运行仓库测试。"
         )
 
     def _llm_decide(self, context: AgentContext) -> AgentAction:

@@ -497,7 +497,18 @@ def _render_context(application: LiveApplication, context: AgentContext) -> None
 
 
 def _render_proposal(application: LiveApplication, context: AgentContext) -> None:
-    if context.agent == "code_change" or context.code_candidate is not None:
+    calls = context.pending.calls
+    if context.reply_draft is not None and any(call.tool == "github.post_comment" for call in calls):
+        issue_number = next(
+            (call.arguments.get("issue_number") for call in calls if call.tool == "github.post_comment"),
+            context.entity_id,
+        )
+        ui.markdown(
+            context.reply_draft,
+            title=f"Issue #{issue_number} 修改报告 · 待发布",
+            kind="agent",
+        )
+    elif any(call.tool == "github.create_draft_pr" for call in calls):
         _render_code_change_proposal(application, context)
     else:
         details = []
@@ -517,7 +528,6 @@ def _render_code_change_proposal(application: LiveApplication, context: AgentCon
     candidate = context.code_candidate
     if candidate is None:
         ui.text(context.pending.summary, title="代码变更 · 待批准", kind="agent")
-        _render_approval(application, context.pending.approval_id)
         return
     files = ", ".join(f"`{path}`" for path in candidate.changed_files)
     content = (
@@ -526,10 +536,18 @@ def _render_code_change_proposal(application: LiveApplication, context: AgentCon
         f"**变更文件：** {files}\n\n"
         f"### Diff\n```diff\n{candidate.patch}\n```"
     )
+    pr_call = next(
+        (call for call in context.pending.calls if call.tool == "github.create_draft_pr"),
+        None,
+    )
+    if pr_call is not None:
+        content += (
+            f"\n\n### Draft PR 标题\n{pr_call.arguments.get('title', '')}\n\n"
+            f"### Draft PR 正文\n{pr_call.arguments.get('body', '')}"
+        )
     ui.markdown(content, title="代码变更 · 待批准", kind="agent")
     if context.verification is not None:
         _render_verification(context.verification)
-    _render_approval(application, context.pending.approval_id)
 
 
 def _render_verification(report: VerificationReport) -> None:

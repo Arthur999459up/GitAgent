@@ -230,6 +230,57 @@ def test_issue_calls_coding_directly_and_parent_context_continues_to_approval():
     assert child_summaries[-1]["payload"]["verification_passed"] is True
     assert all("observations" not in item["payload"] for item in child_summaries)
     assert parent.pending.calls[-1].tool == "github.create_draft_pr"
+    pr_call = parent.pending.calls[-1]
+    assert pr_call.arguments["title"].startswith("Fix #2:")
+    assert "## Summary" in pr_call.arguments["body"]
+    assert "## Static verification" in pr_call.arguments["body"]
+    assert "## Related issue\n#2" in pr_call.arguments["body"]
+
+
+def test_issue_fix_creates_a_separately_approved_modification_report_after_the_draft_pr():
+    service = build_test_service(
+        main_responses=[
+            {
+                "target_agent": "issues",
+                "entity_type": "issue",
+                "entity_id": "2",
+                "request": "修复 Issue #2",
+                "message": "",
+                "clarify": False,
+                "requested_fix": True,
+                "requested_reply": False,
+            }
+        ],
+        agent_reasoner=IssueFixReasoner(),
+    )
+
+    proposal = handle(service, "修复 Issue #2")
+    assert isinstance(proposal.output, AgentContext)
+    assert proposal.output.pending is not None
+    assert proposal.output.pending.calls[-1].tool == "github.create_draft_pr"
+
+    report_proposal = handle(service, "可以")
+
+    assert isinstance(report_proposal.output, AgentContext)
+    assert report_proposal.output.pending is not None
+    assert [call.tool for call in report_proposal.output.pending.calls] == ["github.post_comment"]
+    report = report_proposal.output.pending.calls[0].arguments["body"]
+    assert report_proposal.output.reply_draft == report
+    assert "Draft PR #" in report
+    assert "## 修改摘要" in report
+    assert "## 变更文件" in report
+    assert "## 静态验证" in report
+    assert "## 后续验证" in report
+    repository = service.harness.server.repositories["sample/widgets"]
+    assert len(repository["draft_prs"]) == 1
+    assert repository.get("comments", []) == []
+
+    completed = handle(service, "可以")
+
+    assert len(repository["comments"]) == 1
+    assert repository["comments"][0]["issue_number"] == 2
+    assert repository["comments"][0]["body"] == report
+    assert "并发布修改报告到 Issue #2" in completed.output.answer
 
 
 def test_issue_confirmation_resumes_the_same_context_and_keeps_structured_handoff():
