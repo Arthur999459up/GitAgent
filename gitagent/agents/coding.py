@@ -6,7 +6,7 @@ import difflib
 import json
 from typing import Any
 
-from ..core.errors import ValidationError, WorkflowError
+from ..core.errors import LLMProviderError, StructuredOutputError, ValidationError, WorkflowError
 from ..core.models import (
     AgentGuidance,
     AgentSpec,
@@ -21,6 +21,23 @@ from ..runtime import AgentContext, AgentHarness
 from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
+
+_CANDIDATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "root_cause": {"type": "string"},
+        "files": {
+            "type": "object",
+            "description": "Complete new UTF-8 content keyed by the supplied repository path.",
+            "additionalProperties": {"type": "string"},
+        },
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "verification_required": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary", "root_cause", "files", "risks", "verification_required"],
+    "additionalProperties": False,
+}
 
 CODING_SPEC = AgentSpec(
     name="coding",
@@ -106,14 +123,25 @@ class CodingAgent:
         request: ChangeRequest,
         guidance: AgentGuidance | None,
     ) -> CandidatePatch:
+        context.phase = "discovering_targets"
         tree = context.tool("repository.get_repo_tree", repository=request.repository, depth=4)
-        known_paths = set(tree["entries"])
+        tree_paths = [str(path) for path in tree["entries"]]
+        known_paths = set(tree_paths)
         paths = list(dict.fromkeys(request.target_files + [replacement.path for replacement in request.replacements]))
+        if not paths:
+            paths = [path for path in tree_paths if path in request.description]
         existing_paths = [path for path in paths if path in known_paths]
         if not existing_paths and not request.proposed_files:
+            context.phase = "searching_repository"
             query = self._search_term(request.description)
             hits = context.tool("repository.search_code", repository=request.repository, query=query, max_results=15)["results"]
             existing_paths = list(dict.fromkeys(hit["path"] for hit in hits))[:6]
+            if not existing_paths:
+                raise WorkflowError(
+                    "cannot determine a safe editable target file; "
+                    f"repository search returned no matches for {query!r}"
+                )
+        context.phase = "reading_targets"
         fetched = (
             context.tool(
                 "repository.read_files",
@@ -155,16 +183,24 @@ class CodingAgent:
                     )
                 new_files[replacement.path] = new_files[replacement.path].replace(replacement.old, replacement.new, 1)
         elif self.reasoner:
-            value = self.reasoner.complete_structured(
-                system=context.system_prompt,
-                prompt=_PROMPTS.render(
-                    "agents.coding_create",
-                    repository=request.repository,
-                    description=request.description,
-                    files=json.dumps(originals, ensure_ascii=False),
-                    guidance=guidance_section(guidance),
-                ),
-            )
+            context.phase = "generating_candidate"
+            try:
+                value = self.reasoner.complete_structured(
+                    system=context.system_prompt,
+                    prompt=_PROMPTS.render(
+                        "agents.coding_create",
+                        repository=request.repository,
+                        description=request.description,
+                        files=json.dumps(originals, ensure_ascii=False),
+                        guidance=guidance_section(guidance),
+                    ),
+                    schema=_CANDIDATE_SCHEMA,
+                    tool_name="prepare_candidate",
+                )
+            except LLMProviderError as exc:
+                raise LLMProviderError(f"候选补丁生成阶段失败：{exc}") from exc
+            except StructuredOutputError as exc:
+                raise StructuredOutputError(f"候选补丁结构化输出无效：{exc}") from exc
             new_files = {str(path): str(content) for path, content in value.get("files", {}).items()}
             outside = set(new_files) - set(originals)
             if outside:
@@ -210,6 +246,8 @@ class CodingAgent:
                 errors=json.dumps(errors),
                 guidance=guidance_section(guidance),
             ),
+            schema=_CANDIDATE_SCHEMA,
+            tool_name="repair_candidate",
         )
         repaired = {str(path): str(content) for path, content in value.get("files", {}).items()}
         if set(repaired) != set(candidate.files):
@@ -271,10 +309,13 @@ class CodingAgent:
     def _search_term(self, description: str) -> str:
         if self.reasoner is None:
             raise WorkflowError("coding requires target_files when no reasoner is configured")
-        query = self.reasoner.complete_text(
-            system="Return one concise repository search term for the requested code change. Return only the term.",
-            prompt=description,
-        ).strip()
+        try:
+            query = self.reasoner.complete_text(
+                system="Return one concise repository search term for the requested code change. Return only the term.",
+                prompt=description,
+            ).strip()
+        except LLMProviderError as exc:
+            raise LLMProviderError(f"目标文件搜索词生成阶段失败：{exc}") from exc
         if not query:
             raise WorkflowError("coding could not determine a repository search term")
         return query[:120]

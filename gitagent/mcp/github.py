@@ -6,6 +6,7 @@ import base64
 import io
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +17,10 @@ from ..core.errors import ToolExecutionError, ValidationError
 from ..core.models import RepositoryRef
 from .base import safe_repository_path
 from .memory import InMemoryMCPServer
+
+_READ_RETRIES = 2
+_RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+_RETRY_BACKOFF_SECONDS = 0.25
 
 
 class GitHubMCPServer(InMemoryMCPServer):
@@ -156,19 +161,46 @@ class GitHubMCPServer(InMemoryMCPServer):
         qualifier = f"{query} repo:{repository}" + (f" path:{safe_repository_path(path)}" if path else "")
         encoded = urllib.parse.urlencode({"q": qualifier, "per_page": max_results})
         value = self._request("GET", f"/search/code?{encoded}")
+        items = list(value.get("items", []))[:max_results]
         results: list[dict[str, Any]] = []
-        for item in value.get("items", [])[:max_results]:
+        fetch_errors: list[dict[str, str]] = []
+        files_checked = 0
+        for item in items:
             file_path = str(item.get("path", ""))
             try:
                 fetched = self.read_file(repository, file_path, limit=400)
-            except ToolExecutionError:
+            except ToolExecutionError as exc:
+                fetch_errors.append({"path": file_path, "error": str(exc)[:500]})
                 continue
+            files_checked += 1
             for line_number, line in enumerate(str(fetched["content"]).splitlines(), 1):
                 if query.casefold() in line.casefold():
                     results.append({"path": file_path, "line": line_number, "snippet": line[:500]})
                     if len(results) >= max_results:
-                        return {"query": query, "results": results, "truncated": True}
-        return {"query": query, "results": results, "truncated": len(value.get("items", [])) >= max_results}
+                        return {
+                            "query": query,
+                            "results": results,
+                            "truncated": True,
+                            "candidates": len(items),
+                            "files_checked": files_checked,
+                            "fetch_errors": fetch_errors,
+                        }
+        if items and files_checked == 0:
+            details = "; ".join(
+                f"{item['path'] or '<unknown>'}: {item['error']}" for item in fetch_errors[:3]
+            )
+            raise ToolExecutionError(
+                f"GitHub code search returned {len(items)} candidate file(s), but none could be read"
+                + (f": {details}" if details else "")
+            )
+        return {
+            "query": query,
+            "results": results,
+            "truncated": len(value.get("items", [])) >= max_results,
+            "candidates": len(items),
+            "files_checked": files_checked,
+            "fetch_errors": fetch_errors,
+        }
 
     def read_file(
         self,
@@ -215,7 +247,13 @@ class GitHubMCPServer(InMemoryMCPServer):
     ) -> dict[str, Any]:
         if len(paths) > 20:
             raise ValidationError("read_files is limited to 20 targeted paths")
-        return {"files": [self.read_file(repository, path, limit=limit_per_file, ref=ref) for path in paths]}
+        files: list[dict[str, Any]] = []
+        for path in paths:
+            try:
+                files.append(self.read_file(repository, path, limit=limit_per_file, ref=ref))
+            except ToolExecutionError as exc:
+                raise ToolExecutionError(f"failed to read {path}: {exc}") from exc
+        return {"files": files}
 
     def find_symbol(self, repository: str, symbol: str, max_results: int = 20) -> dict[str, Any]:
         if not re.fullmatch(r"[A-Za-z_$][\w$.:<>-]*", symbol):
@@ -556,14 +594,26 @@ class GitHubMCPServer(InMemoryMCPServer):
             headers["Content-Type"] = "application/json"
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(f"{self.api_url}{path}", data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            details = exc.read().decode("utf-8", errors="replace")[:1000]
-            raise ToolExecutionError(f"GitHub API {method} {path} failed ({exc.code}): {details}") from exc
-        except urllib.error.URLError as exc:
-            raise ToolExecutionError(f"GitHub API connection failed: {exc.reason}") from exc
+        max_attempts = _READ_RETRIES + 1 if method.upper() == "GET" else 1
+        for attempt in range(max_attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code in _RETRYABLE_HTTP_STATUSES and attempt + 1 < max_attempts:
+                    exc.close()
+                    time.sleep(_RETRY_BACKOFF_SECONDS * (2**attempt))
+                    continue
+                details = exc.read().decode("utf-8", errors="replace")[:1000]
+                raise ToolExecutionError(f"GitHub API {method} {path} failed ({exc.code}): {details}") from exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if attempt + 1 < max_attempts:
+                    time.sleep(_RETRY_BACKOFF_SECONDS * (2**attempt))
+                    continue
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                suffix = f" after {max_attempts} attempts" if max_attempts > 1 else ""
+                raise ToolExecutionError(f"GitHub API connection failed{suffix}: {reason}") from exc
+        raise AssertionError("GitHub request retry loop exited unexpectedly")
 
     @staticmethod
     def _decode_log(data: bytes) -> str:

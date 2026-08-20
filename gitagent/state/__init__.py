@@ -1,6 +1,7 @@
 """Local, scoped Session and explicit Memory persistence."""
 
 from .sessions import (
+    OPEN_QUESTION_CHARACTER_LIMIT,
     MemoryRecord,
     SessionManager,
     SessionRecord,
@@ -14,6 +15,7 @@ from .sessions import (
 from .store import REDACTED, SCHEMA_VERSION, StateStore, truncate_utf8
 
 __all__ = [
+    "OPEN_QUESTION_CHARACTER_LIMIT",
     "REDACTED",
     "SCHEMA_VERSION",
     "MemoryRecord",

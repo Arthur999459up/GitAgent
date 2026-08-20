@@ -403,3 +403,60 @@ def test_render_observations_stays_valid_json_under_large_payloads():
     assert isinstance(parsed, list)
     assert parsed[-1]["arguments"]["path"] == "src/formatting.py"
     assert len(rendered) <= 16_000
+
+
+def test_render_observations_preserves_a_complete_target_file_that_fits_the_budget():
+    _, harness = _harness()
+    context = _context(harness, session_id="session-complete-file")
+    content = "x" * 3_000 + "\ndef list_sessions() -> list[dict]:\n    return []\n"
+    context.observations = [
+        {
+            "kind": "tool",
+            "payload": {
+                "tool": "repository.read_file",
+                "arguments": {"repository": "sample/widgets", "path": "corecoder/session.py"},
+                "data": {
+                    "path": "corecoder/session.py",
+                    "start_line": 1,
+                    "end_line": 99,
+                    "content": content,
+                    "truncated": False,
+                },
+            },
+        }
+    ]
+
+    parsed = json.loads(render_observations(context))
+
+    assert parsed[-1]["data"]["content"] == content
+    assert "__content_projection__" not in parsed[-1]["data"]
+
+
+def test_render_observations_marks_prompt_only_content_truncation():
+    _, harness = _harness()
+    context = _context(harness, session_id="session-projected-file")
+    context.observations = [
+        {
+            "kind": "tool",
+            "payload": {
+                "tool": "repository.read_file",
+                "arguments": {"repository": "sample/widgets", "path": "src/large.py"},
+                "data": {
+                    "path": "src/large.py",
+                    "start_line": 1,
+                    "end_line": 400,
+                    "content": "x" * 20_000,
+                    "truncated": False,
+                },
+            },
+        }
+    ]
+
+    parsed = json.loads(render_observations(context))
+
+    assert parsed[-1]["data"]["truncated"] is False
+    assert parsed[-1]["data"]["__content_projection__"] == {
+        "truncated": True,
+        "original_chars": 20_000,
+        "retained_chars": 8_000,
+    }

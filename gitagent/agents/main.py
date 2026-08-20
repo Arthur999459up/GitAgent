@@ -117,6 +117,10 @@ class MainAgent:
         target = str(raw.get("target_agent") or "").strip()
         if target and target not in _DOMAIN_AGENTS:
             raise ValidationError("Main Agent selected an unknown domain agent")
+        entity_type = str(raw.get("entity_type") or "").strip() or None
+        entity_id = str(raw.get("entity_id") or "").strip() or None
+        if target == "code_change" and entity_type == "issue" and entity_id:
+            target = "issues"
         message = str(raw.get("message") or "").strip()
         request = str(raw.get("request") or text).strip() or text
         clarify = bool(raw.get("clarify", False))
@@ -124,8 +128,8 @@ class MainAgent:
             message = "请再具体说明你希望处理的仓库问题。" if clarify else "我需要更多上下文才能回答。"
         return MainDecision(
             target_agent=target or None,
-            entity_type=str(raw.get("entity_type") or "").strip() or None,
-            entity_id=str(raw.get("entity_id") or "").strip() or None,
+            entity_type=entity_type,
+            entity_id=entity_id,
             request=request,
             message=message,
             clarify=clarify,

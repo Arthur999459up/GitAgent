@@ -19,6 +19,7 @@ USER_MEMORY_LIMIT = 16
 USER_MEMORY_TOKEN_LIMIT = 1000
 REPOSITORY_MEMORY_LIMIT = 24
 REPOSITORY_MEMORY_TOKEN_LIMIT = 1600
+OPEN_QUESTION_CHARACTER_LIMIT = 50_000
 
 _ACCOUNT_KEY = re.compile(r"^(?P<api>.+)#user:(?P<id>[1-9][0-9]*)$")
 _REPOSITORY_KEY = re.compile(r"^(?P<api>.+)#repo:(?P<id>[1-9][0-9]*)$")
@@ -827,7 +828,11 @@ def _validate_working_state(value: Mapping[str, Any]) -> dict[str, Any]:
     ):
         raise ValidationError("working_state has an invalid versioned shape")
     goal = _require_string(value["goal"], "working_state goal", maximum=1000)
-    question = _require_string(value["open_question"], "working_state open_question", maximum=500)
+    question = _require_string(
+        value["open_question"],
+        "working_state open_question",
+        maximum=OPEN_QUESTION_CHARACTER_LIMIT,
+    )
     focus = value["focus"]
     if focus is not None:
         if not isinstance(focus, Mapping) or set(focus) != {"type", "id", "short_label"}:
@@ -867,11 +872,11 @@ def merge_working_state(current: Mapping[str, Any], *, projection: Any) -> dict[
     focus = getattr(projection, "focus", None)
     if focus is not None:
         state["focus"] = focus
-    state["open_question"] = _require_string(
+    raw_question = _require_string(
         getattr(projection, "open_question", None) or "",
         "projection open_question",
-        maximum=500,
     )
+    state["open_question"] = _bounded_characters(raw_question, OPEN_QUESTION_CHARACTER_LIMIT)
     return _validate_working_state(state)
 
 

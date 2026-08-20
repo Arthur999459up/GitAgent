@@ -34,6 +34,20 @@ from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
 _MAX_FILE_READS = 5
+_ISSUE_ACTION_SCHEMA = {
+    **AGENT_ACTION_SCHEMA,
+    "properties": {
+        **AGENT_ACTION_SCHEMA["properties"],
+        "awaiting_user_confirmation": {
+            "type": "boolean",
+            "description": (
+                "True only when repository evidence supports a code change but the agent must wait for the user's "
+                "confirmation before preparing it."
+            ),
+        },
+    },
+    "required": [*AGENT_ACTION_SCHEMA["required"], "awaiting_user_confirmation"],
+}
 
 ISSUE_AGENT_SPEC = AgentSpec(
     name="issues",
@@ -216,15 +230,33 @@ class IssueAgent:
                 budget=str(max(0, context.max_steps - context.steps)),
                 guidance=guidance_section(context.guidance),
             ),
-            schema=AGENT_ACTION_SCHEMA,
+            schema=_ISSUE_ACTION_SCHEMA,
             tool_name="decide_action",
             tools=self.harness.client.llm_tools(allowed_tools),
         )
         if value.get("kind") == "tool":
             value["tool"] = self.harness.client.resolve_llm_tool_name(str(value.get("tool", "")), allowed_tools)
+        if bool(value.get("awaiting_user_confirmation")):
+            question = str(value.get("question") or value.get("message") or "").strip()
+            if not question:
+                raise ValidationError("Issue confirmation state requires a question")
+            return AgentAction(
+                AgentActionKind.ASK,
+                summary=str(value.get("summary") or "等待用户确认是否继续修改"),
+                question=question,
+            )
+        if value.get("kind") == AgentActionKind.FINISH.value and str(value.get("question") or "").strip():
+            return AgentAction(
+                AgentActionKind.ASK,
+                summary=str(value.get("summary") or "等待用户补充信息"),
+                question=str(value["question"]).strip(),
+            )
         if value.get("kind") == AgentActionKind.APPLY_CODE_CHANGE.value:
             if context.code_candidate is None:
-                self._prepare_code_change(context)
+                try:
+                    self._prepare_code_change(context)
+                except (LLMProviderError, ValidationError) as exc:
+                    raise WorkflowError(f"code candidate preparation failed: {exc}") from exc
             return AgentAction(
                 AgentActionKind.APPLY_CODE_CHANGE,
                 summary=str(value.get("summary") or "提交 Coding Agent 生成并验证的候选补丁供你审阅"),
@@ -427,6 +459,8 @@ class IssueAgent:
             )
         data = reads[-1].get("data")
         if not isinstance(data, dict) or not isinstance(data.get("end_line"), int):
+            return action
+        if data.get("truncated") is not True:
             return action
         continuation = dict(action.arguments)
         continuation["start_line"] = data["end_line"] + 1

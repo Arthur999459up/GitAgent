@@ -48,6 +48,7 @@ class AgentContext:
         self.entity_type = entity_type
         self.entity_id = entity_id
         self.guidance = guidance
+        self.phase = ""
         self.steps = 0
         self.max_steps = max_steps
         self.observations: list[dict[str, Any]] = []
@@ -169,6 +170,7 @@ class AgentHarness:
             result = operation(context)
             self._validate_output(context.spec, result)
         except Exception as exc:
+            context.error = str(exc)
             self.trace.emit(
                 session_id=session_id,
                 category=TraceCategory.AGENT,
@@ -400,6 +402,7 @@ def debug_context_snapshot(context: AgentContext) -> dict[str, Any]:
         }
     return {
         "agent": context.agent,
+        "phase": context.phase,
         "repository": context.repository,
         "goal": debug_value(context.goal, key="goal"),
         "entity_type": context.entity_type,

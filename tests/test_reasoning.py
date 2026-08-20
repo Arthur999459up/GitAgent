@@ -1,9 +1,10 @@
 import json
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
-from AGENT.GitAgent.gitagent.core.errors import StructuredOutputError, ValidationError
-from AGENT.GitAgent.gitagent.reasoning import ChatResponse, LLMReasoner, OpenAIChatClient
+from AGENT.GitAgent.gitagent.core.errors import LLMProviderError, StructuredOutputError, ValidationError
+from AGENT.GitAgent.gitagent.reasoning import ChatResponse, LLMReasoner, OpenAIChatClient, ToolCall
 
 
 class FakeCompletions:
@@ -16,6 +17,12 @@ class FakeCompletions:
         return self.response
 
 
+class TimeoutCompletions:
+    def create(self, **params):
+        del params
+        raise TimeoutError("provider stalled")
+
+
 class FakeReasoningClient:
     model = "fake-model"
     total_prompt_tokens = 0
@@ -26,8 +33,33 @@ class FakeReasoningClient:
         self.messages = None
 
     def chat(self, messages, tools=None, on_token=None):
+        del tools, on_token
         self.messages = messages
         return ChatResponse(content=self.content)
+
+
+class FormatRetryClient:
+    model = "fake-model"
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    def __init__(self):
+        self.calls: list[dict[str, Any]] = []
+
+    def chat(self, messages, tools=None, on_token=None):
+        del on_token
+        self.calls.append({"messages": messages, "tools": tools})
+        if len(self.calls) == 1:
+            return ChatResponse(content="I changed the file, but forgot the structured result.")
+        return ChatResponse(
+            tool_calls=[
+                ToolCall(
+                    id="retry-1",
+                    name="prepare_candidate",
+                    arguments={"files": {"src/app.py": "fixed\n"}},
+                )
+            ]
+        )
 
 
 def test_openai_client_normalizes_response_and_counts_tokens():
@@ -44,7 +76,10 @@ def test_openai_client_normalizes_response_and_counts_tokens():
     transport = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     client = OpenAIChatClient("test-model", "test-key", client=transport)
 
-    result = client.chat([{"role": "user", "content": "hello"}])
+    result = client.chat(
+        [{"role": "user", "content": "hello"}],
+        tools=[{"type": "function", "function": {"name": "lookup"}}],
+    )
 
     assert result.content == "done"
     assert result.tool_calls[0].arguments == {"path": "README.md"}
@@ -61,6 +96,14 @@ def test_openai_client_rejects_malformed_tool_arguments():
     client = OpenAIChatClient("test-model", "test-key", client=transport)
 
     with pytest.raises(StructuredOutputError, match="合法 JSON"):
+        client.chat([{"role": "user", "content": "hello"}])
+
+
+def test_openai_client_reports_timeout_separately_from_other_provider_failures():
+    transport = SimpleNamespace(chat=SimpleNamespace(completions=TimeoutCompletions()))
+    client = OpenAIChatClient("test-model", "test-key", timeout=42, client=transport)
+
+    with pytest.raises(LLMProviderError, match="请求超时.*42 秒"):
         client.chat([{"role": "user", "content": "hello"}])
 
 
@@ -86,6 +129,30 @@ def test_structured_reasoner_extracts_first_valid_object():
     assert result == {"answer": {"ok": True}}
     assert client.messages[0]["role"] == "system"
     assert "JSON" in client.messages[0]["content"]
+
+
+def test_structured_reasoner_retries_invalid_text_as_the_required_function_call():
+    client = FormatRetryClient()
+    reasoner = LLMReasoner(client)
+    schema = {
+        "type": "object",
+        "properties": {
+            "files": {"type": "object", "additionalProperties": {"type": "string"}},
+        },
+        "required": ["files"],
+        "additionalProperties": False,
+    }
+
+    result = reasoner.complete_structured(
+        system="system",
+        prompt="fix src/app.py",
+        schema=schema,
+        tool_name="prepare_candidate",
+    )
+
+    assert result == {"files": {"src/app.py": "fixed\n"}}
+    assert len(client.calls) == 2
+    assert "call prepare_candidate exactly once" in client.calls[1]["messages"][-1]["content"]
 
 
 def test_structured_reasoner_rejects_non_json_response():

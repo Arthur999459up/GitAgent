@@ -233,7 +233,16 @@ class GitAgentService:
             guidance=guidance,
         )
         if decision.target_agent == "code_change":
-            context.change_request = ChangeRequest(repository=repository, description=goal)
+            issue_number = (
+                int(decision.entity_id)
+                if decision.entity_type == "issue" and decision.entity_id and decision.entity_id.isdigit()
+                else None
+            )
+            context.change_request = ChangeRequest(
+                repository=repository,
+                description=goal,
+                issue_number=issue_number,
+            )
             self.loop.start(context, self.code_change_controller)
             return self._after_loop(context)
         if decision.target_agent == "issues":

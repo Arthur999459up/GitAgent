@@ -91,6 +91,7 @@ class OpenAIChatClient:
         self.client = client
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.timeout = timeout
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
 
@@ -116,7 +117,7 @@ class OpenAIChatClient:
         try:
             raw = self.client.chat.completions.create(**params)
         except Exception as exc:
-            raise LLMProviderError("模型提供方请求失败") from exc
+            raise LLMProviderError(_provider_failure_message(exc, timeout=self.timeout)) from exc
         if not getattr(raw, "choices", None):
             raise StructuredOutputError("模型响应不包含 choices")
 
@@ -186,7 +187,7 @@ class LiteLLMChatClient:
         try:
             raw = litellm.completion(**params)
         except Exception as exc:
-            raise LLMProviderError("模型提供方请求失败") from exc
+            raise LLMProviderError(_provider_failure_message(exc, timeout=self.timeout)) from exc
         if not getattr(raw, "choices", None):
             raise StructuredOutputError("模型响应不包含 choices")
 
@@ -215,6 +216,17 @@ def _content_text(content: Any) -> str:
                 parts.append(str(getattr(item, "text", "")))
         return "".join(parts)
     return str(content)
+
+
+def _provider_failure_message(exc: BaseException, *, timeout: float) -> str:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if "timeout" in type(current).__name__.casefold():
+            return f"模型提供方请求超时（单次读取超时 {timeout:g} 秒）"
+        current = current.__cause__ or current.__context__
+    return "模型提供方请求失败"
 
 
 def _tool_calls(raw_calls: Any) -> list[ToolCall]:

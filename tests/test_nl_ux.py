@@ -120,6 +120,82 @@ def test_file_read_stops_after_five_reads():
     assert "5 次读取上限" in action.summary
 
 
+def test_complete_file_read_does_not_force_a_continuation_past_eof():
+    service = build_test_service()
+    context = service.harness.context(
+        "issues",
+        service.session_scope.session_id,
+        repository="sample/widgets",
+        goal="分析 Issue #1",
+        entity_type="issue",
+        entity_id="1",
+    )
+    context.observations.append(
+        {
+            "kind": "tool",
+            "payload": {
+                "tool": "repository.read_file",
+                "arguments": {"path": "corecoder/session.py"},
+                "data": {
+                    "path": "corecoder/session.py",
+                    "start_line": 1,
+                    "end_line": 99,
+                    "content": "complete",
+                    "truncated": False,
+                },
+            },
+        }
+    )
+    requested = AgentAction(
+        AgentActionKind.TOOL,
+        tool="repository.read_file",
+        arguments={"path": "corecoder/session.py", "start_line": 60, "limit": 40},
+    )
+
+    action = service.issue_agent._normalize_file_read(context, requested)
+
+    assert action.arguments["start_line"] == 60
+
+
+def test_truncated_file_read_continues_from_the_next_line():
+    service = build_test_service()
+    context = service.harness.context(
+        "issues",
+        service.session_scope.session_id,
+        repository="sample/widgets",
+        goal="分析 Issue #1",
+        entity_type="issue",
+        entity_id="1",
+    )
+    context.observations.append(
+        {
+            "kind": "tool",
+            "payload": {
+                "tool": "repository.read_file",
+                "arguments": {"path": "src/large.py"},
+                "data": {
+                    "path": "src/large.py",
+                    "start_line": 1,
+                    "end_line": 200,
+                    "content": "page one",
+                    "truncated": True,
+                },
+            },
+        }
+    )
+
+    action = service.issue_agent._normalize_file_read(
+        context,
+        AgentAction(
+            AgentActionKind.TOOL,
+            tool="repository.read_file",
+            arguments={"path": "src/large.py", "limit": 200},
+        ),
+    )
+
+    assert action.arguments["start_line"] == 201
+
+
 def test_issue_detail_answer_keeps_repository_evidence_already_read():
     class CaptureAnswerReasoner:
         def __init__(self) -> None:

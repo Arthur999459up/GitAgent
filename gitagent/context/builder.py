@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from ..core.models import ContextMemory, RoutingContext, SessionScope
-from ..state import MemoryRecord, SessionManager, TurnRecord
+from ..state import OPEN_QUESTION_CHARACTER_LIMIT, MemoryRecord, SessionManager, TurnRecord
 from .compact import (
     SUMMARY_TAIL_UNITS,
     CompactResult,
@@ -720,7 +720,7 @@ def _safe_working_state(value: Mapping[str, Any]) -> dict[str, Any]:
         "goal": _bounded_text(value["goal"], 1000),
         "focus": _safe_focus(value["focus"]),
         "manifests": list(_safe_manifests(value["manifests"])),
-        "open_question": _bounded_text(value["open_question"], 500),
+        "open_question": _bounded_text(value["open_question"], OPEN_QUESTION_CHARACTER_LIMIT),
     }
 
 

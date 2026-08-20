@@ -28,6 +28,36 @@ def test_default_state_path_is_absolute():
     assert config.state_path.startswith("/")
 
 
+def test_llm_and_github_timeouts_can_be_configured_independently(monkeypatch):
+    monkeypatch.setenv("GITAGENT_REQUEST_TIMEOUT", "31")
+    monkeypatch.setenv("GITAGENT_LLM_TIMEOUT", "90")
+    monkeypatch.setenv("GITAGENT_GITHUB_TIMEOUT", "12")
+
+    config = CLIConfig.from_env()
+
+    assert config.request_timeout == 31
+    assert config.effective_llm_timeout == 90
+    assert config.effective_github_timeout == 12
+
+
+def test_runtime_default_allows_slower_code_generation(monkeypatch):
+    monkeypatch.delenv("GITAGENT_REQUEST_TIMEOUT", raising=False)
+    monkeypatch.delenv("GITAGENT_LLM_TIMEOUT", raising=False)
+    monkeypatch.delenv("GITAGENT_GITHUB_TIMEOUT", raising=False)
+
+    config = CLIConfig.from_env()
+
+    assert config.effective_llm_timeout == 300
+    assert config.effective_github_timeout == 30
+
+
+def test_legacy_request_timeout_remains_the_default_for_both_clients():
+    config = CLIConfig(request_timeout=45)
+
+    assert config.effective_llm_timeout == 45
+    assert config.effective_github_timeout == 45
+
+
 def test_draft_result_is_a_user_visible_first_class_output():
     draft = DraftResult(
         entity_type="issue",

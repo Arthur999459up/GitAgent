@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 from AGENT.GitAgent.gitagent.core.errors import StateError, ValidationError
@@ -15,6 +16,7 @@ from AGENT.GitAgent.gitagent.state import (
     build_account_key,
     build_repository_key,
     default_working_state,
+    merge_working_state,
     truncate_utf8,
 )
 
@@ -68,6 +70,21 @@ def test_default_working_state_is_session_main_agent_memory():
         "manifests": [],
         "open_question": "",
     }
+
+
+def test_projection_open_question_allows_fifty_thousand_characters_and_truncates_larger_values():
+    question = "问" * 60_000
+    projection = SimpleNamespace(
+        goals=(),
+        entity_manifests=(),
+        focus=None,
+        open_question=question,
+    )
+
+    state = merge_working_state(default_working_state(), projection=projection)
+
+    assert len(state["open_question"]) == 50_000
+    assert "[TRUNCATED]" in state["open_question"]
 
 
 def test_session_agent_context_survives_restart(tmp_path):

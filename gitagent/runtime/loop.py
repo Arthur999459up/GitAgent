@@ -372,7 +372,7 @@ def rejection_feedback(context: AgentContext) -> str | None:
 def render_observations(context: AgentContext) -> str:
     """Return bounded observations as valid JSON; never truncate serialized JSON text."""
     observations = context.observations[-20:]
-    for string_limit, item_limit in ((2_000, 20), (750, 10), (240, 5)):
+    for string_limit, item_limit in ((2_000, 20), (750, 10), (240, 5), (240, 5), (240, 5)):
         entries: list[dict[str, Any]] = []
         for observation in observations:
             if observation["kind"] == "tool":
@@ -381,9 +381,17 @@ def render_observations(context: AgentContext) -> str:
                     {
                         "tool": payload.get("tool", ""),
                         "arguments": _compact(
-                            payload.get("arguments", {}), string_limit=string_limit, item_limit=item_limit
+                            payload.get("arguments", {}),
+                            string_limit=string_limit,
+                            item_limit=item_limit,
+                            content_limit=8_000,
                         ),
-                        "data": _compact(payload.get("data"), string_limit=string_limit, item_limit=item_limit),
+                        "data": _compact(
+                            payload.get("data"),
+                            string_limit=string_limit,
+                            item_limit=item_limit,
+                            content_limit=8_000,
+                        ),
                     }
                 )
             else:
@@ -404,9 +412,18 @@ def render_observations(context: AgentContext) -> str:
     )
 
 
-def _compact(value: Any, *, depth: int = 0, string_limit: int = 2_000, item_limit: int = 20) -> Any:
+def _compact(
+    value: Any,
+    *,
+    depth: int = 0,
+    string_limit: int = 2_000,
+    item_limit: int = 20,
+    content_limit: int | None = None,
+    key: str = "",
+) -> Any:
     if isinstance(value, str):
-        return value[:string_limit]
+        limit = content_limit if key == "content" and content_limit is not None else string_limit
+        return value[:limit]
     if isinstance(value, dict):
         if depth > 4:
             return f"<{len(value)} keys>"
@@ -434,9 +451,23 @@ def _compact(value: Any, *, depth: int = 0, string_limit: int = 2_000, item_limi
         ordered_keys.extend(key for key in value if key not in ordered_keys)
         items = [(key, value[key]) for key in ordered_keys[:item_limit]]
         compacted = {
-            key: _compact(item, depth=depth + 1, string_limit=string_limit, item_limit=item_limit)
-            for key, item in items
+            item_key: _compact(
+                item,
+                depth=depth + 1,
+                string_limit=string_limit,
+                item_limit=item_limit,
+                content_limit=content_limit,
+                key=str(item_key),
+            )
+            for item_key, item in items
         }
+        content = value.get("content")
+        if isinstance(content, str) and content_limit is not None and len(content) > content_limit:
+            compacted["__content_projection__"] = {
+                "truncated": True,
+                "original_chars": len(content),
+                "retained_chars": content_limit,
+            }
         if len(value) > item_limit:
             compacted["__omitted__"] = f"{len(value) - item_limit} more keys"
         return compacted
@@ -444,7 +475,13 @@ def _compact(value: Any, *, depth: int = 0, string_limit: int = 2_000, item_limi
         if depth > 4:
             return f"<{len(value)} items>"
         items = [
-            _compact(item, depth=depth + 1, string_limit=string_limit, item_limit=item_limit)
+            _compact(
+                item,
+                depth=depth + 1,
+                string_limit=string_limit,
+                item_limit=item_limit,
+                content_limit=content_limit,
+            )
             for item in value[:item_limit]
         ]
         if len(value) > item_limit:

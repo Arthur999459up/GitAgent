@@ -346,14 +346,14 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         base_url=config.base_url,
         temperature=config.temperature,
         max_tokens=config.max_tokens,
-        timeout=config.request_timeout,
+        timeout=config.effective_llm_timeout,
     )
     reasoner = LLMReasoner(llm)
     trace = TraceBus()
     server = GitHubMCPServer(
         token=config.github_token,
         api_url=config.github_api_url,
-        timeout=config.request_timeout,
+        timeout=config.effective_github_timeout,
     )
     store = StateStore(config.state_path, secret_values=(config.github_token, config.api_key))
     sessions = SessionManager(store)
