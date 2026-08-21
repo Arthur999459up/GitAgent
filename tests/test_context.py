@@ -33,7 +33,6 @@ class SessionRecord:
 class TurnRecord:
     seq: int
     status: str = "completed"
-    turn_kind: str = "conversation"
     history_text: str = "handled safely"
     assistant_text: str = "visible result"
     route_summary: list[dict[str, Any]] = field(default_factory=list)
@@ -267,11 +266,10 @@ def test_manual_compaction_uses_the_same_tail_and_is_idempotent() -> None:
     assert len(manager.summary_saves) == 1
 
 
-def test_compactor_ignores_interrupted_and_memory_hint_rows() -> None:
+def test_compactor_ignores_interrupted_rows() -> None:
     turns = [_turn(seq) for seq in range(1, 9)]
     turns.insert(2, TurnRecord(seq=20, status="interrupted"))
-    turns.insert(3, TurnRecord(seq=21, turn_kind="memory_hint"))
     compactor = DeterministicCompactor()
     plan = compactor.plan(turns, context_boundary_seq=0, summary_through_seq=0)
 
-    assert all(turn.status != "interrupted" and turn.turn_kind != "memory_hint" for turn in plan.turns)
+    assert all(turn.status != "interrupted" for turn in plan.turns)

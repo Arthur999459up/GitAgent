@@ -14,7 +14,7 @@ from typing import Any
 
 from ..core.errors import StateError, ValidationError
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 REDACTED = "[REDACTED]"
 
 _SECRET_PATTERNS = (
@@ -55,8 +55,7 @@ _TABLE_DEFINITIONS = {
             summary TEXT NOT NULL DEFAULT '',
             summary_through_seq INTEGER NOT NULL DEFAULT 0 CHECK(summary_through_seq >= 0),
             working_state TEXT NOT NULL,
-            agent_context TEXT NOT NULL DEFAULT '{}',
-            UNIQUE(session_id, account_key, repository_key)
+            agent_context TEXT NOT NULL DEFAULT '{}'
         )
     """,
     "turns": """
@@ -64,7 +63,6 @@ _TABLE_DEFINITIONS = {
             session_id TEXT NOT NULL,
             seq INTEGER NOT NULL CHECK(seq >= 1),
             status TEXT NOT NULL CHECK(status IN ('started','completed','failed','interrupted')),
-            turn_kind TEXT NOT NULL CHECK(turn_kind IN ('conversation','memory_hint')),
             user_text TEXT NOT NULL,
             assistant_text TEXT NOT NULL DEFAULT '',
             history_text TEXT NOT NULL DEFAULT '',
@@ -94,22 +92,15 @@ _TABLE_DEFINITIONS = {
             )
         )
     """,
-    "active_sessions": """
-        CREATE TABLE active_sessions (
-            account_key TEXT NOT NULL,
-            repository_key TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            PRIMARY KEY(account_key, repository_key),
-            FOREIGN KEY(session_id, account_key, repository_key)
-                REFERENCES sessions(session_id, account_key, repository_key) ON DELETE RESTRICT
-        )
-    """,
 }
 
 _INDEX_DEFINITIONS = {
     "turns_by_session_status": "CREATE INDEX turns_by_session_status ON turns(session_id, status, seq)",
     "sessions_by_scope_updated": (
         "CREATE INDEX sessions_by_scope_updated ON sessions(account_key, repository_key, updated_at DESC)"
+    ),
+    "sessions_by_account_updated": (
+        "CREATE INDEX sessions_by_account_updated ON sessions(account_key, updated_at DESC)"
     ),
     "memories_by_scope_updated": (
         "CREATE INDEX memories_by_scope_updated ON memories(account_key, repository_key, scope, updated_at DESC)"

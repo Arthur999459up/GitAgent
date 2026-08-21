@@ -217,7 +217,10 @@ def test_file_coverage_and_observed_content_survive_agent_context_persistence():
             },
         }
     )
-    restored = service._restore_context(service._serialize_context(context))
+    restored = service._restore_context(
+        service._serialize_context(context),
+        repository="sample/widgets",
+    )
     trace_before = len(service.harness.trace.events(context.session_id))
 
     repeated = restored.tool(

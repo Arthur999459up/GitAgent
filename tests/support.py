@@ -258,7 +258,7 @@ def build_test_service(
     sessions = SessionManager(store)
     account_key = build_account_key("https://api.github.com", 1)
     repository_key = build_repository_key("https://api.github.com", 1)
-    session = sessions.activate_scope(account_key, repository_key, "sample/widgets")
+    session = sessions.create_session(account_key, repository_key, "sample/widgets")
     reasoner = main_reasoner or StubMainReasoner(main_responses)
     service = GitAgentService(
         server or InMemoryMCPServer(sample_repositories()),

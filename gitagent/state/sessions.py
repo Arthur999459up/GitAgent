@@ -52,7 +52,6 @@ class TurnRecord:
     session_id: str
     seq: int
     status: str
-    turn_kind: str
     user_text: str
     assistant_text: str
     history_text: str
@@ -119,66 +118,11 @@ class SessionManager:
         self.token_counter = token_counter or estimate_tokens
         self.recover_interrupted()
 
-    def activate_scope(
-        self,
-        account_key: str,
-        repository_key: str,
-        repository_full_name: str,
-        *,
-        previous_scope: SessionScope | None = None,
-        prepared_session_id: str | None = None,
-    ) -> SessionRecord:
-        _validate_scope_keys(account_key, repository_key)
-        if previous_scope is not None:
-            _validate_session_scope(previous_scope)
-        if prepared_session_id is not None:
-            _validate_session_id(prepared_session_id)
-        full_name = self.store.text(
-            _require_string(repository_full_name, "repository_full_name", maximum=240, allow_empty=False)
-        )
-        with self.store.transaction() as connection:
-            row = connection.execute(
-                """
-                SELECT s.* FROM active_sessions a
-                JOIN sessions s ON s.session_id=a.session_id
-                WHERE a.account_key=? AND a.repository_key=?
-                """,
-                (account_key, repository_key),
-            ).fetchone()
-            if row is None:
-                session = self._insert_session_tx(
-                    connection,
-                    account_key,
-                    repository_key,
-                    full_name,
-                    "",
-                    session_id=prepared_session_id,
-                )
-            else:
-                session = _session(row)
-                connection.execute(
-                    """
-                    UPDATE sessions SET repository_full_name=?
-                    WHERE account_key=? AND repository_key=? AND repository_full_name<>?
-                    """,
-                    (full_name, account_key, repository_key, full_name),
-                )
-            connection.execute(
-                """
-                INSERT INTO active_sessions(account_key, repository_key, session_id) VALUES(?,?,?)
-                ON CONFLICT(account_key, repository_key) DO UPDATE SET session_id=excluded.session_id
-                """,
-                (account_key, repository_key, session.session_id),
-            )
-            row = self._session_row_tx(connection, account_key, repository_key, session.session_id)
-            return _session(row)
-
     def create_session(
         self,
         account_key: str,
         repository_key: str,
         repository_full_name: str,
-        title: str = "",
         *,
         session_id: str | None = None,
     ) -> SessionRecord:
@@ -188,24 +132,27 @@ class SessionManager:
         full_name = self.store.text(
             _require_string(repository_full_name, "repository_full_name", maximum=240, allow_empty=False)
         )
-        _require_string(title, "title", maximum=80)
         with self.store.transaction() as connection:
-            session = self._insert_session_tx(
+            return self._insert_session_tx(
                 connection,
                 account_key,
                 repository_key,
                 full_name,
-                title,
                 session_id=session_id,
             )
-            connection.execute(
-                """
-                INSERT INTO active_sessions(account_key, repository_key, session_id) VALUES(?,?,?)
-                ON CONFLICT(account_key, repository_key) DO UPDATE SET session_id=excluded.session_id
-                """,
-                (account_key, repository_key, session.session_id),
-            )
-            return session
+
+    def get_account_session(self, account_key: str, session_id: str) -> SessionRecord | None:
+        account_key, _ = _validate_account_key(account_key)
+        _validate_session_id(session_id)
+        connection = self.store.read()
+        try:
+            row = connection.execute(
+                "SELECT * FROM sessions WHERE account_key=? AND session_id=?",
+                (account_key, session_id),
+            ).fetchone()
+            return _session(row) if row is not None else None
+        finally:
+            connection.close()
 
     def get_session(
         self,
@@ -221,15 +168,6 @@ class SessionManager:
                 "SELECT * FROM sessions WHERE account_key=? AND repository_key=? AND session_id=?",
                 (account_key, repository_key, session_id),
             ).fetchone()
-            return _session(row) if row is not None else None
-        finally:
-            connection.close()
-
-    def active_session(self, account_key: str, repository_key: str) -> SessionRecord | None:
-        _validate_scope_keys(account_key, repository_key)
-        connection = self.store.read()
-        try:
-            row = self._active_row_tx(connection, account_key, repository_key)
             return _session(row) if row is not None else None
         finally:
             connection.close()
@@ -262,29 +200,20 @@ class SessionManager:
         finally:
             connection.close()
 
-    def switch_session(
-        self,
-        account_key: str,
-        repository_key: str,
-        session_id: str,
-    ) -> SessionRecord:
-        _validate_scope_keys(account_key, repository_key)
-        _validate_session_id(session_id)
-        with self.store.transaction() as connection:
-            target_row = self._session_row_tx(connection, account_key, repository_key, session_id, required=False)
-            if target_row is None:
-                raise StateError("Session not found")
-            active = self._active_row_tx(connection, account_key, repository_key)
-            if active is not None and _session(active).session_id == session_id:
-                return _session(target_row)
-            connection.execute(
+    def list_account_sessions(self, account_key: str) -> tuple[SessionRecord, ...]:
+        account_key, _ = _validate_account_key(account_key)
+        connection = self.store.read()
+        try:
+            rows = connection.execute(
                 """
-                INSERT INTO active_sessions(account_key, repository_key, session_id) VALUES(?,?,?)
-                ON CONFLICT(account_key, repository_key) DO UPDATE SET session_id=excluded.session_id
+                SELECT * FROM sessions WHERE account_key=?
+                ORDER BY updated_at DESC, session_id ASC
                 """,
-                (account_key, repository_key, session_id),
-            )
-            return _session(target_row)
+                (account_key,),
+            ).fetchall()
+            return tuple(_session(row) for row in rows)
+        finally:
+            connection.close()
 
     def reset_session(self, scope: SessionScope) -> SessionRecord:
         _validate_session_scope(scope)
@@ -311,12 +240,8 @@ class SessionManager:
     def delete_session(
         self,
         scope: SessionScope,
-        *,
-        prepared_replacement_id: str | None = None,
     ) -> SessionRecord:
         _validate_session_scope(scope)
-        if prepared_replacement_id is not None:
-            _validate_session_id(prepared_replacement_id)
         with self.store.transaction() as connection:
             target = self._session_row_tx(
                 connection,
@@ -327,37 +252,28 @@ class SessionManager:
             )
             if target is None:
                 raise StateError("Session not found")
-            active = self._active_row_tx(connection, scope.account_key, scope.repository_key)
-            deleting_active = active is not None and _session(active).session_id == scope.session_id
-            if not deleting_active:
-                connection.execute("DELETE FROM sessions WHERE session_id=?", (scope.session_id,))
-                current = self._active_row_tx(connection, scope.account_key, scope.repository_key)
-                if current is None:
-                    raise StateError("active Session mapping is missing")
-                return _session(current)
+            connection.execute("DELETE FROM sessions WHERE session_id=?", (scope.session_id,))
+            return _session(target)
 
-            replacement_row = connection.execute(
-                """
-                SELECT * FROM sessions
-                WHERE account_key=? AND repository_key=? AND session_id<>?
-                ORDER BY updated_at DESC, session_id ASC LIMIT 1
-                """,
-                (scope.account_key, scope.repository_key, scope.session_id),
-            ).fetchone()
-            if replacement_row is None:
-                replacement = self._insert_session_tx(
-                    connection,
-                    scope.account_key,
-                    scope.repository_key,
-                    _session(target).repository_full_name,
-                    "",
-                    session_id=prepared_replacement_id,
-                )
-            else:
-                replacement = _session(replacement_row)
-            connection.execute(
-                "UPDATE active_sessions SET session_id=? WHERE account_key=? AND repository_key=?",
-                (replacement.session_id, scope.account_key, scope.repository_key),
+    def replace_session(self, scope: SessionScope, replacement_session_id: str) -> SessionRecord:
+        _validate_session_scope(scope)
+        _validate_session_id(replacement_session_id)
+        if replacement_session_id == scope.session_id:
+            raise ValidationError("replacement Session must use a new ID")
+        with self.store.transaction() as connection:
+            target_row = self._session_row_tx(
+                connection,
+                scope.account_key,
+                scope.repository_key,
+                scope.session_id,
+            )
+            target = _session(target_row)
+            replacement = self._insert_session_tx(
+                connection,
+                target.account_key,
+                target.repository_key,
+                target.repository_full_name,
+                session_id=replacement_session_id,
             )
             connection.execute("DELETE FROM sessions WHERE session_id=?", (scope.session_id,))
             return replacement
@@ -366,12 +282,8 @@ class SessionManager:
         self,
         scope: SessionScope,
         user_text: str,
-        *,
-        turn_kind: str = "conversation",
     ) -> TurnRecord:
         _validate_session_scope(scope)
-        if turn_kind not in {"conversation", "memory_hint"}:
-            raise ValidationError("turn_kind must be conversation or memory_hint")
         safe_user = self.store.text(_require_string(user_text, "user_text", allow_empty=False), max_bytes=8 * 1024)
         with self.store.transaction() as connection:
             self._session_row_tx(connection, scope.account_key, scope.repository_key, scope.session_id)
@@ -383,16 +295,20 @@ class SessionManager:
                 "next Turn sequence",
             )
             now = _utc_now()
+            first_conversation = connection.execute(
+                "SELECT 1 FROM turns WHERE session_id=? LIMIT 1",
+                (scope.session_id,),
+            ).fetchone() is None
             connection.execute(
                 """
-                INSERT INTO turns(session_id,seq,status,turn_kind,user_text,created_at)
-                VALUES(?,?,'started',?,?,?)
+                INSERT INTO turns(session_id,seq,status,user_text,created_at)
+                VALUES(?,?,'started',?,?)
                 """,
-                (scope.session_id, seq, turn_kind, safe_user, now),
+                (scope.session_id, seq, safe_user, now),
             )
             connection.execute(
-                "UPDATE sessions SET updated_at=? WHERE session_id=?",
-                (now, scope.session_id),
+                "UPDATE sessions SET title=CASE WHEN ? THEN ? ELSE title END,updated_at=? WHERE session_id=?",
+                (first_conversation, _title_from_user_text(safe_user), now, scope.session_id),
             )
             return _turn(
                 connection.execute(
@@ -427,23 +343,11 @@ class SessionManager:
         with self.store.transaction() as connection:
             self._session_row_tx(connection, scope.account_key, scope.repository_key, scope.session_id)
             row = connection.execute(
-                "SELECT status,turn_kind FROM turns WHERE session_id=? AND seq=?",
+                "SELECT status FROM turns WHERE session_id=? AND seq=?",
                 (scope.session_id, seq),
             ).fetchone()
             if row is None or row["status"] != "started":
                 raise StateError("Turn is missing or no longer in started state")
-            if row["turn_kind"] == "memory_hint":
-                current = self._session_row_tx(
-                    connection,
-                    scope.account_key,
-                    scope.repository_key,
-                    scope.session_id,
-                )
-                current_state = _validate_working_state(
-                    json.loads(_require_string(current["working_state"], "working_state"))
-                )
-                if safe_history or routes or manifests or state != current_state:
-                    raise ValidationError("memory_hint Turns cannot change history or Working State")
             now = _utc_now()
             connection.execute(
                 """
@@ -472,13 +376,13 @@ class SessionManager:
         with self.store.transaction() as connection:
             self._session_row_tx(connection, scope.account_key, scope.repository_key, scope.session_id)
             row = connection.execute(
-                "SELECT status,turn_kind FROM turns WHERE session_id=? AND seq=?",
+                "SELECT status FROM turns WHERE session_id=? AND seq=?",
                 (scope.session_id, seq),
             ).fetchone()
             if row is None or row["status"] != "started":
                 raise StateError("Turn is missing or no longer in started state")
             now = _utc_now()
-            history = "" if row["turn_kind"] == "memory_hint" else f"failed: {category}"
+            history = f"failed: {category}"
             connection.execute(
                 """
                 UPDATE turns SET status='failed',assistant_text=?,history_text=?,completed_at=?
@@ -678,7 +582,6 @@ class SessionManager:
         account_key: str,
         repository_key: str,
         repository_full_name: str,
-        title: str,
         *,
         session_id: str | None = None,
     ) -> SessionRecord:
@@ -689,9 +592,7 @@ class SessionManager:
             maximum=240,
             allow_empty=False,
         )
-        title = _require_string(title, "title", maximum=80)
         now = _utc_now()
-        safe_title = self.store.text(title.strip(), max_characters=80) if title.strip() else _default_title(now)
         session_id = session_id or f"session-{uuid.uuid4().hex}"
         session_id = _validate_session_id(session_id)
         working_state = self.store.json(_validate_working_state(default_working_state()), max_bytes=32 * 1024)
@@ -707,23 +608,13 @@ class SessionManager:
                 self.store.text(account_key, max_characters=500),
                 self.store.text(repository_key, max_characters=500),
                 self.store.text(repository_full_name, max_characters=240),
-                safe_title,
+                _default_title(),
                 now,
                 now,
                 working_state,
             ),
         )
         return _session(connection.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone())
-
-    @staticmethod
-    def _active_row_tx(connection: Any, account_key: str, repository_key: str) -> Any:
-        return connection.execute(
-            """
-            SELECT s.* FROM active_sessions a JOIN sessions s ON s.session_id=a.session_id
-            WHERE a.account_key=? AND a.repository_key=?
-            """,
-            (account_key, repository_key),
-        ).fetchone()
 
     @staticmethod
     def _session_row_tx(
@@ -927,9 +818,6 @@ def _turn(row: Any) -> TurnRecord:
         status = _require_string(row["status"], "Turn status", allow_empty=False)
         if status not in {"started", "completed", "failed", "interrupted"}:
             raise ValidationError("stored Turn status is invalid")
-        turn_kind = _require_string(row["turn_kind"], "turn_kind", allow_empty=False)
-        if turn_kind not in {"conversation", "memory_hint"}:
-            raise ValidationError("stored turn_kind is invalid")
         user_text = _bounded_stored_text(row["user_text"], "user_text", 8 * 1024)
         assistant_text = _bounded_stored_text(row["assistant_text"], "assistant_text", 8 * 1024)
         history_text = _bounded_stored_text(row["history_text"], "history_text", 2 * 1024)
@@ -945,15 +833,12 @@ def _turn(row: Any) -> TurnRecord:
             completed_at = _require_utc_timestamp(row["completed_at"], "completed_at")
         if (status == "started") != (completed_at is None):
             raise ValidationError("stored Turn completion timestamp is inconsistent")
-        if turn_kind == "memory_hint" and (history_text or route_summary or entity_manifests):
-            raise ValidationError("stored memory_hint Turn contains history")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, ValidationError) as exc:
         raise StateError("stored Turn record is invalid") from exc
     return TurnRecord(
         session_id=session_id,
         seq=seq,
         status=status,
-        turn_kind=turn_kind,
         user_text=user_text,
         assistant_text=assistant_text,
         history_text=history_text,
@@ -1133,8 +1018,15 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _default_title(created_at: str) -> str:
-    return f"Session {created_at[:19].replace('T', ' ')} UTC"
+def _default_title() -> str:
+    return "新会话（等待首条消息）"
+
+
+def _title_from_user_text(value: str) -> str:
+    title = _normalize_whitespace(value)
+    if len(title) <= 60:
+        return title
+    return f"{title[:59].rstrip()}…"
 
 
 def estimate_tokens(value: str) -> int:

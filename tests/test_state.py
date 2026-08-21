@@ -1,4 +1,4 @@
-"""StateStore v4 and Session-owned working-memory persistence tests."""
+"""StateStore and Session-owned working-memory persistence tests."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+from AGENT.GitAgent.gitagent.context import ContextBuilder
 from AGENT.GitAgent.gitagent.core.errors import StateError, ValidationError
 from AGENT.GitAgent.gitagent.state import (
     REDACTED,
@@ -29,7 +30,7 @@ def _session(store):
     manager = SessionManager(store)
     account = build_account_key("https://api.github.test", 1)
     repo = build_repository_key("https://api.github.test", 2)
-    return manager, manager.activate_scope(account, repo, "sample/widgets")
+    return manager, manager.create_session(account, repo, "sample/widgets")
 
 
 def test_stable_identity_uses_normalized_url_and_numeric_ids():
@@ -57,7 +58,7 @@ def test_store_permissions_schema_and_foreign_keys(tmp_path):
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
             if not str(row[0]).startswith("sqlite_")
         }
-        assert tables == {"schema_metadata", "sessions", "turns", "memories", "active_sessions"}
+        assert tables == {"schema_metadata", "sessions", "turns", "memories"}
     finally:
         connection.close()
 
@@ -70,6 +71,103 @@ def test_default_working_state_is_session_main_agent_memory():
         "manifests": [],
         "open_question": "",
     }
+
+
+def test_first_conversation_sets_a_short_stable_session_title(tmp_path):
+    manager, session = _session(_store(tmp_path))
+    assert session.title == "新会话（等待首条消息）"
+
+    first_text = "  请检查   Session 隔离，尤其是恢复时的记忆载入。  " + "补充" * 30
+    first = manager.start_turn(session.scope, first_text)
+    titled = manager.get_session(session.account_key, session.repository_key, session.session_id)
+    assert titled is not None
+    assert titled.title.startswith("请检查 Session 隔离，尤其是恢复时的记忆载入。")
+    assert len(titled.title) == 60
+    assert titled.title.endswith("…")
+
+    manager.fail_turn(session.scope, first.seq, "test failure")
+    second = manager.start_turn(session.scope, "这句话不能覆盖标题")
+    manager.fail_turn(session.scope, second.seq, "test failure")
+    restored = manager.get_session(session.account_key, session.repository_key, session.session_id)
+    assert restored is not None and restored.title == titled.title
+
+
+def test_account_session_listing_and_deletion_do_not_cross_accounts(tmp_path):
+    manager = SessionManager(_store(tmp_path))
+    account = build_account_key("https://api.github.test", 1)
+    other_account = build_account_key("https://api.github.test", 2)
+    first = manager.create_session(
+        account,
+        build_repository_key("https://api.github.test", 10),
+        "sample/one",
+    )
+    second = manager.create_session(
+        account,
+        build_repository_key("https://api.github.test", 20),
+        "sample/two",
+    )
+    hidden = manager.create_session(
+        other_account,
+        build_repository_key("https://api.github.test", 10),
+        "other/private",
+    )
+
+    listed = manager.list_account_sessions(account)
+    assert {session.session_id for session in listed} == {first.session_id, second.session_id}
+    assert manager.get_account_session(account, hidden.session_id) is None
+
+    manager.delete_session(first.scope)
+    assert [session.session_id for session in manager.list_account_sessions(account)] == [second.session_id]
+    assert manager.get_account_session(other_account, hidden.session_id) == hidden
+
+
+def test_context_restore_is_session_isolated_and_loads_only_scoped_memories(tmp_path):
+    manager = SessionManager(_store(tmp_path))
+    account = build_account_key("https://api.github.test", 1)
+    first_repo = build_repository_key("https://api.github.test", 10)
+    second_repo = build_repository_key("https://api.github.test", 20)
+    first = manager.create_session(account, first_repo, "sample/one")
+    sibling = manager.create_session(account, first_repo, "sample/one")
+    other_repo = manager.create_session(account, second_repo, "sample/two")
+
+    turn = manager.start_turn(first.scope, "只属于第一个 Session")
+    manager.complete_turn(
+        first.scope,
+        turn.seq,
+        assistant_text="first answer",
+        history_text="first-session-history",
+        route_summary=[],
+        entity_manifests=[],
+        working_state=default_working_state(),
+    )
+    user_memory, _ = manager.remember(account, first_repo, scope="user", kind="preference", content="统一用中文")
+    first_repo_memory, _ = manager.remember(
+        account,
+        first_repo,
+        scope="repository",
+        kind="constraint",
+        content="仓库一约束",
+    )
+    second_repo_memory, _ = manager.remember(
+        account,
+        second_repo,
+        scope="repository",
+        kind="constraint",
+        content="仓库二约束",
+    )
+
+    builder = ContextBuilder(manager)
+    restored_first = builder.build(first.scope, "sample/one", "继续")
+    restored_sibling = builder.build(sibling.scope, "sample/one", "开始")
+    restored_other_repo = builder.build(other_repo.scope, "sample/two", "开始")
+
+    assert [unit["history_text"] for unit in restored_first.history_units] == ["first-session-history"]
+    assert restored_sibling.history_units == ()
+    assert restored_other_repo.history_units == ()
+    assert [memory.memory_id for memory in restored_first.user_memories] == [user_memory.memory_id]
+    assert [memory.memory_id for memory in restored_sibling.repository_memories] == [first_repo_memory.memory_id]
+    assert [memory.memory_id for memory in restored_other_repo.user_memories] == [user_memory.memory_id]
+    assert [memory.memory_id for memory in restored_other_repo.repository_memories] == [second_repo_memory.memory_id]
 
 
 def test_projection_open_question_allows_fifty_thousand_characters_and_truncates_larger_values():

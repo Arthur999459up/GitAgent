@@ -275,7 +275,7 @@ def merge_summary_records(
 
 
 def is_history_unit(turn: TurnRecord) -> bool:
-    return turn.turn_kind == "conversation" and turn.status in {"completed", "failed"}
+    return turn.status in {"completed", "failed"}
 
 
 def _single_line(value: Any, limit: int) -> str:

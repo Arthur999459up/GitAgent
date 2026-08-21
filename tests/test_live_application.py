@@ -1,8 +1,28 @@
 """Persistence/restart behavior around the Session-scoped service boundary."""
 
+from types import SimpleNamespace
+
+import pytest
+from AGENT.GitAgent.gitagent.app.config import CLIConfig
+from AGENT.GitAgent.gitagent.app.factory import LiveApplication
 from AGENT.GitAgent.gitagent.app.service import GitAgentService
+from AGENT.GitAgent.gitagent.context import ContextBuilder
+from AGENT.GitAgent.gitagent.core.errors import RoutingError, StateError
 from AGENT.GitAgent.gitagent.core.models import DraftResult
-from AGENT.GitAgent.tests.support import StubMainReasoner, build_test_service, routing_context
+from AGENT.GitAgent.gitagent.core.trace import TraceBus
+from AGENT.GitAgent.gitagent.mcp.memory import InMemoryMCPServer
+from AGENT.GitAgent.gitagent.state import (
+    SessionManager,
+    StateStore,
+    build_account_key,
+    build_repository_key,
+)
+from AGENT.GitAgent.tests.support import (
+    StubMainReasoner,
+    build_test_service,
+    routing_context,
+    sample_repositories,
+)
 
 
 def _restart(service):
@@ -82,3 +102,98 @@ def test_session_working_state_contains_main_context_not_task_lifecycle():
         "open_question": "",
     }
     assert session.agent_context == {}
+
+
+def test_application_resume_rebuilds_exact_session_service_and_loads_scoped_memory(tmp_path):
+    api_url = "https://api.github.test"
+    store = StateStore(tmp_path / "state.db")
+    sessions = SessionManager(store)
+    account = build_account_key(api_url, 7)
+    repository = build_repository_key(api_url, 11)
+    target = sessions.create_session(account, repository, "sample/widgets")
+    sibling = sessions.create_session(account, repository, "sample/widgets")
+    sessions.save_agent_context(
+        target.scope,
+        {
+            "agent": "issues",
+            "repository": "sample/widgets",
+            "goal": "继续处理 Issue #1",
+        },
+    )
+    memory, _ = sessions.remember(
+        account,
+        repository,
+        scope="repository",
+        kind="constraint",
+        content="恢复后仍需加载的仓库约束",
+    )
+    reasoner = StubMainReasoner()
+    server = InMemoryMCPServer(sample_repositories())
+    trace = TraceBus()
+
+    def service_factory(scope):
+        return GitAgentService(
+            server,
+            main_reasoner=reasoner,
+            session_manager=sessions,
+            trace=trace,
+            session_scope=scope,
+        )
+
+    stateless_service = service_factory(None)
+    application = LiveApplication(
+        config=CLIConfig(github_api_url=api_url),
+        github=server,
+        llm=SimpleNamespace(),
+        reasoner=reasoner,
+        trace=trace,
+        service=stateless_service,
+        store=store,
+        sessions=sessions,
+        context_builder=ContextBuilder(sessions),
+        _service_factory=service_factory,
+    )
+
+    resumed = application.resume_session(7, target.session_id)
+    restored_agent = application.service._load_context()
+    assert restored_agent is not None and restored_agent.guidance is not None
+    assert [item.memory_id for item in restored_agent.guidance.repository_memories] == [memory.memory_id]
+
+    sessions.forget(account, repository, memory.memory_id)
+    without_forgotten_memory = application.service._load_context()
+    assert without_forgotten_memory is not None and without_forgotten_memory.guidance is None
+    current_memory, _ = sessions.remember(
+        account,
+        repository,
+        scope="repository",
+        kind="constraint",
+        content="更新后的仓库约束",
+    )
+    restored_routing = application.context_builder.build(target.scope, "sample/widgets", "继续")
+    restored_with_memory = application.service._load_context(restored_routing)
+
+    assert resumed.session_id == target.session_id
+    assert resumed.agent_context["goal"] == "继续处理 Issue #1"
+    assert application.scope == target.scope
+    assert application.repository == "sample/widgets"
+    assert stateless_service._invalidated is True
+    assert restored_agent.session_id == target.session_id
+    assert restored_agent.goal == "继续处理 Issue #1"
+    assert [item.memory_id for item in restored_routing.repository_memories] == [current_memory.memory_id]
+    assert restored_with_memory is not None and restored_with_memory.guidance is not None
+    assert [item.memory_id for item in restored_with_memory.guidance.repository_memories] == [current_memory.memory_id]
+    assert sessions.list_turns(sibling.account_key, sibling.repository_key, sibling.session_id) == ()
+    with pytest.raises(StateError, match="not found"):
+        application.resume_session(8, target.session_id)
+
+    sessions.save_agent_context(
+        sibling.scope,
+        {
+            "agent": "issues",
+            "repository": "other/private",
+            "goal": "不应跨仓库恢复",
+        },
+    )
+    application.switch_session(sibling.session_id)
+    with pytest.raises(RoutingError, match="different repository"):
+        application.service._load_context()

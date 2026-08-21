@@ -61,7 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         application = build_live_application(config)
         application.trace.subscribe(ui.trace)
-        if not _select_repository(application):
+        if not _select_startup_session(application):
             return 0
     except (GitAgentError, ValueError) as exc:
         ui.text(str(exc), title="Error · 启动失败", kind="error")
@@ -104,12 +104,56 @@ def _collect_credentials(config: CLIConfig) -> bool:
     return True
 
 
-def _select_repository(application: LiveApplication) -> bool:
-    """读取 Token 可访问仓库，并通过编号或名称筛选进入其中一个仓库。"""
-    previous_repository = application.repository
-    previous_service = application.service
-    with console.status("[cyan]正在验证 GitHub Token 并读取可访问仓库…"):
+def _select_startup_session(application: LiveApplication) -> bool:
+    """让已认证账号显式恢复、创建或删除 Session。"""
+    with console.status("[cyan]正在验证 GitHub Token…"):
         account = application.github.get_authenticated_user()
+    try:
+        authenticated_user_id = _github_numeric_id(account["id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GitAgentError("GitHub 未返回稳定的账号数字 ID") from exc
+
+    login = str(account.get("login") or "unknown")
+    while True:
+        sessions = application.list_account_sessions(authenticated_user_id)
+        _show_sessions(sessions, active_session_id=None, title=f"@{login} Sessions")
+        choice = terminal_prompt("操作：[编号] 恢复  [n] 新建  [d 编号] 删除  [q] 退出\n> ").strip()
+        normalized = choice.casefold()
+        if normalized in {"q", "quit", "exit", "/quit", "/exit"}:
+            return False
+        if normalized in {"n", "new", "/new"}:
+            return _select_repository(application, account=account)
+
+        delete_reference = _delete_reference(choice)
+        if delete_reference is not None:
+            try:
+                target = _session_from_number(sessions, delete_reference)
+                application.delete_account_session(authenticated_user_id, target.session_id)
+                console.print(f"已删除 Session [cyan]{target.session_id}[/cyan]。")
+            except (GitAgentError, ValueError) as exc:
+                console.print(f"[red]Session 删除失败：{exc}[/red]")
+            continue
+
+        try:
+            target = _session_from_number(sessions, choice)
+            resumed = application.resume_session(authenticated_user_id, target.session_id)
+        except (GitAgentError, ValueError) as exc:
+            console.print(f"[yellow]无法恢复 Session：{exc}[/yellow]")
+            continue
+        console.print(
+            f"已恢复 [bold cyan]{resumed.repository_full_name}[/bold cyan] · "
+            f"[cyan]{resumed.title}[/cyan]"
+        )
+        _show_session_safety_note()
+        return True
+
+
+def _select_repository(application: LiveApplication, *, account: dict[str, Any] | None = None) -> bool:
+    """读取 Token 可访问仓库，并为所选仓库创建一个全新 Session。"""
+    previous_repository = application.repository
+    with console.status("[cyan]正在读取可访问仓库…"):
+        if account is None:
+            account = application.github.get_authenticated_user()
         repositories = application.github.list_repositories()
     if not repositories:
         raise GitAgentError("当前 GitHub Token 没有可访问的仓库")
@@ -146,13 +190,13 @@ def _select_repository(application: LiveApplication) -> bool:
     except (KeyError, TypeError, ValueError) as exc:
         raise GitAgentError("GitHub 未返回稳定的账号或仓库数字 ID") from exc
     repository = str(selected["full_name"])
-    application.activate_scope(
+    application.create_session(
         authenticated_user_id=authenticated_user_id,
         repository_id=repository_id,
         repository_full_name=repository,
     )
-    console.print(f"已进入 [bold cyan]{repository}[/bold cyan]")
-    if previous_repository and application.service is not previous_service:
+    console.print(f"已为 [bold cyan]{repository}[/bold cyan] 创建新 Session")
+    if previous_repository:
         _show_session_safety_note()
     return True
 
@@ -302,19 +346,23 @@ def _run_command(application: LiveApplication, request: str) -> None:
         except (GitAgentError, ValueError) as exc:
             console.print(f"[red]Session 读取失败：{exc}[/red]")
     elif command == "/new":
+        if argument:
+            console.print("[yellow]用法：/new[/yellow]")
+            return
         try:
-            application.new_session(title=argument)
+            application.new_session()
             console.print(f"已创建并进入 Session [cyan]{application.session_id}[/cyan]")
             _show_session_safety_note()
         except (GitAgentError, ValueError) as exc:
             console.print(f"[red]Session 创建失败：{exc}[/red]")
     elif command == "/switch":
         if not argument:
-            console.print("[yellow]用法：/switch <session_id>[/yellow]")
+            console.print("[yellow]用法：/switch <编号>[/yellow]")
             return
         previous_session_id = application.session_id
         try:
-            application.switch_session(argument)
+            target = _session_from_number(application.list_sessions(), argument)
+            application.switch_session(target.session_id)
             if application.session_id == previous_session_id:
                 console.print(f"Session [cyan]{application.session_id}[/cyan] 已是当前 Session；未更改状态。")
             else:
@@ -337,13 +385,15 @@ def _run_command(application: LiveApplication, request: str) -> None:
             console.print(f"[red]Session reset 失败：{exc}[/red]")
     elif command == "/delete":
         if not argument:
-            console.print("[yellow]用法：/delete <session_id>[/yellow]")
+            console.print("[yellow]用法：/delete <编号>[/yellow]")
             return
-        deleting_active_session = argument == application.session_id
         try:
-            application.delete_session(argument)
+            target = _session_from_number(application.list_sessions(), argument)
+            deleting_active_session = target.session_id == application.session_id
+            application.delete_session(target.session_id)
             console.print(
-                f"已删除 Session [cyan]{argument}[/cyan]；当前 Session：[cyan]{application.session_id}[/cyan]"
+                f"已删除 Session [cyan]{target.session_id}[/cyan]；"
+                f"当前 Session：[cyan]{application.session_id}[/cyan]"
             )
             if deleting_active_session:
                 _show_session_safety_note()
@@ -578,28 +628,69 @@ def _render_approval(application: LiveApplication, approval_id: str | None) -> N
         )
 
 
-def _show_sessions(sessions: Sequence[SessionRecord], *, active_session_id: str | None) -> None:
+def _show_sessions(
+    sessions: Sequence[SessionRecord],
+    *,
+    active_session_id: str | None,
+    title: str = "Sessions",
+) -> None:
     if not sessions:
-        console.print("[dim]当前仓库没有 Session。[/dim]")
+        console.print("[dim]当前没有 Session。[/dim]")
         return
-    table = Table(title="Sessions")
-    table.add_column("当前", justify="center")
-    table.add_column("Session ID", style="cyan")
+    table = Table(title=title)
+    table.add_column("#", justify="right", style="cyan")
+    show_current = active_session_id is not None
+    if show_current:
+        table.add_column("当前", justify="center")
     table.add_column("标题")
+    table.add_column("仓库")
+    table.add_column("创建时间")
     table.add_column("更新时间")
-    for session in sessions:
+    table.add_column("Session ID", style="dim")
+    for index, session in enumerate(sessions, 1):
         session_id = session.session_id
-        table.add_row(
-            "●" if session_id == active_session_id else "",
-            session_id,
+        row = [
+            str(index),
             session.title,
+            session.repository_full_name,
+            session.created_at,
             session.updated_at,
-        )
+            session_id,
+        ]
+        if show_current:
+            row.insert(1, "●" if session_id == active_session_id else "")
+        table.add_row(*row)
     console.print(table)
 
 
+def _session_from_number(sessions: Sequence[SessionRecord], number: str) -> SessionRecord:
+    value = number.strip()
+    if not value:
+        raise ValidationError("请提供 Session 编号")
+    if not value.isascii() or not value.isdecimal():
+        raise ValidationError("Session 必须使用 /sessions 显示的数字编号")
+    index = int(value)
+    if 1 <= index <= len(sessions):
+        return sessions[index - 1]
+    if sessions:
+        raise ValidationError(f"Session 编号必须在 1–{len(sessions)} 之间")
+    raise ValidationError("当前没有可选的 Session")
+
+
+def _delete_reference(choice: str) -> str | None:
+    command, separator, reference = choice.strip().partition(" ")
+    if command.casefold() not in {"d", "delete", "/delete"}:
+        return None
+    if not separator or not reference.strip():
+        return ""
+    return reference.strip()
+
+
 def _show_session_safety_note() -> None:
-    console.print("[dim]只有目标 Session 的上下文可用；运行时审批不会跨 Service 恢复。[/dim]")
+    console.print(
+        "[dim]后续请求只载入当前 Session 的历史，以及当前账号/仓库作用域的 Memory；"
+        "运行时审批 ID 不跨 Service 复用。[/dim]"
+    )
 
 
 def _show_compaction(result: CompactResult) -> None:
@@ -708,10 +799,10 @@ def _show_help() -> None:
             "  /help                 显示帮助\n"
             "  /repo                 重新读取列表并选择仓库\n"
             "  /sessions             列出当前仓库的 Sessions\n"
-            "  /new [title]          创建并进入新 Session\n"
-            "  /switch <session_id>  切换 Session\n"
+            "  /new                  为当前仓库创建并进入新 Session\n"
+            "  /switch <编号>        切换 Session\n"
             "  /reset                保留 Turn 并建立新 Context 边界\n"
-            "  /delete <session_id>  删除 Session\n"
+            "  /delete <编号>        删除 Session\n"
             "  /compact              压缩旧 Turn 的 Context 投影\n"
             "  /remember user <偏好>  保存 User Memory\n"
             "  /remember repo <decision|constraint|reference> <内容>\n"

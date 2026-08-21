@@ -52,7 +52,7 @@ class LiveApplication:
     def session_id(self) -> str | None:
         return self.scope.session_id if self.scope is not None else None
 
-    def activate_scope(
+    def create_session(
         self,
         *,
         authenticated_user_id: int,
@@ -61,38 +61,43 @@ class LiveApplication:
     ) -> SessionRecord:
         account_key = build_account_key(self.config.github_api_url, authenticated_user_id)
         repository_key = build_repository_key(self.config.github_api_url, repository_id)
-        if (
-            self.scope is not None
-            and self.scope.account_key == account_key
-            and self.scope.repository_key == repository_key
-        ):
-            session = self.sessions.activate_scope(
-                account_key,
-                repository_key,
-                repository_full_name,
-                previous_scope=None,
-                prepared_session_id=self.scope.session_id,
-            )
-            self.repository = repository_full_name
-            return session
-
-        existing = self.sessions.active_session(account_key, repository_key)
-        prepared_id = existing.session_id if existing is not None else _new_session_id()
-        target_scope = SessionScope(account_key, repository_key, prepared_id)
+        session_id = _new_session_id()
+        target_scope = SessionScope(account_key, repository_key, session_id)
         staged_service = self._prepare_service(target_scope)
-        activated = self.sessions.activate_scope(
+        created = self.sessions.create_session(
             account_key,
             repository_key,
             repository_full_name,
-            previous_scope=self.scope,
-            prepared_session_id=prepared_id,
+            session_id=session_id,
         )
-        if activated.session_id != prepared_id:
-            raise StateError("activated Session changed during the staged repository switch")
         self.repository = repository_full_name
         self.scope = target_scope
         self._swap_service(staged_service)
-        return activated
+        return created
+
+    def list_account_sessions(self, authenticated_user_id: int) -> tuple[SessionRecord, ...]:
+        account_key = build_account_key(self.config.github_api_url, authenticated_user_id)
+        return self.sessions.list_account_sessions(account_key)
+
+    def resume_session(self, authenticated_user_id: int, session_id: str) -> SessionRecord:
+        account_key = build_account_key(self.config.github_api_url, authenticated_user_id)
+        target = self.sessions.get_account_session(account_key, session_id)
+        if target is None:
+            raise StateError("Session not found")
+        staged = self._prepare_service(target.scope)
+        self.repository = target.repository_full_name
+        self.scope = target.scope
+        self._swap_service(staged)
+        return target
+
+    def delete_account_session(self, authenticated_user_id: int, session_id: str) -> SessionRecord:
+        if self.scope is not None:
+            raise StateError("account Session deletion is only available before entering a Session")
+        account_key = build_account_key(self.config.github_api_url, authenticated_user_id)
+        target = self.sessions.get_account_session(account_key, session_id)
+        if target is None:
+            raise StateError("Session not found")
+        return self.sessions.delete_session(target.scope)
 
     def handle(self, user_input: str, *, renderer: Renderer | None = None) -> Any:
         scope = self._require_scope()
@@ -100,7 +105,7 @@ class LiveApplication:
         text = user_input.strip()
         if not text:
             raise ValidationError("request cannot be empty")
-        turn = self.sessions.start_turn(scope, text, turn_kind="conversation")
+        turn = self.sessions.start_turn(scope, text)
         dispatch_started = False
         rendered = False
         try:
@@ -174,7 +179,7 @@ class LiveApplication:
         scope = self._require_scope()
         return self.sessions.list_sessions(scope.account_key, scope.repository_key)
 
-    def new_session(self, *, title: str = "") -> SessionRecord:
+    def new_session(self) -> SessionRecord:
         scope = self._require_scope()
         repository = self._require_repository()
         session_id = _new_session_id()
@@ -184,7 +189,6 @@ class LiveApplication:
             scope.account_key,
             scope.repository_key,
             repository,
-            title,
             session_id=session_id,
         )
         self.scope = target_scope
@@ -200,10 +204,9 @@ class LiveApplication:
             raise StateError("Session not found")
         target_scope = target.scope
         staged = self._prepare_service(target_scope)
-        switched = self.sessions.switch_session(scope.account_key, scope.repository_key, session_id)
         self.scope = target_scope
         self._swap_service(staged)
-        return switched
+        return target
 
     def reset_session(self) -> SessionRecord:
         scope = self._require_scope()
@@ -221,15 +224,14 @@ class LiveApplication:
             return self.sessions.delete_session(target.scope)
 
         remaining = [item for item in self.list_sessions() if item.session_id != session_id]
-        prepared_id = remaining[0].session_id if remaining else _new_session_id()
-        replacement_scope = SessionScope(scope.account_key, scope.repository_key, prepared_id)
+        replacement_id = remaining[0].session_id if remaining else _new_session_id()
+        replacement_scope = SessionScope(scope.account_key, scope.repository_key, replacement_id)
         staged = self._prepare_service(replacement_scope)
-        replacement = self.sessions.delete_session(
-            target.scope,
-            prepared_replacement_id=prepared_id,
-        )
-        if replacement.session_id != prepared_id:
-            raise StateError("replacement Session changed during staged deletion")
+        if remaining:
+            replacement = remaining[0]
+            self.sessions.delete_session(target.scope)
+        else:
+            replacement = self.sessions.replace_session(target.scope, replacement_id)
         self.scope = replacement_scope
         self._swap_service(staged)
         return replacement

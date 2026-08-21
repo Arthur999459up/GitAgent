@@ -1,5 +1,6 @@
 """CLI/config smoke tests for the refactored application surface."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import AGENT.GitAgent.gitagent.app.cli as cli_module
@@ -8,6 +9,25 @@ from AGENT.GitAgent.gitagent.app.cli import build_parser
 from AGENT.GitAgent.gitagent.app.config import CLIConfig
 from AGENT.GitAgent.gitagent.core.models import DraftResult
 from AGENT.GitAgent.gitagent.core.trace import TraceBus, TraceCategory, TraceStatus
+from AGENT.GitAgent.gitagent.state import SessionRecord, default_working_state
+from rich.console import Console
+
+
+def _session_record(index: int, *, repository: str = "sample/widgets") -> SessionRecord:
+    return SessionRecord(
+        session_id=f"session-{index:032x}",
+        account_key="https://api.github.test#user:7",
+        repository_key=f"https://api.github.test#repo:{index}",
+        repository_full_name=repository,
+        title=f"Session {index}",
+        created_at=f"2026-08-{index:02d}T00:00:00+00:00",
+        updated_at=f"2026-08-{index:02d}T00:00:00+00:00",
+        context_boundary_seq=0,
+        summary="",
+        summary_through_seq=0,
+        working_state=default_working_state(),
+        agent_context={},
+    )
 
 
 def test_cli_parser_keeps_plain_gitagent_entrypoint():
@@ -102,3 +122,109 @@ def test_debug_command_filters_current_session_by_agent(monkeypatch):
     assert captured["session_id"] == session_id
     assert captured["agent"] == "issues"
     assert [event.name for event in captured["events"]] == ["issues"]
+
+
+def test_startup_menu_deletes_by_number_then_returns_and_resumes(monkeypatch):
+    first = _session_record(1, repository="sample/one")
+    second = _session_record(2, repository="sample/two")
+
+    class Application:
+        github = SimpleNamespace(get_authenticated_user=lambda: {"id": 7, "login": "alice"})
+
+        def __init__(self):
+            self.sessions = [first, second]
+            self.deleted = []
+            self.resumed = []
+
+        def list_account_sessions(self, authenticated_user_id):
+            assert authenticated_user_id == 7
+            return tuple(self.sessions)
+
+        def delete_account_session(self, authenticated_user_id, session_id):
+            assert authenticated_user_id == 7
+            self.deleted.append(session_id)
+            target = next(session for session in self.sessions if session.session_id == session_id)
+            self.sessions.remove(target)
+            return target
+
+        def resume_session(self, authenticated_user_id, session_id):
+            assert authenticated_user_id == 7
+            self.resumed.append(session_id)
+            return next(session for session in self.sessions if session.session_id == session_id)
+
+    application = Application()
+    choices = iter(["d 1", "1"])
+    snapshots = []
+    monkeypatch.setattr(cli_module, "terminal_prompt", lambda *args, **kwargs: next(choices))
+    monkeypatch.setattr(
+        cli_module,
+        "_show_sessions",
+        lambda sessions, **kwargs: snapshots.append(tuple(session.session_id for session in sessions)),
+    )
+
+    assert cli_module._select_startup_session(application) is True
+    assert snapshots == [(first.session_id, second.session_id), (second.session_id,)]
+    assert application.deleted == [first.session_id]
+    assert application.resumed == [second.session_id]
+
+
+def test_startup_prompt_uses_consistent_short_commands(monkeypatch):
+    prompts = []
+    application = SimpleNamespace(
+        github=SimpleNamespace(get_authenticated_user=lambda: {"id": 7, "login": "alice"}),
+        list_account_sessions=lambda authenticated_user_id: (),
+    )
+    monkeypatch.setattr(cli_module, "_show_sessions", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli_module,
+        "terminal_prompt",
+        lambda prompt, **kwargs: prompts.append(prompt) or "q",
+    )
+
+    assert cli_module._select_startup_session(application) is False
+    assert prompts == ["操作：[编号] 恢复  [n] 新建  [d 编号] 删除  [q] 退出\n> "]
+
+
+def test_delete_command_resolves_display_number(monkeypatch):
+    current = _session_record(1)
+    target = replace(_session_record(2), repository_key=current.repository_key)
+    deleted = []
+    application = SimpleNamespace(
+        session_id=current.session_id,
+        list_sessions=lambda: (current, target),
+        delete_session=lambda session_id: deleted.append(session_id),
+    )
+    monkeypatch.setattr(cli_module, "_show_session_safety_note", lambda: None)
+
+    cli_module._run_command(application, "/delete 2")
+
+    assert deleted == [target.session_id]
+
+
+def test_startup_session_table_omits_current_column(monkeypatch):
+    captured = []
+    monkeypatch.setattr(cli_module.console, "print", captured.append)
+
+    cli_module._show_sessions((_session_record(1),), active_session_id=None)
+
+    table = captured[0]
+    assert [column.header for column in table.columns] == [
+        "#",
+        "标题",
+        "仓库",
+        "创建时间",
+        "更新时间",
+        "Session ID",
+    ]
+
+
+def test_in_session_table_marks_the_current_session(monkeypatch):
+    session = _session_record(1)
+    rendered_console = Console(record=True, width=240)
+    monkeypatch.setattr(cli_module, "console", rendered_console)
+
+    cli_module._show_sessions((session,), active_session_id=session.session_id)
+
+    rendered = rendered_console.export_text()
+    assert "当前" in rendered
+    assert "●" in rendered

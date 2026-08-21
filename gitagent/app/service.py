@@ -101,9 +101,13 @@ class GitAgentService:
         repository = self._repository(repository)
         if routing_context is None:
             raise RoutingError("GitAgentService requires Session routing context")
+        if routing_context.scope != self._scope():
+            raise RoutingError("routing context belongs to a different Session scope")
+        if routing_context.repository_full_name != repository:
+            raise RoutingError("routing context belongs to a different repository")
         self.dispatch_started = False
 
-        current = self._load_context()
+        current = self._load_context(routing_context)
         if current is not None:
             if current.reply_draft is not None and current.pending is None and not current.question:
                 self.dispatch_started = True
@@ -432,7 +436,7 @@ class GitAgentService:
     def _clear_context(self) -> None:
         self._require_session_manager().save_agent_context(self._scope(), None)
 
-    def _load_context(self) -> AgentContext | None:
+    def _load_context(self, routing_context: RoutingContext | None = None) -> AgentContext | None:
         session = self._require_session_manager().get_session(
             self._scope().account_key,
             self._scope().repository_key,
@@ -440,7 +444,36 @@ class GitAgentService:
         )
         if session is None:
             raise RoutingError("Session not found")
-        return self._restore_context(session.agent_context) if session.agent_context else None
+        context = (
+            self._restore_context(session.agent_context, repository=session.repository_full_name)
+            if session.agent_context
+            else None
+        )
+        if context is not None and routing_context is not None:
+            context.guidance = self._guidance(context.entity_type, context.entity_id, routing_context)
+        elif context is not None:
+            context.guidance = self._stored_guidance(context)
+        return context
+
+    def _stored_guidance(self, context: AgentContext) -> AgentGuidance | None:
+        scope = self._scope()
+        memories = self._require_session_manager().list_memories(scope.account_key, scope.repository_key)
+        user_memories = tuple(
+            ContextMemory(memory.memory_id, memory.scope, memory.kind, memory.content)
+            for memory in memories
+            if memory.scope == "user"
+        )
+        repository_memories = tuple(
+            ContextMemory(memory.memory_id, memory.scope, memory.kind, memory.content)
+            for memory in memories
+            if memory.scope == "repository"
+        )
+        guidance = AgentGuidance(
+            user_memories=user_memories,
+            repository_memories=repository_memories,
+            resolved_references=self._resolved_references(context.entity_type, context.entity_id),
+        )
+        return None if guidance.empty else guidance
 
     def _require_pending_context(self) -> AgentContext:
         self._require_live()
@@ -472,7 +505,6 @@ class GitAgentService:
             "code_candidate": to_plain(context.code_candidate),
             "change_request": to_plain(context.change_request),
             "verification": to_plain(context.verification),
-            "guidance": to_plain(context.guidance),
             "reply_draft": context.reply_draft,
             "read_only": context.read_only,
             "result_required": context.result_required,
@@ -482,18 +514,21 @@ class GitAgentService:
             "finished": context.finished,
         }
 
-    def _restore_context(self, raw: dict[str, Any]) -> AgentContext:
+    def _restore_context(self, raw: dict[str, Any], *, repository: str) -> AgentContext:
         agent = str(raw.get("agent") or "")
         if agent not in {"issues", "pull_requests", "code_change"}:
             raise RoutingError("stored Session agent context is invalid")
+        stored_repository = str(raw.get("repository") or "")
+        if stored_repository != repository:
+            raise RoutingError("stored Session agent context belongs to a different repository")
         context = self.harness.context(
             agent,
             self._scope().session_id,
-            repository=str(raw.get("repository") or ""),
+            repository=repository,
             goal=str(raw.get("goal") or ""),
             entity_type=str(raw.get("entity_type") or "") or None,
             entity_id=str(raw.get("entity_id") or "") or None,
-            guidance=self._restore_guidance(raw.get("guidance")),
+            guidance=None,
             max_steps=int(raw.get("max_steps") or 20),
         )
         context.steps = int(raw.get("steps") or 0)
@@ -516,6 +551,11 @@ class GitAgentService:
                 PlannedToolCall(str(item["tool"]), dict(item.get("arguments") or {}))
                 for item in pending.get("calls", [])
             ]
+            if any(
+                "repository" in call.arguments and str(call.arguments["repository"]) != repository
+                for call in calls
+            ):
+                raise RoutingError("stored Session mutation plan belongs to a different repository")
             self.loop.restore_pending(
                 context,
                 summary=str(pending.get("summary") or ""),
@@ -579,51 +619,19 @@ class GitAgentService:
         )
 
     @staticmethod
-    def _restore_guidance(raw: Any) -> AgentGuidance | None:
-        if not isinstance(raw, dict):
-            return None
+    def _guidance(entity_type: str | None, entity_id: str | None, context: RoutingContext) -> AgentGuidance | None:
         guidance = AgentGuidance(
-            user_memories=tuple(
-                ContextMemory(
-                    str(item.get("memory_id") or ""),
-                    str(item.get("scope") or ""),
-                    str(item.get("kind") or ""),
-                    str(item.get("content") or ""),
-                )
-                for item in raw.get("user_memories", [])
-                if isinstance(item, dict)
-            ),
-            repository_memories=tuple(
-                ContextMemory(
-                    str(item.get("memory_id") or ""),
-                    str(item.get("scope") or ""),
-                    str(item.get("kind") or ""),
-                    str(item.get("content") or ""),
-                )
-                for item in raw.get("repository_memories", [])
-                if isinstance(item, dict)
-            ),
-            resolved_references=tuple(
-                ResolvedReference(str(item.get("type") or ""), str(item.get("id") or ""))
-                for item in raw.get("resolved_references", [])
-                if isinstance(item, dict)
-            ),
+            user_memories=context.user_memories,
+            repository_memories=context.repository_memories,
+            resolved_references=GitAgentService._resolved_references(entity_type, entity_id),
         )
         return None if guidance.empty else guidance
 
     @staticmethod
-    def _guidance(entity_type: str | None, entity_id: str | None, context: RoutingContext) -> AgentGuidance | None:
-        references = (
-            (ResolvedReference(entity_type, entity_id),)
-            if entity_type in {"issue", "pull_request", "workflow_run"} and entity_id
-            else ()
-        )
-        guidance = AgentGuidance(
-            user_memories=context.user_memories,
-            repository_memories=context.repository_memories,
-            resolved_references=references,
-        )
-        return None if guidance.empty else guidance
+    def _resolved_references(entity_type: str | None, entity_id: str | None) -> tuple[ResolvedReference, ...]:
+        if entity_type in {"issue", "pull_request", "workflow_run"} and entity_id:
+            return (ResolvedReference(entity_type, entity_id),)
+        return ()
 
     @staticmethod
     def _context_description(context: AgentContext) -> dict[str, Any]:
