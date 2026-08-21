@@ -37,6 +37,7 @@ class InMemoryMCPServer(MCPServer):
             raise ToolExecutionError(f"repository not found: {repository}") from exc
         repo.setdefault("files", {})
         repo.setdefault("issues", {})
+        repo.setdefault("milestones", {})
         repo.setdefault("prs", {})
         repo.setdefault("workflow_runs", {})
         repo.setdefault("comments", [])
@@ -84,6 +85,9 @@ class InMemoryMCPServer(MCPServer):
         self.register(
             tool_spec("github.get_issue_comments", read, "Fetch bounded issue comments.", self.get_issue_comments)
         )
+        self.register(
+            tool_spec("github.list_milestones", read, "List milestones so an Issue can reference one by number.", self.list_milestones)
+        )
         self.register(tool_spec("github.get_pr", read, "Fetch one pull request.", self.get_pr))
         self.register(
             tool_spec("github.list_pull_requests", read, "List and filter pull requests.", self.list_pull_requests)
@@ -94,7 +98,28 @@ class InMemoryMCPServer(MCPServer):
         self.register(tool_spec("github.get_job_logs", read, "Fetch a bounded failed-job log.", self.get_job_logs))
         self.register(tool_spec("github.post_comment", write, "Post an issue or PR comment.", self.post_comment))
         self.register(
-            tool_spec("github.update_issue", write, "Update issue state, labels, assignees, or milestone.", self.update_issue)
+            tool_spec(
+                "github.create_issue",
+                write,
+                "Create an issue, optionally with labels, assignees, and a milestone number.",
+                self.create_issue,
+            )
+        )
+        self.register(
+            tool_spec(
+                "github.update_issue",
+                write,
+                "Update issue fields. Labels and assignees replace their complete current lists.",
+                self.update_issue,
+            )
+        )
+        self.register(
+            tool_spec(
+                "github.set_issue_lock",
+                write,
+                "Lock or unlock an issue discussion, with an optional GitHub lock reason.",
+                self.set_issue_lock,
+            )
         )
         self.register(tool_spec("github.update_pr", write, "Update pull-request state.", self.update_pr))
         self.register(tool_spec("github.create_branch", write, "Create a branch.", self.create_branch))
@@ -271,6 +296,16 @@ class InMemoryMCPServer(MCPServer):
         comments.extend(item for item in repo["comments"] if int(item.get("issue_number", -1)) == issue_number)
         return {"comments": deepcopy(comments[: max(1, min(limit, 100))])}
 
+    def list_milestones(self, repository: str, state: str = "open", limit: int = 100) -> dict[str, Any]:
+        if state not in {"open", "closed", "all"}:
+            raise ValidationError("milestone state must be open, closed, or all")
+        milestones = []
+        for milestone in self._repo(repository)["milestones"].values():
+            if state != "all" and str(milestone.get("state", "open")).casefold() != state:
+                continue
+            milestones.append(milestone)
+        return {"milestones": deepcopy(milestones[: max(1, min(limit, 100))])}
+
     def get_pr(self, repository: str, pr_number: int) -> dict[str, Any]:
         return deepcopy(self._get_numbered(self._repo(repository)["prs"], pr_number, "pull request"))
 
@@ -348,6 +383,37 @@ class InMemoryMCPServer(MCPServer):
             repo["comments"].append(comment)
         return deepcopy(comment)
 
+    def create_issue(
+        self,
+        repository: str,
+        title: str,
+        body: str = "",
+        labels: list[str] | None = None,
+        assignees: list[str] | None = None,
+        milestone_number: int | None = None,
+    ) -> dict[str, Any]:
+        if not title.strip():
+            raise ValidationError("issue title cannot be empty")
+        with self._lock:
+            repo = self._repo(repository)
+            existing_numbers = [int(number) for number in repo["issues"]]
+            existing_numbers.extend(int(number) for number in repo["prs"])
+            issue_number = max(existing_numbers, default=0) + 1
+            issue = {
+                "number": issue_number,
+                "title": title,
+                "body": body,
+                "state": "open",
+                "labels": list(labels or []),
+                "assignees": list(assignees or []),
+                "milestone": self._issue_milestone(repo, milestone_number),
+                "locked": False,
+                "active_lock_reason": None,
+                "comments": [],
+            }
+            repo["issues"][issue_number] = issue
+        return deepcopy(issue)
+
     def get_pr_reviews(self, repository: str, pr_number: int) -> dict[str, Any]:
         repo = self._repo(repository)
         self._get_numbered(repo["prs"], pr_number, "pull request")
@@ -358,25 +424,59 @@ class InMemoryMCPServer(MCPServer):
         self,
         repository: str,
         issue_number: int,
+        title: str | None = None,
+        body: str | None = None,
         state: str | None = None,
         labels: list[str] | None = None,
         assignees: list[str] | None = None,
-        milestone: str | None = None,
+        milestone_number: int | None = None,
+        clear_milestone: bool = False,
     ) -> dict[str, Any]:
+        if milestone_number is not None and clear_milestone:
+            raise ValidationError("milestone_number and clear_milestone cannot be used together")
         with self._lock:
             repo = self._repo(repository)
             issue = self._get_numbered(repo["issues"], issue_number, "issue")
+            if title is not None:
+                if not title.strip():
+                    raise ValidationError("issue title cannot be empty")
+                issue["title"] = title
+            if body is not None:
+                issue["body"] = body
             if state is not None:
                 if state not in {"open", "closed"}:
                     raise ValidationError("issue state must be open or closed")
                 issue["state"] = state
             if labels is not None:
-                issue["labels"] = [str(label) for label in labels]
+                issue["labels"] = list(labels)
             if assignees is not None:
-                issue["assignees"] = [str(item) for item in assignees]
-            if milestone is not None:
-                issue["milestone"] = None if milestone in {"", "none"} else str(milestone)
+                issue["assignees"] = list(assignees)
+            if milestone_number is not None:
+                issue["milestone"] = self._issue_milestone(repo, milestone_number)
+            elif clear_milestone:
+                issue["milestone"] = None
         return deepcopy(issue)
+
+    def set_issue_lock(
+        self,
+        repository: str,
+        issue_number: int,
+        locked: bool,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        if locked and reason is not None and reason not in {"off-topic", "too heated", "resolved", "spam"}:
+            raise ValidationError("issue lock reason must be off-topic, too heated, resolved, or spam")
+        with self._lock:
+            issue = self._get_numbered(self._repo(repository)["issues"], issue_number, "issue")
+            issue["locked"] = locked
+            issue["active_lock_reason"] = reason if locked else None
+        return {"number": issue_number, "locked": locked, "active_lock_reason": reason if locked else None}
+
+    @staticmethod
+    def _issue_milestone(repo: dict[str, Any], milestone_number: int | None) -> dict[str, Any] | None:
+        if milestone_number is None:
+            return None
+        return deepcopy(InMemoryMCPServer._get_numbered(repo["milestones"], milestone_number, "milestone"))
 
     def update_pr(self, repository: str, pr_number: int, state: str | None = None) -> dict[str, Any]:
         with self._lock:

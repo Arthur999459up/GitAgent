@@ -252,8 +252,10 @@ class DomainAction(str, Enum):
 
 
 class IssueOperation(str, Enum):
+    CREATE = "CREATE"
     LIST = "LIST"
     GET = "GET"
+    UPDATE = "UPDATE"
     SEARCH = "SEARCH"
     SUMMARIZE = "SUMMARIZE"
 
@@ -263,7 +265,10 @@ class IssueSummary:
     number: int
     title: str
     state: str
+    locked: bool
     labels: list[str]
+    assignees: list[str]
+    milestone: str | None
     author: str
     updated_at: str
     url: str

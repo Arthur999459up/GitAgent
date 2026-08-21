@@ -336,6 +336,14 @@ class GitHubMCPServer(InMemoryMCPServer):
         values = self._request("GET", f"/repos/{repository}/issues/{issue_number}/comments?per_page={limit}")
         return {"comments": values}
 
+    def list_milestones(self, repository: str, state: str = "open", limit: int = 100) -> dict[str, Any]:
+        repository = self._repository(repository)
+        if state not in {"open", "closed", "all"}:
+            raise ValidationError("milestone state must be open, closed, or all")
+        query = urllib.parse.urlencode({"state": state, "per_page": max(1, min(limit, 100))})
+        values = self._request("GET", f"/repos/{repository}/milestones?{query}")
+        return {"milestones": values}
+
     def get_pr(self, repository: str, pr_number: int) -> dict[str, Any]:
         repository = self._repository(repository)
         return self._request("GET", f"/repos/{repository}/pulls/{pr_number}")
@@ -419,29 +427,82 @@ class GitHubMCPServer(InMemoryMCPServer):
             raise ValidationError("comment body cannot be empty")
         return self._request("POST", f"/repos/{repository}/issues/{issue_number}/comments", {"body": body})
 
+    def create_issue(
+        self,
+        repository: str,
+        title: str,
+        body: str = "",
+        labels: list[str] | None = None,
+        assignees: list[str] | None = None,
+        milestone_number: int | None = None,
+    ) -> dict[str, Any]:
+        self._require_token()
+        repository = self._repository(repository)
+        if not title.strip():
+            raise ValidationError("issue title cannot be empty")
+        payload: dict[str, Any] = {"title": title, "body": body}
+        if labels is not None:
+            payload["labels"] = labels
+        if assignees is not None:
+            payload["assignees"] = assignees
+        if milestone_number is not None:
+            payload["milestone"] = milestone_number
+        return self._request("POST", f"/repos/{repository}/issues", payload)
+
     def update_issue(
         self,
         repository: str,
         issue_number: int,
+        title: str | None = None,
+        body: str | None = None,
         state: str | None = None,
         labels: list[str] | None = None,
         assignees: list[str] | None = None,
-        milestone: str | None = None,
+        milestone_number: int | None = None,
+        clear_milestone: bool = False,
     ) -> dict[str, Any]:
         self._require_token()
         repository = self._repository(repository)
+        if milestone_number is not None and clear_milestone:
+            raise ValidationError("milestone_number and clear_milestone cannot be used together")
         payload: dict[str, Any] = {}
+        if title is not None:
+            if not title.strip():
+                raise ValidationError("issue title cannot be empty")
+            payload["title"] = title
+        if body is not None:
+            payload["body"] = body
         if state is not None:
             if state not in {"open", "closed"}:
                 raise ValidationError("issue state must be open or closed")
             payload["state"] = state
         if labels is not None:
-            payload["labels"] = [str(label) for label in labels]
+            payload["labels"] = labels
         if assignees is not None:
-            payload["assignees"] = [str(item) for item in assignees]
-        if milestone is not None:
-            payload["milestone"] = None if milestone in {"", "none"} else milestone
+            payload["assignees"] = assignees
+        if milestone_number is not None:
+            payload["milestone"] = milestone_number
+        elif clear_milestone:
+            payload["milestone"] = None
         return self._request("PATCH", f"/repos/{repository}/issues/{issue_number}", payload)
+
+    def set_issue_lock(
+        self,
+        repository: str,
+        issue_number: int,
+        locked: bool,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_token()
+        repository = self._repository(repository)
+        path = f"/repos/{repository}/issues/{issue_number}/lock"
+        if locked:
+            if reason is not None and reason not in {"off-topic", "too heated", "resolved", "spam"}:
+                raise ValidationError("issue lock reason must be off-topic, too heated, resolved, or spam")
+            self._request("PUT", path, {"lock_reason": reason} if reason else {})
+        else:
+            self._request("DELETE", path)
+        return {"number": issue_number, "locked": locked, "active_lock_reason": reason if locked else None}
 
     def update_pr(self, repository: str, pr_number: int, state: str | None = None) -> dict[str, Any]:
         self._require_token()

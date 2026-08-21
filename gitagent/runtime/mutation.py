@@ -22,7 +22,9 @@ GITHUB_MUTATOR_SPEC = AgentSpec(
     allowed_tools=frozenset(
         {
             "github.post_comment",
+            "github.create_issue",
             "github.update_issue",
+            "github.set_issue_lock",
             "github.update_pr",
             "github.create_branch",
             "github.commit",

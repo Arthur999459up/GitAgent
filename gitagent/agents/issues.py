@@ -61,7 +61,11 @@ ISSUE_AGENT_SPEC = AgentSpec(
             "github.list_issues",
             "github.get_issue",
             "github.get_issue_comments",
+            "github.list_milestones",
             "github.post_comment",
+            "github.create_issue",
+            "github.update_issue",
+            "github.set_issue_lock",
             "repository.get_repo_tree",
             "repository.search_code",
             "repository.read_file",
@@ -78,6 +82,10 @@ ISSUE_AGENT_SPEC = AgentSpec(
         "列出当前未关闭的 bug",
         "总结最近的 Issues",
         "查看 Issue #17 的讨论",
+        "创建一个 Issue",
+        "关闭 Issue #17",
+        "给 Issue #17 设置标签、负责人或 Milestone",
+        "锁定 Issue #17 的讨论",
         "处理 Issue #17",
         "修复 Issue #17",
     ),
@@ -146,6 +154,12 @@ class IssueAgent:
                 issues=[],
                 issue_number=issue_number,
             )
+        latest_mutation = self._last_tool_name(
+            context,
+            {"github.create_issue", "github.update_issue", "github.set_issue_lock"},
+        )
+        if latest_mutation is not None:
+            return self._mutation_result(context, latest_mutation, issue_number)
         posted = self._last_tool(context, "github.post_comment")
         raw_issues = self._last_tool(context, "github.list_issues")
         issue = self._last_tool(context, "github.get_issue")
@@ -502,6 +516,38 @@ class IssueAgent:
                 return tool
         return None
 
+    def _mutation_result(
+        self,
+        context: AgentContext,
+        tool: str,
+        fallback_number: int | None,
+    ) -> IssueAgentResult:
+        data = self._last_tool(context, tool) or {}
+        issue = data
+        operation = IssueOperation.CREATE if tool == "github.create_issue" else IssueOperation.UPDATE
+        if tool == "github.set_issue_lock":
+            issue = {**(self._last_tool(context, "github.get_issue") or {}), **data}
+            verb = "锁定" if data.get("locked") else "解锁"
+            fallback_answer = f"Issue 讨论已{verb}。"
+        else:
+            verb = "创建" if operation == IssueOperation.CREATE else "更新"
+            fallback_answer = f"Issue 已{verb}。"
+        raw_number = data.get("number") or fallback_number
+        issue_number = int(raw_number) if raw_number is not None else None
+        if issue_number is not None:
+            fallback_answer = (
+                f"已{verb} Issue #{issue_number} 的讨论。"
+                if tool == "github.set_issue_lock"
+                else f"已{verb} Issue #{issue_number}。"
+            )
+        return IssueAgentResult(
+            action=DomainAction.ANSWER,
+            operation=operation,
+            answer=context.final_message or fallback_answer,
+            issues=[self._summary(issue)] if issue else [],
+            issue_number=issue_number,
+        )
+
     @staticmethod
     def _abandon() -> AgentAction:
         return AgentAction(
@@ -518,7 +564,10 @@ class IssueAgent:
             number=int(issue.get("number", 0)),
             title=str(issue.get("title", "")),
             state=str(issue.get("state", "open")),
+            locked=bool(issue.get("locked")),
             labels=cls._labels(issue),
+            assignees=cls._assignees(issue),
+            milestone=cls._milestone_title(issue),
             author=author,
             updated_at=str(issue.get("updated_at", "")),
             url=str(issue.get("html_url") or issue.get("url") or ""),
@@ -528,13 +577,31 @@ class IssueAgent:
     def _labels(issue: dict[str, Any]) -> list[str]:
         return [str(item.get("name", "")) if isinstance(item, dict) else str(item) for item in issue.get("labels", [])]
 
+    @staticmethod
+    def _assignees(issue: dict[str, Any]) -> list[str]:
+        return [
+            str(item.get("login", "")) if isinstance(item, dict) else str(item)
+            for item in issue.get("assignees", [])
+        ]
+
+    @staticmethod
+    def _milestone_title(issue: dict[str, Any]) -> str | None:
+        milestone = issue.get("milestone")
+        if not milestone:
+            return None
+        return str(milestone.get("title", "")) if isinstance(milestone, dict) else str(milestone)
+
     @classmethod
     def _bounded_issue(cls, issue: dict[str, Any]) -> dict[str, Any]:
         return {
             "number": issue.get("number"),
             "title": str(issue.get("title", ""))[:500],
             "state": issue.get("state", "open"),
+            "locked": bool(issue.get("locked")),
+            "active_lock_reason": issue.get("active_lock_reason"),
             "labels": cls._labels(issue),
+            "assignees": cls._assignees(issue),
+            "milestone": cls._milestone_title(issue),
             "body": str(issue.get("body") or "")[:4000],
             "comments": issue.get("comments", 0),
             "created_at": issue.get("created_at", ""),

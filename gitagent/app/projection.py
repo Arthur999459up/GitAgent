@@ -119,7 +119,10 @@ def project_output(
             return _bounded(output.question, 8 * 1024, text_sanitizer), [], None
         selected, truncated = visible_items(output.issues)
         lines = [output.answer]
-        lines.extend(f"#{issue.number} {issue.title} [{issue.state}]" for issue in selected)
+        lines.extend(
+            f"#{issue.number} {issue.title} [{issue.state}{', locked' if issue.locked else ''}]"
+            for issue in selected
+        )
         if truncated:
             lines.append(f"[仅显示前 {MAX_VISIBLE_ITEMS} 项]")
         manifests = []
