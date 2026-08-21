@@ -104,7 +104,14 @@ class LiveApplication:
         dispatch_started = False
         rendered = False
         try:
-            routing_context = self.context_builder.build(scope, repository, text)
+            routing_context = self.context_builder.build(
+                scope,
+                repository,
+                text,
+                prompt_renderer=lambda context: self.service.main_agent.render_input_context(
+                    text, repository, context
+                ),
+            )
             try:
                 result = self.service.handle(
                     text, repository=repository, routing_context=routing_context, session_scope=scope
@@ -276,6 +283,7 @@ class LiveApplication:
             session_manager=self.sessions,
             trace=self.trace,
             session_scope=scope,
+            input_budget_tokens=self.config.effective_input_budget,
         )
 
     def _swap_service(self, service: GitAgentService) -> None:
@@ -369,6 +377,7 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         agent_reasoner=reasoner,
         session_manager=sessions,
         trace=trace,
+        input_budget_tokens=config.effective_input_budget,
     )
     return LiveApplication(
         config=config,

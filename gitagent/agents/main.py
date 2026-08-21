@@ -7,7 +7,7 @@ from typing import Any
 
 from ..core.errors import RoutingError, ValidationError
 from ..core.models import AgentSpec, MainDecision, Route, RoutingContext, to_plain
-from ..reasoning import Reasoner
+from ..reasoning import Reasoner, structured_request_payload
 from ..runtime import AgentContext, AgentHarness
 
 _DOMAIN_AGENTS = {"issues", "pull_requests", "ci_diagnosis", "repo_qa", "code_change"}
@@ -87,29 +87,44 @@ class MainAgent:
         repository: str,
         context: RoutingContext,
     ) -> MainDecision:
+        prompt = self._prompt(text, repository, context)
+        raw = self.reasoner.complete_structured(
+            system=agent_context.system_prompt,
+            prompt=prompt,
+            schema=_MAIN_SCHEMA,
+            tool_name="route_session_turn",
+        )
+        return self._validate(raw, text)
+
+    def render_input_context(self, user_input: str, repository: str, context: RoutingContext) -> str:
+        """Serialize the exact Main Agent request counted by the shared context budget."""
+
+        request = structured_request_payload(
+            self.harness.spec("main").system_prompt,
+            self._prompt(user_input, repository, context),
+            schema=_MAIN_SCHEMA,
+            tool_name="route_session_turn",
+        )
+        return json.dumps(request, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    def _prompt(self, text: str, repository: str, context: RoutingContext) -> str:
         payload: dict[str, Any] = {
             "user_input": text,
             "repository": repository,
             "capabilities": self._capabilities(),
             "session": {
                 "summary": context.summary,
-                "recent_history": list(context.history_units[-8:]),
+                "recent_history": list(context.history_units),
                 "working_state": context.working_state,
                 "user_memory": [to_plain(item) for item in context.user_memories],
                 "repository_memory": [to_plain(item) for item in context.repository_memories],
             },
         }
-        raw = self.reasoner.complete_structured(
-            system=agent_context.system_prompt,
-            prompt=(
-                "Decide whether to answer directly or choose one domain agent. "
-                "Do not select tools or create lifecycle objects.\n"
-                + json.dumps(payload, ensure_ascii=False)
-            ),
-            schema=_MAIN_SCHEMA,
-            tool_name="route_session_turn",
+        return (
+            "Decide whether to answer directly or choose one domain agent. "
+            "Do not select tools or create lifecycle objects.\n"
+            + json.dumps(payload, ensure_ascii=False)
         )
-        return self._validate(raw, text)
 
     def _validate(self, raw: dict[str, Any], text: str) -> MainDecision:
         if not isinstance(raw, dict):

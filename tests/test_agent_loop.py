@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import pytest
+from AGENT.GitAgent.gitagent.context import estimate_tokens
 from AGENT.GitAgent.gitagent.core.errors import WorkflowError
 from AGENT.GitAgent.gitagent.core.models import AccessLevel, AgentSpec, ApprovalIntent, WorkflowTurnDecision
 from AGENT.GitAgent.gitagent.core.trace import TraceBus
@@ -401,8 +402,10 @@ def test_render_observations_stays_valid_json_under_large_payloads():
     parsed = json.loads(rendered)
 
     assert isinstance(parsed, list)
+    assert parsed[0]["context_projection"]["level"] in {"light", "summary", "emergency"}
     assert parsed[-1]["arguments"]["path"] == "src/formatting.py"
-    assert len(rendered) <= 16_000
+    assert len(rendered) < 50_000 * 30
+    assert estimate_tokens(rendered) + context.fixed_input_tokens() <= context.input_budget_tokens
 
 
 def test_render_observations_preserves_a_complete_target_file_that_fits_the_budget():
@@ -432,7 +435,7 @@ def test_render_observations_preserves_a_complete_target_file_that_fits_the_budg
     assert "__content_projection__" not in parsed[-1]["data"]
 
 
-def test_render_observations_marks_prompt_only_content_truncation():
+def test_render_observations_does_not_project_content_below_the_light_threshold():
     _, harness = _harness()
     context = _context(harness, session_id="session-projected-file")
     context.observations = [
@@ -455,8 +458,35 @@ def test_render_observations_marks_prompt_only_content_truncation():
     parsed = json.loads(render_observations(context))
 
     assert parsed[-1]["data"]["truncated"] is False
+    assert parsed[-1]["data"]["content"] == "x" * 20_000
+    assert "__content_projection__" not in parsed[-1]["data"]
+
+
+def test_render_observations_projects_one_large_tool_result_only_after_the_shared_threshold():
+    _, harness = _harness()
+    context = _context(harness, session_id="session-large-projected-file")
+    context.observations = [
+        {
+            "kind": "tool",
+            "payload": {
+                "tool": "repository.read_file",
+                "arguments": {"repository": "sample/widgets", "path": "src/large.py"},
+                "data": {
+                    "path": "src/large.py",
+                    "start_line": 1,
+                    "end_line": 400,
+                    "content": "x" * 100_000,
+                    "truncated": False,
+                },
+            },
+        }
+    ]
+
+    parsed = json.loads(render_observations(context))
+
+    assert parsed[0]["context_projection"]["level"] == "light"
     assert parsed[-1]["data"]["__content_projection__"] == {
-        "truncated": True,
-        "original_chars": 20_000,
-        "retained_chars": 8_000,
+        "projected": True,
+        "original_chars": 100_000,
+        "retained_chars": 6_000,
     }

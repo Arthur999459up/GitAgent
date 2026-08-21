@@ -34,7 +34,6 @@ from .decide import AGENT_ACTION_SCHEMA, parse_action
 from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
-_MAX_FILE_READS = 5
 _ISSUE_ACTION_SCHEMA = {
     **AGENT_ACTION_SCHEMA,
     "properties": {
@@ -321,8 +320,6 @@ class IssueAgent:
         action = parse_action(value, requires_candidate=False)
         if action.kind == AgentActionKind.SPECIALIST:
             raise ValidationError("issues agent does not expose a specialist action")
-        if action.kind == AgentActionKind.TOOL and action.tool == "repository.read_file":
-            return self._normalize_file_read(context, action)
         return action
 
     def _required_entity_evidence(self, context: AgentContext) -> AgentAction | None:
@@ -355,19 +352,6 @@ class IssueAgent:
                 summary="列出 Issues",
             )
         return AgentAction(AgentActionKind.FINISH, summary="Issues 已列出", message="")
-
-    def _answer_from_observations(self, context: AgentContext) -> str:
-        if self.reasoner is None:
-            return "已有证据足够，请基于已读取的 Issue 信息继续。"
-        return self.reasoner.complete_text(
-            system=context.system_prompt,
-            prompt=_PROMPTS.render(
-                "agents.issue_detail_answer",
-                request=context.goal,
-                evidence=render_observations(context),
-                guidance=guidance_section(context.guidance),
-            ),
-        )
 
     def _list_answer(
         self,
@@ -494,39 +478,6 @@ class IssueAgent:
                 guidance=guidance_section(context.guidance),
             ),
         ).strip()
-
-    def _normalize_file_read(self, context: AgentContext, action: AgentAction) -> AgentAction:
-        path = str(action.arguments.get("path") or "")
-        ref = action.arguments.get("ref")
-        reads = [
-            observation["payload"]
-            for observation in context.observations
-            if observation["kind"] == "tool"
-            and observation["payload"].get("tool") == "repository.read_file"
-            and observation["payload"].get("arguments", {}).get("path") == path
-            and observation["payload"].get("arguments", {}).get("ref") == ref
-        ]
-        if not reads:
-            return action
-        if len(reads) >= _MAX_FILE_READS:
-            return AgentAction(
-                AgentActionKind.FINISH,
-                summary=f"{path} 已达到 {_MAX_FILE_READS} 次读取上限，使用已有证据继续",
-                message=self._answer_from_observations(context) if context.result_required else "",
-            )
-        data = reads[-1].get("data")
-        if not isinstance(data, dict) or not isinstance(data.get("end_line"), int):
-            return action
-        if data.get("truncated") is not True:
-            return action
-        continuation = dict(action.arguments)
-        continuation["start_line"] = data["end_line"] + 1
-        return AgentAction(
-            AgentActionKind.TOOL,
-            tool="repository.read_file",
-            arguments=continuation,
-            summary=f"续读 {path}，从第 {continuation['start_line']} 行开始",
-        )
 
     @staticmethod
     def _entity_number(context: AgentContext) -> int | None:

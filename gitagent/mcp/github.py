@@ -15,7 +15,7 @@ from typing import Any
 
 from ..core.errors import ToolExecutionError, ValidationError
 from ..core.models import RepositoryRef
-from .base import safe_repository_path
+from .base import parse_file_read_requests, safe_repository_path, select_file_lines
 from .memory import InMemoryMCPServer
 
 _READ_RETRIES = 2
@@ -222,35 +222,28 @@ class GitHubMCPServer(InMemoryMCPServer):
             content = base64.b64decode(str(value.get("content", "")), validate=False).decode("utf-8")
         except (ValueError, UnicodeDecodeError) as exc:
             raise ToolExecutionError(f"file is not UTF-8 text: {safe}") from exc
-        start_line = max(1, start_line)
-        limit = max(1, min(limit, 400))
-        lines = content.splitlines(keepends=True)
-        end_line = min(len(lines), start_line - 1 + limit)
-        selected = "".join(lines[start_line - 1 : end_line])
-        char_truncated = len(selected) > 120_000
-        if char_truncated:
-            selected = selected[:120_000]
-        return {
-            "path": safe,
-            "start_line": start_line,
-            "end_line": end_line,
-            "content": selected,
-            "truncated": char_truncated or end_line < len(lines),
-        }
+        return {"path": safe, **select_file_lines(content, start_line=start_line, limit=limit)}
 
     def read_files(
         self,
         repository: str,
-        paths: list[str],
-        limit_per_file: int = 200,
+        requests: list[dict[str, Any]],
         ref: str | None = None,
     ) -> dict[str, Any]:
-        if len(paths) > 20:
-            raise ValidationError("read_files is limited to 20 targeted paths")
+        parsed = parse_file_read_requests(requests)
         files: list[dict[str, Any]] = []
-        for path in paths:
+        for request in parsed:
+            path = request["path"]
             try:
-                files.append(self.read_file(repository, path, limit=limit_per_file, ref=ref))
+                files.append(
+                    self.read_file(
+                        repository,
+                        path,
+                        start_line=request["start_line"],
+                        limit=request["limit"],
+                        ref=ref,
+                    )
+                )
             except ToolExecutionError as exc:
                 raise ToolExecutionError(f"failed to read {path}: {exc}") from exc
         return {"files": files}

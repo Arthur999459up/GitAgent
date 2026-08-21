@@ -3,7 +3,6 @@
 from typing import Any
 
 from AGENT.GitAgent.gitagent.core.models import DraftResult, IssueOperation
-from AGENT.GitAgent.gitagent.runtime import AgentAction, AgentActionKind
 from AGENT.GitAgent.tests.support import build_test_service, handle
 
 
@@ -84,7 +83,73 @@ def test_issue_detail_result_wins_over_historical_issue_list():
     assert "需要展开分析这个具体问题" in result.answer
 
 
-def test_file_read_stops_after_five_reads():
+def test_single_and_batched_file_reads_share_coverage_and_continue_from_the_first_gap():
+    service = build_test_service()
+    service.harness.server.repositories["sample/widgets"]["files"]["docs/paged.txt"] = "".join(
+        f"line {number}\n" for number in range(1, 451)
+    )
+    context = service.harness.context(
+        "issues",
+        service.session_scope.session_id,
+        repository="sample/widgets",
+        goal="分析 Issue #1",
+        entity_type="issue",
+        entity_id="1",
+    )
+    first = context.tool("repository.read_file", repository="sample/widgets", path="docs/paged.txt", limit=200)
+    second = context.tool(
+        "repository.read_files",
+        repository="sample/widgets",
+        requests=[{"path": "docs/paged.txt", "limit": 200}],
+    )["files"][0]
+    third = context.tool("repository.read_file", repository="sample/widgets", path="docs/paged.txt", limit=200)
+
+    assert (first["start_line"], first["end_line"], first["truncated"]) == (1, 200, True)
+    assert (second["start_line"], second["end_line"], second["truncated"]) == (201, 400, True)
+    assert (third["start_line"], third["end_line"], third["truncated"]) == (401, 450, False)
+    assert context.file_reads.summaries() == [
+        {
+            "repository": "sample/widgets",
+            "path": "docs/paged.txt",
+            "ref": None,
+            "ranges": [[1, 450]],
+            "eof": True,
+            "eof_line": 450,
+        }
+    ]
+
+
+def test_implicit_read_stops_before_a_later_covered_range_instead_of_refetching_it():
+    service = build_test_service()
+    service.harness.server.repositories["sample/widgets"]["files"]["docs/gaps.txt"] = "".join(
+        f"line {number}\n" for number in range(1, 301)
+    )
+    context = service.harness.context(
+        "issues",
+        service.session_scope.session_id,
+        repository="sample/widgets",
+        goal="分析 Issue #1",
+        entity_type="issue",
+        entity_id="1",
+    )
+
+    middle = context.tool(
+        "repository.read_file",
+        repository="sample/widgets",
+        path="docs/gaps.txt",
+        start_line=101,
+        limit=100,
+    )
+    beginning = context.tool("repository.read_file", repository="sample/widgets", path="docs/gaps.txt", limit=200)
+    end = context.tool("repository.read_file", repository="sample/widgets", path="docs/gaps.txt", limit=200)
+
+    assert (middle["start_line"], middle["end_line"]) == (101, 200)
+    assert (beginning["start_line"], beginning["end_line"]) == (1, 100)
+    assert (end["start_line"], end["end_line"], end["truncated"]) == (201, 300, False)
+    assert context.file_reads.summaries()[0]["ranges"] == [[1, 300]]
+
+
+def test_covered_file_range_is_not_fetched_or_returned_again():
     service = build_test_service()
     context = service.harness.context(
         "issues",
@@ -94,33 +159,39 @@ def test_file_read_stops_after_five_reads():
         entity_type="issue",
         entity_id="1",
     )
-    context.result_required = False
-    for line in range(1, 6):
-        context.observations.append(
-            {
-                "kind": "tool",
-                "payload": {
-                    "tool": "repository.read_file",
-                    "arguments": {"path": "docs/paged.txt", "start_line": line, "limit": 1},
-                    "data": {"path": "docs/paged.txt", "start_line": line, "end_line": line, "content": "line\n"},
-                },
-            }
-        )
-
-    action = service.issue_agent._normalize_file_read(
-        context,
-        AgentAction(
-            AgentActionKind.TOOL,
-            tool="repository.read_file",
-            arguments={"path": "docs/paged.txt", "start_line": 1, "limit": 1},
-        ),
+    first = context.tool(
+        "repository.read_files",
+        repository="sample/widgets",
+        requests=[{"path": "src/formatting.py", "limit": 200}],
+    )
+    trace_before = len(service.harness.trace.events(context.session_id))
+    repeated = context.tool(
+        "repository.read_file",
+        repository="sample/widgets",
+        path="src/formatting.py",
+        start_line=1,
+        limit=200,
     )
 
-    assert action.kind == AgentActionKind.FINISH
-    assert "5 次读取上限" in action.summary
+    assert first["files"][0]["content"].startswith("def format_name")
+    assert repeated["already_read"] is True
+    assert "content" not in repeated
+    assert context.last_tool_call is not None and context.last_tool_call.covered is True
+    assert context.last_tool_call.observation_data == {
+        "already_read": True,
+        "coverage": {
+            "repository": "sample/widgets",
+            "path": "src/formatting.py",
+            "ref": None,
+            "ranges": [[1, 2]],
+            "eof": True,
+            "eof_line": 2,
+        },
+    }
+    assert len(service.harness.trace.events(context.session_id)) == trace_before
 
 
-def test_complete_file_read_does_not_force_a_continuation_past_eof():
+def test_file_coverage_and_observed_content_survive_agent_context_persistence():
     service = build_test_service()
     context = service.harness.context(
         "issues",
@@ -129,36 +200,43 @@ def test_complete_file_read_does_not_force_a_continuation_past_eof():
         goal="分析 Issue #1",
         entity_type="issue",
         entity_id="1",
+    )
+    original = context.tool(
+        "repository.read_file",
+        repository="sample/widgets",
+        path="src/formatting.py",
+        limit=200,
     )
     context.observations.append(
         {
             "kind": "tool",
             "payload": {
                 "tool": "repository.read_file",
-                "arguments": {"path": "corecoder/session.py"},
-                "data": {
-                    "path": "corecoder/session.py",
-                    "start_line": 1,
-                    "end_line": 99,
-                    "content": "complete",
-                    "truncated": False,
-                },
+                "arguments": {"repository": "sample/widgets", "path": "src/formatting.py", "limit": 200},
+                "data": original,
             },
         }
     )
-    requested = AgentAction(
-        AgentActionKind.TOOL,
-        tool="repository.read_file",
-        arguments={"path": "corecoder/session.py", "start_line": 60, "limit": 40},
-    )
+    restored = service._restore_context(service._serialize_context(context))
+    trace_before = len(service.harness.trace.events(context.session_id))
 
-    action = service.issue_agent._normalize_file_read(context, requested)
+    repeated = restored.tool(
+        "repository.read_files",
+        repository="sample/widgets",
+        requests=[{"path": "src/formatting.py", "limit": 200}],
+    )["files"][0]
 
-    assert action.arguments["start_line"] == 60
+    assert repeated["already_read"] is True
+    assert "content" not in repeated
+    assert restored.observations[0]["payload"]["data"]["content"] == original["content"]
+    assert restored.file_reads.summaries() == context.file_reads.summaries()
+    assert len(service.harness.trace.events(context.session_id)) == trace_before
 
 
-def test_truncated_file_read_continues_from_the_next_line():
+def test_character_bound_file_reads_stop_on_a_line_boundary_before_continuing():
     service = build_test_service()
+    line = "x" * 1_999 + "\n"
+    service.harness.server.repositories["sample/widgets"]["files"]["docs/wide.txt"] = line * 100
     context = service.harness.context(
         "issues",
         service.session_scope.session_id,
@@ -167,33 +245,20 @@ def test_truncated_file_read_continues_from_the_next_line():
         entity_type="issue",
         entity_id="1",
     )
-    context.observations.append(
-        {
-            "kind": "tool",
-            "payload": {
-                "tool": "repository.read_file",
-                "arguments": {"path": "src/large.py"},
-                "data": {
-                    "path": "src/large.py",
-                    "start_line": 1,
-                    "end_line": 200,
-                    "content": "page one",
-                    "truncated": True,
-                },
-            },
-        }
-    )
 
-    action = service.issue_agent._normalize_file_read(
-        context,
-        AgentAction(
-            AgentActionKind.TOOL,
-            tool="repository.read_file",
-            arguments={"path": "src/large.py", "limit": 200},
-        ),
-    )
+    first = context.tool("repository.read_file", repository="sample/widgets", path="docs/wide.txt", limit=200)
+    second = context.tool(
+        "repository.read_files",
+        repository="sample/widgets",
+        requests=[{"path": "docs/wide.txt", "limit": 200}],
+    )["files"][0]
 
-    assert action.arguments["start_line"] == 201
+    assert first["end_line"] == 60
+    assert len(first["content"]) == 120_000
+    assert first["truncated"] is True
+    assert second["start_line"] == 61
+    assert second["end_line"] == 100
+    assert second["truncated"] is False
 
 
 def test_issue_detail_answer_keeps_repository_evidence_already_read():

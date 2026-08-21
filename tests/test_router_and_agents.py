@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from AGENT.GitAgent.gitagent.core.errors import LLMProviderError
-from AGENT.GitAgent.gitagent.core.models import DraftResult
+from AGENT.GitAgent.gitagent.core.models import DraftResult, RoutingContext
 from AGENT.GitAgent.gitagent.mcp.memory import InMemoryMCPServer
 from AGENT.GitAgent.gitagent.runtime import AgentContext
 from AGENT.GitAgent.tests.support import StubMainReasoner, build_test_service, handle, sample_repositories
@@ -141,6 +142,30 @@ class ConfirmationThenTimeoutReasoner(ConfirmationThenFixReasoner):
         if kwargs.get("tool_name", "respond") == "prepare_candidate":
             raise LLMProviderError("模型提供方请求超时（单次读取超时 30 秒）")
         return super().complete_structured(**kwargs)
+
+
+def test_main_agent_receives_every_history_unit_selected_by_the_shared_budget():
+    main_reasoner = StubMainReasoner()
+    service = build_test_service(main_reasoner=main_reasoner)
+    history = tuple(
+        {
+            "seq": seq,
+            "status": "completed",
+            "history_text": f"history {seq}",
+            "assistant_text": f"answer {seq}",
+        }
+        for seq in range(1, 14)
+    )
+    context = RoutingContext(
+        scope=service.session_scope,
+        repository_full_name="sample/widgets",
+        history_units=history,
+    )
+
+    service.main_agent.decide("继续", repository="sample/widgets", context=context)
+
+    payload = json.loads(main_reasoner.prompts[-1].split("\n", 1)[1])
+    assert [item["seq"] for item in payload["session"]["recent_history"]] == list(range(1, 14))
 
 
 def test_issue_draft_revision_and_publish_are_session_scoped():

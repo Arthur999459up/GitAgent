@@ -277,7 +277,14 @@ def build_test_service(
 
 
 def routing_context(service: GitAgentService, user_input: str) -> RoutingContext:
-    return service._test_context_builder.build(service.session_scope, "sample/widgets", user_input)
+    return service._test_context_builder.build(
+        service.session_scope,
+        "sample/widgets",
+        user_input,
+        prompt_renderer=lambda context: service.main_agent.render_input_context(
+            user_input, "sample/widgets", context
+        ),
+    )
 
 
 def handle(service: GitAgentService, user_input: str):

@@ -68,4 +68,4 @@ def test_read_files_reports_the_path_that_exhausted_retries(monkeypatch):
     )
 
     with pytest.raises(ToolExecutionError, match=r"failed to read corecoder/session\.py:.*after 3 attempts"):
-        GitHubMCPServer().read_files("sample/widgets", ["corecoder/session.py"])
+        GitHubMCPServer().read_files("sample/widgets", [{"path": "corecoder/session.py"}])

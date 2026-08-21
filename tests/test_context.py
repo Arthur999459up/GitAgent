@@ -185,16 +185,28 @@ def test_summary_is_deduplicated_bounded_and_never_reads_user_text() -> None:
     assert summary.startswith("[older turns omitted through:")
 
 
-def test_more_than_twelve_history_units_persist_one_rolling_summary() -> None:
+def test_history_count_alone_does_not_trigger_a_rolling_summary() -> None:
     manager = FakeSessionManager(turns=[_turn(seq) for seq in range(1, 14)])
     context = ContextBuilder(manager).build(SCOPE, "sample/widgets", "继续检查")
 
-    assert context.selection_metadata["compression_level"] == "summary"
-    assert len(manager.summary_saves) == 1
-    assert manager.summary_saves[0][1] == 7
-    assert manager.session.summary_through_seq == 7
-    assert [unit["seq"] for unit in context.history_units][-2:] == [12, 13]
+    assert context.selection_metadata["compression_level"] == "none"
+    assert manager.summary_saves == []
+    assert [unit["seq"] for unit in context.history_units] == list(range(1, 14))
     assert context.selection_metadata["final_projection_size"] <= 26112
+
+
+def test_history_fields_are_not_hard_truncated_below_the_light_threshold() -> None:
+    history = "history-" + "x" * 5_000
+    assistant = "assistant-" + "y" * 5_000
+    manager = FakeSessionManager(
+        turns=[replace(_turn(1), history_text=history, assistant_text=assistant)]
+    )
+
+    context = ContextBuilder(manager).build(SCOPE, "sample/widgets", "继续检查")
+
+    assert context.selection_metadata["compression_level"] == "none"
+    assert context.history_units[0]["history_text"] == history
+    assert context.history_units[0]["assistant_text"] == assistant
 
 
 def test_light_and_emergency_projections_keep_the_latest_two_units() -> None:

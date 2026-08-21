@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..state import TurnRecord
+from .budget import estimate_tokens
 
 SUMMARY_TOKEN_LIMIT = 1500
 SUMMARY_RECORD_CHARACTER_LIMIT = 400
@@ -17,12 +18,6 @@ TokenCounter = Callable[[str], int]
 
 _TURN_LINE = re.compile(r"^\[turn:(\d+)](?:\s|$)")
 _OMITTED_LINE = re.compile(r"^\[older turns omitted through:(\d+)]$")
-
-
-def estimate_tokens(value: str) -> int:
-    """Estimate tokens using the project's fixed ceil(UTF-8 byte length / 3) rule."""
-
-    return (len(value.encode("utf-8")) + 2) // 3
 
 
 @dataclass(frozen=True)

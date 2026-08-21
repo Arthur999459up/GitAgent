@@ -123,7 +123,9 @@ class CIDiagnosisAgent:
             suspected = list(dict.fromkeys(hit["path"] for hit in search["results"]))[:8]
         files = (
             context.tool(
-                "repository.read_files", repository=repository, paths=suspected, limit_per_file=180
+                "repository.read_files",
+                repository=repository,
+                requests=[{"path": path, "limit": 180} for path in suspected],
             )["files"]
             if suspected
             else []

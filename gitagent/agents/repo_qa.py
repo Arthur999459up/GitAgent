@@ -74,7 +74,11 @@ class RepoQAAgent:
         hits = search["results"]
         paths = list(dict.fromkeys(hit["path"] for hit in hits))[:4]
         reads = (
-            context.tool("repository.read_files", repository=repository, paths=paths, limit_per_file=220)["files"]
+            context.tool(
+                "repository.read_files",
+                repository=repository,
+                requests=[{"path": path, "limit": 220} for path in paths],
+            )["files"]
             if paths
             else []
         )

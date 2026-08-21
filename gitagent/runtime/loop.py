@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
+from ..context import render_agent_observations
 from ..core.errors import PermissionDenied, ValidationError, WorkflowError
 from ..core.models import (
     AccessLevel,
@@ -199,14 +199,6 @@ class AgentLoop:
         ):
             arguments["repository"] = context.repository
         tool = self.harness.server.get_tool(action.tool)
-        cache_key = json.dumps([action.tool, arguments], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        if tool.access == AccessLevel.READ and cache_key in context.read_cache:
-            self._observe(
-                context,
-                "tool",
-                {"tool": action.tool, "arguments": arguments, "data": context.read_cache[cache_key], "cached": True},
-            )
-            return True
         if tool.access in {AccessLevel.WRITE, AccessLevel.DESTRUCTIVE}:
             if context.read_only:
                 self._observe(
@@ -231,9 +223,16 @@ class AgentLoop:
             context.pending = PendingAction(approval.approval_id, approval.summary, [call])
             self._emit(context, TraceStatus.WAITING, message=approval.summary)
             return False
-        result = context.tool(action.tool, **arguments)
-        context.read_cache[cache_key] = result
-        self._observe(context, "tool", {"tool": action.tool, "arguments": arguments, "data": result})
+        context.tool(action.tool, **arguments)
+        call = context.last_tool_call
+        if call is None:
+            raise WorkflowError("tool execution did not record its result")
+        payload = {"tool": action.tool, "arguments": call.arguments, "data": call.observation_data}
+        if call.cached:
+            payload["cached"] = True
+        if call.covered:
+            payload["covered"] = True
+        self._observe(context, "tool", payload)
         return True
 
     def _handle_apply(self, context: AgentContext, action: AgentAction) -> bool:
@@ -370,121 +369,11 @@ def rejection_feedback(context: AgentContext) -> str | None:
 
 
 def render_observations(context: AgentContext) -> str:
-    """Return bounded observations as valid JSON; never truncate serialized JSON text."""
-    observations = context.observations[-20:]
-    for string_limit, item_limit in ((2_000, 20), (750, 10), (240, 5), (240, 5), (240, 5)):
-        entries: list[dict[str, Any]] = []
-        for observation in observations:
-            if observation["kind"] == "tool":
-                payload = observation["payload"]
-                entries.append(
-                    {
-                        "tool": payload.get("tool", ""),
-                        "arguments": _compact(
-                            payload.get("arguments", {}),
-                            string_limit=string_limit,
-                            item_limit=item_limit,
-                            content_limit=8_000,
-                        ),
-                        "data": _compact(
-                            payload.get("data"),
-                            string_limit=string_limit,
-                            item_limit=item_limit,
-                            content_limit=8_000,
-                        ),
-                    }
-                )
-            else:
-                entries.append(
-                    {
-                        observation["kind"]: _compact(
-                            observation["payload"], string_limit=string_limit, item_limit=item_limit
-                        )
-                    }
-                )
-        text = json.dumps(entries, ensure_ascii=False)
-        if len(text) <= 16_000:
-            return text
-        observations = observations[-max(1, len(observations) // 2) :]
-    return json.dumps(
-        [{"notice": "latest observation exceeded the model context budget and was omitted"}],
-        ensure_ascii=False,
+    """Render observations unchanged until the shared context budget reaches a compression threshold."""
+
+    return render_agent_observations(
+        context.observations,
+        file_coverage=context.file_reads.summaries(),
+        effective_input_budget=context.input_budget_tokens,
+        fixed_input_tokens=context.fixed_input_tokens(),
     )
-
-
-def _compact(
-    value: Any,
-    *,
-    depth: int = 0,
-    string_limit: int = 2_000,
-    item_limit: int = 20,
-    content_limit: int | None = None,
-    key: str = "",
-) -> Any:
-    if isinstance(value, str):
-        limit = content_limit if key == "content" and content_limit is not None else string_limit
-        return value[:limit]
-    if isinstance(value, dict):
-        if depth > 4:
-            return f"<{len(value)} keys>"
-        priority_keys = (
-            "path",
-            "start_line",
-            "end_line",
-            "truncated",
-            "content",
-            "number",
-            "title",
-            "body",
-            "state",
-            "labels",
-            "comments",
-            "query",
-            "results",
-            "entries",
-            "name",
-            "login",
-            "created_at",
-            "updated_at",
-        )
-        ordered_keys = [key for key in priority_keys if key in value]
-        ordered_keys.extend(key for key in value if key not in ordered_keys)
-        items = [(key, value[key]) for key in ordered_keys[:item_limit]]
-        compacted = {
-            item_key: _compact(
-                item,
-                depth=depth + 1,
-                string_limit=string_limit,
-                item_limit=item_limit,
-                content_limit=content_limit,
-                key=str(item_key),
-            )
-            for item_key, item in items
-        }
-        content = value.get("content")
-        if isinstance(content, str) and content_limit is not None and len(content) > content_limit:
-            compacted["__content_projection__"] = {
-                "truncated": True,
-                "original_chars": len(content),
-                "retained_chars": content_limit,
-            }
-        if len(value) > item_limit:
-            compacted["__omitted__"] = f"{len(value) - item_limit} more keys"
-        return compacted
-    if isinstance(value, (list, tuple)):
-        if depth > 4:
-            return f"<{len(value)} items>"
-        items = [
-            _compact(
-                item,
-                depth=depth + 1,
-                string_limit=string_limit,
-                item_limit=item_limit,
-                content_limit=content_limit,
-            )
-            for item in value[:item_limit]
-        ]
-        if len(value) > item_limit:
-            items.append(f"<{len(value) - item_limit} more>")
-        return items
-    return value

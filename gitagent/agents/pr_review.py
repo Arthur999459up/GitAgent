@@ -91,8 +91,7 @@ class PRReviewAgent:
             context.tool(
                 "repository.read_files",
                 repository=repository,
-                paths=readable[:12],
-                limit_per_file=180,
+                requests=[{"path": path, "limit": 180} for path in readable[:12]],
                 ref=head_ref or None,
             )["files"]
             if readable

@@ -39,7 +39,7 @@ from ..core.models import (
 from ..core.trace import TraceBus
 from ..mcp import MCPServer
 from ..reasoning import Reasoner
-from ..runtime import AgentContext, AgentHarness, AgentLoop, register_github_mutator
+from ..runtime import AgentContext, AgentHarness, AgentLoop, FileReadLedger, register_github_mutator
 from ..state import SessionManager
 from ..verification import StaticVerifier
 from .approval import ApprovalIntentClassifier
@@ -67,8 +67,9 @@ class GitAgentService:
         session_manager: SessionManager | None = None,
         trace: TraceBus | None = None,
         session_scope: SessionScope | None = None,
+        input_budget_tokens: int = 26_112,
     ) -> None:
-        self.harness = AgentHarness(server, trace=trace)
+        self.harness = AgentHarness(server, trace=trace, input_budget_tokens=input_budget_tokens)
         register_github_mutator(self.harness)
         self.repo_qa = RepoQAAgent(self.harness, agent_reasoner)
         self.pr_review_agent = PRReviewAgent(self.harness, agent_reasoner)
@@ -476,6 +477,7 @@ class GitAgentService:
             "read_only": context.read_only,
             "result_required": context.result_required,
             "read_cache": to_plain(context.read_cache),
+            "file_reads": context.file_reads.to_plain(),
             "error": context.error,
             "finished": context.finished,
         }
@@ -505,6 +507,7 @@ class GitAgentService:
         context.read_only = bool(raw.get("read_only", False))
         context.result_required = bool(raw.get("result_required", True))
         context.read_cache = dict(raw.get("read_cache") or {})
+        context.file_reads = FileReadLedger.from_plain(raw.get("file_reads"))
         context.error = str(raw.get("error")) if raw.get("error") is not None else None
         context.finished = bool(raw.get("finished", False))
         pending = raw.get("pending")

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from time import perf_counter
 from typing import Any, TypeVar
 
+from ..context import estimate_tokens
 from ..core.approval import ApprovalStore
 from ..core.audit import AuditLog
 from ..core.errors import PermissionDenied, ToolExecutionError, ValidationError
@@ -20,8 +22,17 @@ from ..core.models import (
 )
 from ..core.trace import TraceBus, TraceCategory, TraceStatus
 from ..mcp import MCPClient, MCPServer
+from .file_reads import FileReadLedger
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class ToolCallRecord:
+    arguments: dict[str, Any]
+    observation_data: Any
+    cached: bool = False
+    covered: bool = False
 
 
 class AgentContext:
@@ -63,6 +74,8 @@ class AgentContext:
         self.read_only = False
         self.result_required = True
         self.read_cache: dict[str, Any] = {}
+        self.file_reads = FileReadLedger()
+        self.last_tool_call: ToolCallRecord | None = None
         self.error: str | None = None
         self.finished = False
 
@@ -78,8 +91,59 @@ class AgentContext:
     def waiting(self) -> bool:
         return self.pending is not None or bool(self.question)
 
+    @property
+    def input_budget_tokens(self) -> int:
+        return self._harness.input_budget_tokens
+
     def tool(self, name: str, *, approval_id: str | None = None, **arguments: Any) -> Any:
-        return self._harness.execute_tool(self, name, arguments, approval_id=approval_id)
+        self.last_tool_call = None
+        prepared = self.file_reads.prepare(name, arguments)
+        actual_arguments = prepared.actual_arguments if prepared is not None else dict(arguments)
+        if actual_arguments is None:
+            result, observation_data = self.file_reads.complete(prepared, None)
+            self.last_tool_call = ToolCallRecord(dict(arguments), observation_data, cached=True, covered=True)
+            return result
+
+        tool = self._harness.server.get_tool(name)
+        cache_key = json.dumps([name, actual_arguments], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        cacheable = tool.access == AccessLevel.READ and prepared is None
+        cached = cacheable and cache_key in self.read_cache
+        if cached:
+            raw_result = self.read_cache[cache_key]
+        else:
+            raw_result = self._harness.execute_tool(self, name, actual_arguments, approval_id=approval_id)
+            if cacheable:
+                self.read_cache[cache_key] = raw_result
+
+        if prepared is not None:
+            result, observation_data = self.file_reads.complete(prepared, raw_result)
+        else:
+            result = raw_result
+            observation_data = (
+                {"already_observed": True, "tool": name, "arguments": actual_arguments} if cached else raw_result
+            )
+        self.last_tool_call = ToolCallRecord(
+            actual_arguments,
+            observation_data,
+            cached=cached,
+            covered=bool(prepared and prepared.covered_indexes),
+        )
+        return result
+
+    def fixed_input_tokens(self) -> int:
+        """Estimate non-observation input shared by each decision prompt."""
+
+        value = {
+            "system": self.system_prompt,
+            "goal": self.goal,
+            "repository": self.repository,
+            "entity_type": self.entity_type,
+            "entity_id": self.entity_id,
+            "guidance": asdict(self.guidance) if self.guidance is not None else None,
+            "tools": self._harness.client.llm_tools(self.spec.allowed_tools),
+        }
+        # Reserve room for the agent-specific prompt framing that surrounds observations.
+        return estimate_tokens(json.dumps(value, ensure_ascii=False, default=str)) + 512
 
 
 class AgentHarness:
@@ -90,12 +154,20 @@ class AgentHarness:
         approvals: ApprovalStore | None = None,
         audit: AuditLog | None = None,
         trace: TraceBus | None = None,
+        input_budget_tokens: int = 26_112,
     ) -> None:
         self.server = server
         self.client = MCPClient(server)
         self.approvals = approvals or ApprovalStore()
         self.audit = audit or AuditLog()
         self.trace = trace or TraceBus()
+        if (
+            not isinstance(input_budget_tokens, int)
+            or isinstance(input_budget_tokens, bool)
+            or input_budget_tokens < 4096
+        ):
+            raise ValueError("input_budget_tokens must be an integer of at least 4096")
+        self.input_budget_tokens = input_budget_tokens
         self._specs: dict[str, AgentSpec] = {}
 
     def register(self, spec: AgentSpec) -> None:

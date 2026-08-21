@@ -146,8 +146,7 @@ class CodingAgent:
             context.tool(
                 "repository.read_files",
                 repository=request.repository,
-                paths=existing_paths,
-                limit_per_file=400,
+                requests=[{"path": path, "limit": 400} for path in existing_paths],
             )["files"]
             if existing_paths
             else []
@@ -163,8 +162,7 @@ class CodingAgent:
                 more = context.tool(
                     "repository.read_files",
                     repository=request.repository,
-                    paths=missing_context,
-                    limit_per_file=400,
+                    requests=[{"path": path, "limit": 400} for path in missing_context],
                 )["files"]
                 if any(item.get("truncated") for item in more):
                     raise WorkflowError(
@@ -255,8 +253,7 @@ class CodingAgent:
         fetched = context.tool(
             "repository.read_files",
             repository=request.repository,
-            paths=candidate.changed_files,
-            limit_per_file=400,
+            requests=[{"path": path, "limit": 400} for path in candidate.changed_files],
         )["files"]
         if any(item.get("truncated") for item in fetched):
             raise WorkflowError("a target file exceeds the safe fetch bound; refusing a truncated repair")

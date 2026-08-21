@@ -29,6 +29,27 @@ def structured_message_contents(
     return system + "\n" + instruction, prompt
 
 
+def structured_request_payload(
+    system: str,
+    prompt: str,
+    *,
+    schema: dict[str, Any] | None = None,
+    tool_name: str = "respond",
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the exact messages and tool definitions used for a structured call."""
+
+    system_content, user_content = structured_message_contents(system, prompt, schema=schema)
+    available_tools = [*_structured_tools(tool_name, schema), *(tools or [])] if schema is not None else tools
+    return {
+        "messages": [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ],
+        "tools": available_tools or None,
+    }
+
+
 class Reasoner(Protocol):
     def complete_structured(
         self,
@@ -58,17 +79,14 @@ class LLMReasoner:
         tool_name: str = "respond",
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        system_content, user_content = structured_message_contents(system, prompt, schema=schema)
-        structured_tools = _structured_tools(tool_name, schema) if schema is not None else []
-        available_tools = [*structured_tools, *(tools or [])] or None
-        messages = [
-            {
-                "role": "system",
-                "content": system_content,
-            },
-            {"role": "user", "content": user_content},
-        ]
-        response = self.client.chat(messages=messages, tools=available_tools)
+        request = structured_request_payload(
+            system,
+            prompt,
+            schema=schema,
+            tool_name=tool_name,
+            tools=tools,
+        )
+        response = self.client.chat(messages=request["messages"], tools=request["tools"])
         try:
             return self._structured_value(
                 response,
@@ -82,7 +100,7 @@ class LLMReasoner:
             previous = _response_text_for_retry(response)
             retry = self.client.chat(
                 messages=[
-                    *messages,
+                    *request["messages"],
                     {"role": "assistant", "content": previous},
                     {
                         "role": "user",
@@ -93,7 +111,7 @@ class LLMReasoner:
                         ),
                     },
                 ],
-                tools=available_tools,
+                tools=request["tools"],
             )
             try:
                 return self._structured_value(

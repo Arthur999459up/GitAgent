@@ -9,23 +9,18 @@ from typing import Any
 
 from ..core.models import ContextMemory, RoutingContext, SessionScope
 from ..state import OPEN_QUESTION_CHARACTER_LIMIT, MemoryRecord, SessionManager, TurnRecord
+from .budget import EMERGENCY_THRESHOLD, LIGHT_THRESHOLD, SUMMARY_THRESHOLD, context_pressure, estimate_tokens
 from .compact import (
     SUMMARY_TAIL_UNITS,
     CompactResult,
     DeterministicCompactor,
     _render_summary_record,
-    estimate_tokens,
     is_history_unit,
     render_summary_record,
 )
 
-LIGHT_THRESHOLD = 0.50
-SUMMARY_THRESHOLD = 0.70
-EMERGENCY_THRESHOLD = 0.90
 RETRY_RESERVE_TOKENS = 512
 MINIMUM_EFFECTIVE_INPUT_BUDGET = 4096
-HISTORY_PREVIEW_BYTES = 2048
-
 TokenCounter = Callable[[str], int]
 PromptRenderer = Callable[[RoutingContext], str]
 
@@ -138,7 +133,7 @@ class ContextBuilder:
             current_size = light_size
             light_applied = True
 
-        should_summarise = self._pressure(current_size) >= SUMMARY_THRESHOLD or len(loaded.history_units) > 12
+        should_summarise = self._pressure(current_size) >= SUMMARY_THRESHOLD
         if should_summarise:
             compression_level = "summary"
             before_summary_size = current_size
@@ -622,7 +617,7 @@ class ContextBuilder:
         )
 
     def _pressure(self, tokens: int) -> float:
-        return tokens / self.effective_input_budget
+        return context_pressure(tokens, self.effective_input_budget)
 
     @staticmethod
     def _budget_error_message() -> str:
@@ -637,11 +632,11 @@ def _safe_history_unit(turn: TurnRecord) -> dict[str, Any]:
     unit: dict[str, Any] = {
         "seq": turn.seq,
         "status": status,
-        "history_text": _utf8_head_tail(turn.history_text, HISTORY_PREVIEW_BYTES),
+        "history_text": turn.history_text,
         "route_summary": _safe_route_summary(turn.route_summary),
     }
     if status == "completed":
-        unit["assistant_text"] = _utf8_head_tail(turn.assistant_text, HISTORY_PREVIEW_BYTES)
+        unit["assistant_text"] = turn.assistant_text
         unit["entity_manifests"] = _safe_manifests(turn.entity_manifests)
     return unit
 
@@ -754,19 +749,6 @@ def _memory_plain(memory: ContextMemory) -> dict[str, str]:
         "kind": memory.kind,
         "content": memory.content,
     }
-
-
-def _utf8_head_tail(value: str, limit: int) -> str:
-    encoded = value.encode("utf-8")
-    if len(encoded) <= limit:
-        return value
-    marker = b"\n[TRUNCATED]\n"
-    available = max(0, limit - len(marker))
-    head_budget = available // 2
-    tail_budget = available - head_budget
-    head = encoded[:head_budget].decode("utf-8", errors="ignore").encode("utf-8")
-    tail = encoded[-tail_budget:].decode("utf-8", errors="ignore").encode("utf-8") if tail_budget else b""
-    return (head + marker + tail).decode("utf-8")
 
 
 def _bounded_text(value: Any, limit: int) -> str:
