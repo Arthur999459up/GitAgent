@@ -7,10 +7,11 @@ from enum import Enum
 from typing import Any, Protocol
 
 from ..context import render_agent_observations
-from ..core.errors import PermissionDenied, ValidationError, WorkflowError
+from ..core.errors import PermissionDenied, ToolExecutionError, ValidationError, WorkflowError
 from ..core.models import (
     AccessLevel,
     ApprovalIntent,
+    MutationRejectedResult,
     PlannedToolCall,
     WorkflowTurnDecision,
 )
@@ -26,7 +27,6 @@ from .mutation import (
 class AgentActionKind(str, Enum):
     TOOL = "tool"
     APPLY_CODE_CHANGE = "apply_code_change"
-    SPECIALIST = "specialist"
     ASK = "ask"
     FINISH = "finish"
 
@@ -39,7 +39,6 @@ class AgentAction:
     summary: str = ""
     tool: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
-    specialist: str | None = None
     question: str = ""
     message: str = ""
 
@@ -51,16 +50,12 @@ class PendingAction:
     approval_id: str
     summary: str
     calls: list[PlannedToolCall]
-    specialist: str | None = None
 
 
 class AgentLoopAgent(Protocol):
     def decide(self, context: AgentContext) -> AgentAction: ...
 
     def build_result(self, context: AgentContext) -> Any: ...
-
-    def run_specialist(self, context: AgentContext, specialist: str) -> dict[str, Any]: ...
-
 
 class AgentLoop:
     def __init__(self, harness: AgentHarness, *, max_steps: int = 20) -> None:
@@ -84,7 +79,7 @@ class AgentLoop:
     ) -> AgentContext:
         if context.finished or context.error:
             raise WorkflowError("agent context is not waiting for user input")
-        self._apply_decision(context, agent, decision)
+        self._apply_decision(context, decision)
         if not context.finished and not context.error and not context.waiting:
             self._step(context, agent)
         return context
@@ -95,7 +90,6 @@ class AgentLoop:
         *,
         summary: str,
         calls: list[PlannedToolCall],
-        specialist: str | None = None,
     ) -> None:
         approval = self.harness.approvals.create(
             session_id=context.session_id,
@@ -105,12 +99,11 @@ class AgentLoop:
             proposal_revision=1,
             proposal_content=summary,
         )
-        context.pending = PendingAction(approval.approval_id, summary, calls, specialist=specialist)
+        context.pending = PendingAction(approval.approval_id, summary, calls)
 
     def _apply_decision(
         self,
         context: AgentContext,
-        agent: AgentLoopAgent,
         decision: WorkflowTurnDecision,
     ) -> None:
         if context.question:
@@ -123,12 +116,18 @@ class AgentLoop:
             raise WorkflowError("agent context is not waiting for user input")
         if decision.action == ApprovalIntent.APPROVE:
             self.harness.approvals.decide(pending.approval_id, "Approve")
+            # Approval is one-shot even when the remote mutation fails.  Keep the
+            # local copy for exact execution, but stop exposing it as retryable
+            # user input before crossing the external write boundary.
+            context.pending = None
             try:
-                self._execute_pending(context, agent, pending)
+                self._execute_pending(context, pending)
+            except ToolExecutionError as exc:
+                self._finish_mutation_rejection(context, pending, exc)
+                return
             except Exception as exc:  # noqa: BLE001 - mutation stops fail-closed
                 self._fail(context, f"approved action stopped fail-closed: {exc}", exc=exc)
                 return
-            context.pending = None
             return
         self.harness.approvals.decide(pending.approval_id, "Reject")
         feedback = (decision.instruction or "").strip()
@@ -138,9 +137,7 @@ class AgentLoop:
     def _step(self, context: AgentContext, agent: AgentLoopAgent) -> None:
         while not context.finished and not context.error and not context.waiting:
             if context.steps >= context.max_steps:
-                context.error = f"达到步数上限（{context.max_steps}）"
-                context.finished = True
-                self._emit(context, TraceStatus.FAILED, message=context.error)
+                self._fail(context, f"达到步数上限（{context.max_steps}）")
                 return
             context.steps += 1
             try:
@@ -169,8 +166,6 @@ class AgentLoop:
                 return self._handle_tool(context, agent, action)
             if action.kind == AgentActionKind.APPLY_CODE_CHANGE:
                 return self._handle_apply(context, action)
-            if action.kind == AgentActionKind.SPECIALIST:
-                return self._handle_specialist(context, action)
             if action.kind == AgentActionKind.ASK:
                 context.question = action.question or action.summary
                 self._emit(context, TraceStatus.WAITING, message=context.question)
@@ -255,45 +250,11 @@ class AgentLoop:
         self._emit(context, TraceStatus.WAITING, message=approval.summary)
         return False
 
-    def _handle_specialist(self, context: AgentContext, action: AgentAction) -> bool:
-        if not action.specialist:
-            raise ValidationError("specialist action requires a specialist name")
-        call = PlannedToolCall("agent.invoke_specialist", {"specialist": action.specialist})
-        approval = self.harness.approvals.create(
-            session_id=context.session_id,
-            repository=context.repository,
-            summary=action.summary or f"调用 {action.specialist}",
-            calls=[call],
-            proposal_revision=1,
-            proposal_content=action.summary or f"调用 {action.specialist}",
-        )
-        context.pending = PendingAction(
-            approval.approval_id,
-            approval.summary,
-            [call],
-            specialist=action.specialist,
-        )
-        self._emit(context, TraceStatus.WAITING, message=approval.summary)
-        return False
-
     def _execute_pending(
         self,
         context: AgentContext,
-        agent: AgentLoopAgent,
         pending: PendingAction,
     ) -> None:
-        if pending.specialist is not None:
-            self.harness.approvals.authorize(
-                approval_id=pending.approval_id,
-                session_id=context.session_id,
-                tool="agent.invoke_specialist",
-                arguments={"specialist": pending.specialist},
-            )
-            data = agent.run_specialist(context, pending.specialist)
-            self._observe(context, "tool", {"tool": f"specialist:{pending.specialist}", "data": data})
-            if not self.harness.approvals.complete(pending.approval_id):
-                raise WorkflowError("approved specialist call was not fully consumed")
-            return
         mutator = self.harness.context(
             "github_mutator",
             context.session_id,
@@ -310,10 +271,29 @@ class AgentLoop:
         if not self.harness.approvals.complete(pending.approval_id):
             raise WorkflowError("approved mutation plan was not fully consumed")
 
+    def _finish_mutation_rejection(
+        self,
+        context: AgentContext,
+        pending: PendingAction,
+        exc: ToolExecutionError,
+    ) -> None:
+        context.result = MutationRejectedResult(
+            summary=pending.summary or "GitHub 操作",
+            reason=exc.user_message,
+        )
+        context.finished = True
+        self._emit(
+            context,
+            TraceStatus.COMPLETED,
+            message=f"{context.result.summary}：未执行。失败原因：{context.result.reason}",
+        )
+
     def _observe(self, context: AgentContext, kind: str, payload: Any) -> None:
         context.observations.append({"kind": kind, "payload": payload})
 
     def _fail(self, context: AgentContext, error: str, *, exc: BaseException | None = None) -> None:
+        context.pending = None
+        context.question = ""
         context.error = str(error)
         context.finished = True
         self._emit(context, TraceStatus.FAILED, message=str(error), exc=exc)
@@ -351,7 +331,6 @@ def _debug_action(action: AgentAction) -> dict[str, Any]:
         "summary": debug_value(action.summary, key="summary"),
         "tool": action.tool,
         "arguments": debug_value(action.arguments),
-        "specialist": action.specialist,
         "question": debug_value(action.question, key="question"),
         "message": debug_value(action.message, key="message"),
     }

@@ -54,7 +54,7 @@ class ContextBuilder:
         session_manager: SessionManager,
         *,
         context_window_tokens: int = 32768,
-        max_output_tokens: int = 4096,
+        max_output_tokens: int = 16_384,
         safety_tokens: int = 2048,
         retry_reserve_tokens: int = RETRY_RESERVE_TOKENS,
         token_counter: TokenCounter = estimate_tokens,

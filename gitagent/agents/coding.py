@@ -12,6 +12,10 @@ from ..core.models import (
     AgentSpec,
     CandidatePatch,
     ChangeRequest,
+    CodeExplanationResult,
+    CodePlanResult,
+    CodeReviewResult,
+    Recommendation,
     Route,
     VerificationReport,
 )
@@ -39,9 +43,61 @@ _CANDIDATE_SCHEMA = {
     "additionalProperties": False,
 }
 
+_EXPLANATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "behavior_changes": {"type": "array", "items": {"type": "string"}},
+        "key_symbols": {"type": "array", "items": {"type": "string"}},
+        "call_relationships": {"type": "array", "items": {"type": "string"}},
+        "impact_scope": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["behavior_changes", "key_symbols", "call_relationships", "impact_scope"],
+    "additionalProperties": False,
+}
+
+_REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "blocking_issues": {"type": "array", "items": {"type": "string"}},
+        "impacts": {"type": "array", "items": {"type": "string"}},
+        "suggestions": {"type": "array", "items": {"type": "string"}},
+        "test_assessment": {"type": "string"},
+        "risk_level": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+        "recommendation": {
+            "type": "string",
+            "enum": ["APPROVE", "REQUEST_CHANGES", "NEEDS_HUMAN_REVIEW"],
+        },
+        "goal_alignment": {"type": "string", "enum": ["ALIGNED", "PARTIAL", "MISMATCH", "UNKNOWN"]},
+    },
+    "required": [
+        "summary",
+        "blocking_issues",
+        "impacts",
+        "suggestions",
+        "test_assessment",
+        "risk_level",
+        "recommendation",
+        "goal_alignment",
+    ],
+    "additionalProperties": False,
+}
+
+_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "direction": {"type": "string"},
+        "files": {"type": "array", "items": {"type": "string"}},
+        "tradeoffs": {"type": "array", "items": {"type": "string"}},
+        "tests": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["direction", "files", "tradeoffs", "tests"],
+    "additionalProperties": False,
+}
+
 CODING_SPEC = AgentSpec(
     name="coding",
-    role="Read targeted repository context and return a minimal candidate patch.",
+    role="Explain, review, plan, or prepare a minimal candidate patch from targeted repository evidence.",
     system_prompt=_PROMPTS.text("system.coding"),
     allowed_tools=frozenset(
         {
@@ -53,15 +109,7 @@ CODING_SPEC = AgentSpec(
             "repository.find_references",
         }
     ),
-    output_schema=(
-        "summary",
-        "root_cause",
-        "changed_files",
-        "patch",
-        "static_checks",
-        "risks",
-        "verification_required",
-    ),
+    output_schema=(),
     capabilities=frozenset({Route.CODE_CHANGE}),
     required_context=("repository",),
     routing_examples=(
@@ -76,6 +124,60 @@ class CodingAgent:
         self.harness = harness
         self.reasoner = reasoner
         harness.register(CODING_SPEC)
+
+    def explain(
+        self,
+        repository: str,
+        request: str,
+        evidence: dict[str, Any],
+        *,
+        session_id: str,
+        guidance: AgentGuidance | None = None,
+    ) -> CodeExplanationResult:
+        return self.harness.run(
+            "coding",
+            session_id=session_id,
+            operation=lambda context: self._explain(context, request, evidence, guidance),
+            repository=repository,
+            goal=request,
+            guidance=guidance,
+        )
+
+    def review(
+        self,
+        repository: str,
+        request: str,
+        evidence: dict[str, Any],
+        *,
+        session_id: str,
+        guidance: AgentGuidance | None = None,
+    ) -> CodeReviewResult:
+        return self.harness.run(
+            "coding",
+            session_id=session_id,
+            operation=lambda context: self._review(context, request, evidence, guidance),
+            repository=repository,
+            goal=request,
+            guidance=guidance,
+        )
+
+    def plan(
+        self,
+        repository: str,
+        request: str,
+        evidence: dict[str, Any],
+        *,
+        session_id: str,
+        guidance: AgentGuidance | None = None,
+    ) -> CodePlanResult:
+        return self.harness.run(
+            "coding",
+            session_id=session_id,
+            operation=lambda context: self._plan(context, request, evidence, guidance),
+            repository=repository,
+            goal=request,
+            guidance=guidance,
+        )
 
     def create_candidate(
         self,
@@ -117,6 +219,124 @@ class CodingAgent:
             guidance=guidance,
         )
 
+    def _explain(
+        self,
+        context: AgentContext,
+        request: str,
+        evidence: dict[str, Any],
+        guidance: AgentGuidance | None,
+    ) -> CodeExplanationResult:
+        if self.reasoner is None:
+            changed = [str(path) for path in evidence.get("changed_files", [])]
+            return CodeExplanationResult(
+                behavior_changes=[f"代码变更涉及 {path}" for path in changed],
+                key_symbols=[],
+                call_relationships=[],
+                impact_scope=changed,
+            )
+        value = self.reasoner.complete_structured(
+            system=context.system_prompt,
+            prompt=_PROMPTS.render(
+                "agents.coding_explain",
+                request=request,
+                evidence=json.dumps(evidence, ensure_ascii=False),
+                guidance=guidance_section(guidance),
+            ),
+            schema=_EXPLANATION_SCHEMA,
+            tool_name="explain_code_change",
+        )
+        return CodeExplanationResult(
+            behavior_changes=[str(item) for item in value.get("behavior_changes", [])],
+            key_symbols=[str(item) for item in value.get("key_symbols", [])],
+            call_relationships=[str(item) for item in value.get("call_relationships", [])],
+            impact_scope=[str(item) for item in value.get("impact_scope", [])],
+        )
+
+    def _review(
+        self,
+        context: AgentContext,
+        request: str,
+        evidence: dict[str, Any],
+        guidance: AgentGuidance | None,
+    ) -> CodeReviewResult:
+        changed = [str(path) for path in evidence.get("changed_files", [])]
+        if self.reasoner is None:
+            tests = [path for path in changed if self._is_test_path(path)]
+            return CodeReviewResult(
+                summary=f"静态查看了 {len(changed)} 个变更文件。",
+                blocking_issues=[],
+                impacts=changed,
+                suggestions=[],
+                test_assessment=(
+                    f"Diff 中包含 {len(tests)} 个测试文件；未执行测试。"
+                    if tests
+                    else "Diff 中没有测试文件变化；未执行测试。"
+                ),
+                risk_level="MEDIUM" if changed else "LOW",
+                recommendation=Recommendation.NEEDS_HUMAN_REVIEW,
+                goal_alignment="UNKNOWN",
+            )
+        value = self.reasoner.complete_structured(
+            system=context.system_prompt,
+            prompt=_PROMPTS.render(
+                "agents.pr_review",
+                request=request,
+                evidence=json.dumps(evidence, ensure_ascii=False),
+                guidance=guidance_section(guidance),
+            ),
+            schema=_REVIEW_SCHEMA,
+            tool_name="review_code_change",
+        )
+        recommendation = Recommendation(str(value.get("recommendation", "NEEDS_HUMAN_REVIEW")))
+        blocking_issues = (
+            [str(item) for item in value.get("blocking_issues", [])]
+            if recommendation == Recommendation.REQUEST_CHANGES
+            else []
+        )
+        return CodeReviewResult(
+            summary=str(value.get("summary", "")),
+            blocking_issues=blocking_issues,
+            impacts=[str(item) for item in value.get("impacts", [])],
+            suggestions=[str(item) for item in value.get("suggestions", [])],
+            test_assessment=str(value.get("test_assessment", "")),
+            risk_level=str(value.get("risk_level", "MEDIUM")).upper(),
+            recommendation=recommendation,
+            goal_alignment=str(value.get("goal_alignment", "UNKNOWN")).upper(),
+        )
+
+    def _plan(
+        self,
+        context: AgentContext,
+        request: str,
+        evidence: dict[str, Any],
+        guidance: AgentGuidance | None,
+    ) -> CodePlanResult:
+        changed = [str(path) for path in evidence.get("changed_files", [])]
+        if self.reasoner is None:
+            return CodePlanResult(
+                direction=request,
+                files=changed,
+                tradeoffs=["需要结合运行时行为确认具体取舍。"],
+                tests=["运行受影响模块的项目测试。"],
+            )
+        value = self.reasoner.complete_structured(
+            system=context.system_prompt,
+            prompt=_PROMPTS.render(
+                "agents.coding_plan",
+                request=request,
+                evidence=json.dumps(evidence, ensure_ascii=False),
+                guidance=guidance_section(guidance),
+            ),
+            schema=_PLAN_SCHEMA,
+            tool_name="plan_code_change",
+        )
+        return CodePlanResult(
+            direction=str(value.get("direction", request)),
+            files=[str(item) for item in value.get("files", changed)],
+            tradeoffs=[str(item) for item in value.get("tradeoffs", [])],
+            tests=[str(item) for item in value.get("tests", [])],
+        )
+
     def _create(
         self,
         context: AgentContext,
@@ -124,7 +344,12 @@ class CodingAgent:
         guidance: AgentGuidance | None,
     ) -> CandidatePatch:
         context.phase = "discovering_targets"
-        tree = context.tool("repository.get_repo_tree", repository=request.repository, depth=4)
+        tree = context.tool(
+            "repository.get_repo_tree",
+            repository=request.repository,
+            depth=4,
+            ref=request.source_ref,
+        )
         tree_paths = [str(path) for path in tree["entries"]]
         known_paths = set(tree_paths)
         paths = list(dict.fromkeys(request.target_files + [replacement.path for replacement in request.replacements]))
@@ -147,6 +372,7 @@ class CodingAgent:
                 "repository.read_files",
                 repository=request.repository,
                 requests=[{"path": path, "limit": 400} for path in existing_paths],
+                ref=request.source_ref,
             )["files"]
             if existing_paths
             else []
@@ -163,6 +389,7 @@ class CodingAgent:
                     "repository.read_files",
                     repository=request.repository,
                     requests=[{"path": path, "limit": 400} for path in missing_context],
+                    ref=request.source_ref,
                 )["files"]
                 if any(item.get("truncated") for item in more):
                     raise WorkflowError(
@@ -254,6 +481,7 @@ class CodingAgent:
             "repository.read_files",
             repository=request.repository,
             requests=[{"path": path, "limit": 400} for path in candidate.changed_files],
+            ref=request.source_ref,
         )["files"]
         if any(item.get("truncated") for item in fetched):
             raise WorkflowError("a target file exceeds the safe fetch bound; refusing a truncated repair")
@@ -316,6 +544,14 @@ class CodingAgent:
         if not query:
             raise WorkflowError("coding could not determine a repository search term")
         return query[:120]
+
+    @staticmethod
+    def _is_test_path(path: str) -> bool:
+        lowered = path.casefold()
+        segments = lowered.split("/")
+        return any(segment in {"test", "tests", "spec", "specs"} for segment in segments[:-1]) or any(
+            marker in segments[-1] for marker in ("_test.", ".test.", ".spec.")
+        )
 
 
 def prepare_verified_candidate(

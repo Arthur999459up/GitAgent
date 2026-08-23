@@ -9,10 +9,10 @@ from typing import Any, TypeVar
 
 from ..core.errors import ValidationError
 from ..core.models import (
-    CIDiagnosisResult,
     DomainAction,
     DraftResult,
     IssueAgentResult,
+    MutationRejectedResult,
     PullRequestAgentResult,
     RepoQAResult,
 )
@@ -108,6 +108,9 @@ def project_output(
                 "short_label": _reference_label(output.entity_type, output.entity_id),
             }
         return _bounded(text, 8 * 1024, text_sanitizer), [], focus
+    if isinstance(output, MutationRejectedResult):
+        text = f"操作：{output.summary}\n结果：未执行\n失败原因：{output.reason}"
+        return _bounded(text, 8 * 1024, text_sanitizer), [], None
     if isinstance(output, AgentContext):
         return _project_context(output, turn_seq=turn_seq, text_sanitizer=text_sanitizer)
     if isinstance(output, RepoQAResult):
@@ -157,21 +160,6 @@ def project_output(
                 "short_label": _bounded(selected[0].title, 120, text_sanitizer),
             }
         return _bounded("\n".join(filter(None, lines)), 8 * 1024, text_sanitizer), manifests, focus
-    if isinstance(output, CIDiagnosisResult):
-        text = (
-            f"CI {output.failed_job}: {output.failure_summary}\n"
-            f"可能根因：{output.probable_root_cause}\n建议：{output.suggested_fix}\n"
-            f"相关文件：{', '.join(output.suspected_files[:20])}\nconfidence={output.confidence:.0%}"
-        )
-        return _bounded(text, 8 * 1024, text_sanitizer), [], None
-    if isinstance(output, dict) and set(output) == {"diagnosis", "code_change"}:
-        first = project_output(output["diagnosis"], turn_seq=turn_seq, text_sanitizer=text_sanitizer)
-        second = project_output(output["code_change"], turn_seq=turn_seq, text_sanitizer=text_sanitizer)
-        return (
-            _bounded(f"{first[0]}\n\n{second[0]}", 8 * 1024, text_sanitizer),
-            first[1] + second[1],
-            second[2] or first[2],
-        )
     raise ValidationError(f"unsupported output type: {type(output).__name__}")
 
 
@@ -184,16 +172,16 @@ def _project_context(
     parts: list[str] = []
     manifests: list[dict[str, Any]] = []
     focus: dict[str, str] | None = None
-    if context.question:
+    if context.error:
+        parts.append(f"错误：{context.error}")
+    elif context.question:
         parts.append(f"问题：{context.question}")
-    if context.pending is not None:
+    elif context.pending is not None:
         parts.append(f"提案：{context.pending.summary}")
         for call in context.pending.calls:
             arguments = json.dumps(call.arguments, ensure_ascii=False, indent=2, sort_keys=True)
             parts.append(f"待执行 `{call.tool}`：\n{arguments}")
         parts.append("待人工批准后执行。")
-    if context.error:
-        parts.append(f"错误：{context.error}")
     mutation = _last_write_like_observation(context)
     if mutation is not None:
         parts.append("执行结果：" + json.dumps(mutation, ensure_ascii=False, sort_keys=True))
@@ -235,13 +223,15 @@ def _last_write_like_observation(context: AgentContext) -> Any | None:
 
 
 def _workflow_status(output: Any) -> str:
+    if isinstance(output, MutationRejectedResult):
+        return "rejected"
     if isinstance(output, AgentContext):
+        if output.error:
+            return "failed"
         if output.pending is not None:
             return "awaiting_approval"
         if output.question:
             return "awaiting_input"
-        if output.error:
-            return "failed"
     return "completed"
 
 

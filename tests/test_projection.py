@@ -1,7 +1,7 @@
 """Session projection tests for direct child-agent results."""
 
-from AGENT.GitAgent.gitagent.app.projection import project_service_result
-from AGENT.GitAgent.gitagent.core.models import DraftResult
+from AGENT.GitAgent.gitagent.app.projection import project_output, project_service_result
+from AGENT.GitAgent.gitagent.core.models import DraftResult, MutationRejectedResult
 from AGENT.GitAgent.gitagent.runtime import AgentContext
 from AGENT.GitAgent.tests.support import build_test_service, handle
 
@@ -39,3 +39,20 @@ def test_completed_write_projection_confirms_the_applied_mutation():
 
     assert "已发布回复" in projection.assistant_text
     assert service.harness.server.repositories["sample/widgets"]["comments"][-1]["body"] == first.output.body
+
+
+def test_mutation_rejection_projection_contains_only_business_reason():
+    text, manifests, focus = project_output(
+        MutationRejectedResult(
+            summary="发布 APPROVE Review 到 PR #11",
+            reason="GitHub 拒绝了该操作（HTTP 422）：Review Can not approve your own pull request",
+        )
+    )
+
+    assert text == (
+        "操作：发布 APPROVE Review 到 PR #11 结果：未执行 "
+        "失败原因：GitHub 拒绝了该操作（HTTP 422）："
+        "Review Can not approve your own pull request"
+    )
+    assert manifests == []
+    assert focus is None

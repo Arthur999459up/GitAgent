@@ -8,7 +8,13 @@ from typing import Any
 import pytest
 from AGENT.GitAgent.gitagent.context import estimate_tokens
 from AGENT.GitAgent.gitagent.core.errors import WorkflowError
-from AGENT.GitAgent.gitagent.core.models import AccessLevel, AgentSpec, ApprovalIntent, WorkflowTurnDecision
+from AGENT.GitAgent.gitagent.core.models import (
+    AccessLevel,
+    AgentSpec,
+    ApprovalIntent,
+    MutationRejectedResult,
+    WorkflowTurnDecision,
+)
 from AGENT.GitAgent.gitagent.core.trace import TraceBus
 from AGENT.GitAgent.gitagent.mcp.memory import InMemoryMCPServer
 from AGENT.GitAgent.gitagent.runtime import (
@@ -35,9 +41,6 @@ class ScriptedAgent:
     def build_result(self, context: AgentContext) -> dict[str, Any]:
         return {"done": True}
 
-    def run_specialist(self, context: AgentContext, specialist: str) -> dict[str, Any]:
-        return {"specialist": specialist}
-
 
 class RepeatReadAgent:
     def decide(self, context: AgentContext) -> AgentAction:
@@ -49,9 +52,6 @@ class RepeatReadAgent:
 
     def build_result(self, context: AgentContext) -> dict[str, Any]:
         return {"done": True}
-
-    def run_specialist(self, context: AgentContext, specialist: str) -> dict[str, Any]:
-        raise AssertionError("repeat agent never invokes a specialist")
 
 
 def _harness() -> tuple[InMemoryMCPServer, AgentHarness]:
@@ -240,30 +240,7 @@ def test_bare_rejection_reports_empty_instruction():
     assert resumed.pending is None
 
 
-def test_specialist_invocation_is_gated_and_approved_without_finishing_parent_early():
-    _, harness = _harness()
-    loop = AgentLoop(harness)
-    agent = ScriptedAgent(
-        AgentAction(AgentActionKind.SPECIALIST, specialist="pr_review", summary="run review"),
-        AgentAction(AgentActionKind.FINISH, summary="done"),
-    )
-    context = loop.start(_context(harness, session_id="session-specialist"), agent)
-    assert context.pending is not None
-    assert not context.finished
-    assert context.pending.specialist == "pr_review"
-
-    resumed = loop.resume(context, agent, WorkflowTurnDecision(ApprovalIntent.APPROVE))
-
-    assert resumed.finished
-    specialist_observations = [
-        obs
-        for obs in resumed.observations
-        if obs["kind"] == "tool" and obs["payload"]["tool"].startswith("specialist:")
-    ]
-    assert specialist_observations[0]["payload"]["data"] == {"specialist": "pr_review"}
-
-
-def test_approved_mutation_fails_fail_closed_on_stale_head_sha():
+def test_approved_mutation_remote_rejection_returns_business_result_on_stale_head_sha():
     server, harness = _harness()
     loop = AgentLoop(harness)
     agent = ScriptedAgent(
@@ -279,9 +256,12 @@ def test_approved_mutation_fails_fail_closed_on_stale_head_sha():
     resumed = loop.resume(context, agent, WorkflowTurnDecision(ApprovalIntent.APPROVE))
 
     assert resumed.finished
-    assert resumed.error is not None and "head changed" in resumed.error
+    assert resumed.error is None
+    assert resumed.pending is None
+    assert not resumed.waiting
     assert "merged" not in server.repositories["sample/widgets"]["prs"][7]
-    assert resumed.result is None
+    assert isinstance(resumed.result, MutationRejectedResult)
+    assert "head changed" in resumed.result.reason
 
 
 def test_ask_pauses_and_reply_resumes_as_observation():

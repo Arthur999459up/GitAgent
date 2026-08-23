@@ -13,8 +13,9 @@ import urllib.request
 import zipfile
 from typing import Any
 
-from ..core.errors import ToolExecutionError, ValidationError
+from ..core.errors import ResourceNotFoundError, ToolExecutionError, ValidationError
 from ..core.models import RepositoryRef
+from ..core.reviews import normalize_review
 from .base import parse_file_read_requests, safe_repository_path, select_file_lines
 from .memory import InMemoryMCPServer
 
@@ -344,9 +345,12 @@ class GitHubMCPServer(InMemoryMCPServer):
         values = self._request("GET", f"/repos/{repository}/milestones?{query}")
         return {"milestones": values}
 
-    def get_pr(self, repository: str, pr_number: int) -> dict[str, Any]:
+    def get_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
         repository = self._repository(repository)
-        return self._request("GET", f"/repos/{repository}/pulls/{pr_number}")
+        try:
+            return self._request("GET", f"/repos/{repository}/pulls/{pr_number}")
+        except ResourceNotFoundError:
+            return None
 
     def list_pull_requests(
         self,
@@ -380,7 +384,8 @@ class GitHubMCPServer(InMemoryMCPServer):
     def get_pr_reviews(self, repository: str, pr_number: int) -> dict[str, Any]:
         repository = self._repository(repository)
         values = self._request("GET", f"/repos/{repository}/pulls/{pr_number}/reviews?per_page=100")
-        return {"pr_number": pr_number, "reviews": values}
+        reviews = [normalize_review(item) for item in values if isinstance(item, dict)]
+        return {"pr_number": pr_number, "reviews": reviews}
 
     def get_workflow_runs(
         self,
@@ -415,7 +420,11 @@ class GitHubMCPServer(InMemoryMCPServer):
         for job in jobs[:20]:
             if str(job.get("conclusion", "")).casefold() not in {"failure", "failed"} and job_id is None:
                 continue
-            log = self._request_bytes("GET", f"/repos/{repository}/actions/jobs/{int(job['id'])}/logs")
+            try:
+                log = self._request_bytes("GET", f"/repos/{repository}/actions/jobs/{int(job['id'])}/logs")
+            except ToolExecutionError:
+                bounded.append({**job, "log": "", "log_truncated": False, "log_unavailable": True})
+                continue
             text = self._decode_log(log)
             bounded.append({**job, "log": text[:limit], "log_truncated": len(text) > limit})
         return {"run_id": run_id, "jobs": bounded}
@@ -584,11 +593,12 @@ class GitHubMCPServer(InMemoryMCPServer):
         repository = self._repository(repository)
         if event not in {"APPROVE", "REQUEST_CHANGES", "COMMENT"}:
             raise ValidationError("invalid review event")
-        return self._request(
+        result = self._request(
             "POST",
             f"/repos/{repository}/pulls/{pr_number}/reviews",
             {"event": event, "body": body},
         )
+        return normalize_review(result)
 
     def merge(self, repository: str, pr_number: int, expected_head_sha: str) -> dict[str, Any]:
         self._require_token()
@@ -659,7 +669,13 @@ class GitHubMCPServer(InMemoryMCPServer):
                     time.sleep(_RETRY_BACKOFF_SECONDS * (2**attempt))
                     continue
                 details = exc.read().decode("utf-8", errors="replace")[:1000]
-                raise ToolExecutionError(f"GitHub API {method} {path} failed ({exc.code}): {details}") from exc
+                if exc.code == 404:
+                    raise ResourceNotFoundError(f"GitHub resource not found: {method} {path}") from exc
+                reason = _github_error_reason(details)
+                raise ToolExecutionError(
+                    f"GitHub API {method} {path} failed ({exc.code}): {details}",
+                    user_message=f"GitHub 拒绝了该操作（HTTP {exc.code}）：{reason}",
+                ) from exc
             except (urllib.error.URLError, TimeoutError) as exc:
                 if attempt + 1 < max_attempts:
                     time.sleep(_RETRY_BACKOFF_SECONDS * (2**attempt))
@@ -688,3 +704,28 @@ class GitHubMCPServer(InMemoryMCPServer):
     @staticmethod
     def _repository(repository: str) -> str:
         return str(RepositoryRef.parse(repository))
+
+
+def _github_error_reason(details: str) -> str:
+    """Extract the actionable reason while keeping raw response details in debug traces."""
+
+    try:
+        payload = json.loads(details)
+    except json.JSONDecodeError:
+        return details.strip() or "GitHub 未提供具体原因"
+    if not isinstance(payload, dict):
+        return details.strip() or "GitHub 未提供具体原因"
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        reasons = []
+        for item in errors:
+            if isinstance(item, str) and item.strip():
+                reasons.append(item.strip())
+            elif isinstance(item, dict):
+                message = str(item.get("message") or item.get("code") or "").strip()
+                if message:
+                    reasons.append(message)
+        if reasons:
+            return "; ".join(reasons)
+    message = str(payload.get("message") or "").strip()
+    return message or "GitHub 未提供具体原因"

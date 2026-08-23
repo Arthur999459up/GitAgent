@@ -18,7 +18,6 @@ def test_model_cannot_route_to_unknown_agent():
                 "request": "继续",
                 "message": "",
                 "clarify": False,
-                "requested_fix": False,
                 "requested_reply": False,
             }
         ]
@@ -38,7 +37,6 @@ def test_model_cannot_silently_switch_repository():
                 "request": "find format_name",
                 "message": "",
                 "clarify": False,
-                "requested_fix": False,
                 "requested_reply": False,
                 "repository": "evil/other",
             }
@@ -62,7 +60,6 @@ def test_direct_answer_never_creates_child_context():
                 "request": "thanks",
                 "message": "不客气。",
                 "clarify": False,
-                "requested_fix": False,
                 "requested_reply": False,
             }
         ]

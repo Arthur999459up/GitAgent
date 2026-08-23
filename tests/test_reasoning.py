@@ -86,6 +86,7 @@ def test_openai_client_normalizes_response_and_counts_tokens():
     assert client.total_prompt_tokens == 11
     assert client.total_completion_tokens == 7
     assert completions.params["model"] == "test-model"
+    assert completions.params["max_tokens"] == 16_384
 
 
 def test_openai_client_rejects_malformed_tool_arguments():

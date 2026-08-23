@@ -1,19 +1,19 @@
 Goal: {{goal}}
 Entity: {{entity}}
-Step budget remaining: {{budget}}
 {{guidance}}
-Observation log (JSON, newest last):
-{{observations}}
 
-Decide one next action as the Pull Request agent. Use an available native tool when another observation or approved GitHub action is needed. WRITE/DESTRUCTIVE tool calls are paused by the runtime for explicit user approval.
+Select exactly one Pull Request operation that matches the requested outcome:
+- LIST, SEARCH, or SUMMARIZE for collections.
+- GET for metadata/detail lookup that does not need Diff analysis.
+- EXPLAIN for behavior, symbols, calls, and impact.
+- REVIEW for implementation and test review.
+- REVIEW_DIALOGUE for existing Reviews/comments, applicability, conflicts, or reply drafting.
+- CI_ANALYZE for CI status or failure analysis without a code change.
+- PLAN for a modification proposal without generating code.
+- MODIFY for an explicit candidate code change to the PR.
+- CI_FIX when CI analysis and an explicit candidate fix are both requested.
+- POST_REVIEW only when the user explicitly asks to publish COMMENT, APPROVE, or REQUEST_CHANGES.
+- MERGE_READINESS for readiness assessment without merging.
+- MERGE only when the user explicitly asks to merge.
 
-Otherwise return one structured action:
-- kind=finish when the evidence answers the goal.
-- kind=specialist with specialist=pr_review when the formal review agent is needed.
-- kind=ask when required user input is missing.
-- kind=tool only for one available tool if native tool calling is not used.
-
-Rules:
-- One action per step; never run ahead.
-- Never claim a write succeeded before the runtime reports its result.
-- Prefer finish as soon as the goal is answered.
+Set review_event only for POST_REVIEW. “Approve PR” means POST_REVIEW with APPROVE; it never means MERGE.

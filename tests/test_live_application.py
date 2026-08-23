@@ -86,6 +86,26 @@ def test_runtime_approval_id_is_rebuilt_after_restart_before_explicit_execution(
     assert repo["comments"][-1]["body"] == draft
 
 
+def test_restore_rejects_terminal_context_with_pending_approval():
+    service = build_test_service()
+    _handle(service, "处理 Issue #1，先给我回复草稿")
+    proposal = _handle(service, "发布吧")
+    assert proposal.output.pending is not None
+    session = service._test_sessions.get_session(
+        service.session_scope.account_key,
+        service.session_scope.repository_key,
+        service.session_scope.session_id,
+    )
+    assert session is not None
+    malformed = dict(session.agent_context)
+    malformed["finished"] = True
+    malformed["error"] = "remote mutation failed"
+    service._test_sessions.save_agent_context(service.session_scope, malformed)
+
+    with pytest.raises(RoutingError, match="cannot be terminal and pending"):
+        _restart(service)._load_context()
+
+
 def test_session_working_state_contains_main_context_not_task_lifecycle():
     service = build_test_service()
     session = service._test_sessions.get_session(

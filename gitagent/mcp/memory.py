@@ -12,7 +12,7 @@ from typing import Any
 
 import tomllib
 
-from ..core.errors import ToolExecutionError, ValidationError
+from ..core.errors import ResourceNotFoundError, ToolExecutionError, ValidationError
 from ..core.models import AccessLevel
 from .base import parse_file_read_requests, safe_repository_path, select_file_lines
 from .registry import tool_spec
@@ -306,8 +306,11 @@ class InMemoryMCPServer(MCPServer):
             milestones.append(milestone)
         return {"milestones": deepcopy(milestones[: max(1, min(limit, 100))])}
 
-    def get_pr(self, repository: str, pr_number: int) -> dict[str, Any]:
-        return deepcopy(self._get_numbered(self._repo(repository)["prs"], pr_number, "pull request"))
+    def get_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
+        try:
+            return deepcopy(self._get_numbered(self._repo(repository)["prs"], pr_number, "pull request"))
+        except ResourceNotFoundError:
+            return None
 
     def list_pull_requests(
         self,
@@ -615,7 +618,7 @@ class InMemoryMCPServer(MCPServer):
     def _get_numbered(items: dict[Any, Any], number: int, label: str) -> dict[str, Any]:
         item = items.get(number, items.get(str(number)))
         if item is None:
-            raise ToolExecutionError(f"{label} not found: {number}")
+            raise ResourceNotFoundError(f"{label} not found: {number}")
         return item
 
     @staticmethod

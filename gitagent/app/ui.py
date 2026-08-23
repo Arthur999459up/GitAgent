@@ -50,8 +50,6 @@ _AGENT_NAMES = {
     "issues": "Issues",
     "pull_requests": "Pull Requests",
     "repo_qa": "Repository QA",
-    "pr_review": "PR Review",
-    "ci_diagnosis": "CI Diagnosis",
     "coding": "Coding",
     "code_change": "Code Change",
     "github_mutator": "GitHub Mutator",

@@ -12,12 +12,11 @@ AGENT_ACTION_SCHEMA = {
     "properties": {
         "kind": {
             "type": "string",
-            "enum": ["tool", "apply_code_change", "specialist", "ask", "finish"],
+            "enum": ["tool", "apply_code_change", "ask", "finish"],
         },
         "summary": {"type": "string", "description": "One-line user-facing explanation of the next action."},
         "tool": {"type": "string", "description": "The registered tool name when kind is tool."},
         "arguments": {"type": "object", "description": "Tool arguments when kind is tool."},
-        "specialist": {"type": "string", "enum": ["pr_review"]},
         "question": {"type": "string", "description": "The question to ask the user when kind is ask."},
         "message": {"type": "string", "description": "One-line result message when kind is finish."},
     },
@@ -42,10 +41,6 @@ def parse_action(value: Any, *, requires_candidate: bool) -> AgentAction:
         if arguments is not None and not isinstance(arguments, dict):
             raise ValidationError("tool arguments must be an object")
         action.arguments = dict(arguments or {})
-    elif kind == AgentActionKind.SPECIALIST:
-        action.specialist = str(value.get("specialist", "")).strip() or None
-        if action.specialist != "pr_review":
-            raise ValidationError("unknown specialist; only pr_review is available")
     elif kind == AgentActionKind.ASK:
         action.question = str(value.get("question", "")).strip()
         if not action.question:

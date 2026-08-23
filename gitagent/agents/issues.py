@@ -210,9 +210,6 @@ class IssueAgent:
             issue_number=issue_number,
         )
 
-    def run_specialist(self, context: AgentContext, specialist: str) -> dict[str, Any]:
-        raise WorkflowError(f"issues agent has no approved specialist: {specialist}")
-
     def draft_reply(self, context: AgentContext, reasoner: Reasoner) -> str:
         if self._last_tool(context, "github.get_issue") is None:
             raise WorkflowError("reply drafting requires Issue evidence")
@@ -332,8 +329,6 @@ class IssueAgent:
                 summary=str(value.get("summary") or "提交 Coding Agent 生成并验证的候选补丁供你审阅"),
             )
         action = parse_action(value, requires_candidate=False)
-        if action.kind == AgentActionKind.SPECIALIST:
-            raise ValidationError("issues agent does not expose a specialist action")
         return action
 
     def _required_entity_evidence(self, context: AgentContext) -> AgentAction | None:

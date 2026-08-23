@@ -20,6 +20,14 @@ class ApprovalRequired(PermissionDenied):
 class ToolExecutionError(GitAgentError):
     """An MCP tool failed."""
 
+    def __init__(self, message: str, *, user_message: str | None = None) -> None:
+        super().__init__(message)
+        self.user_message = user_message or message
+
+
+class ResourceNotFoundError(ToolExecutionError):
+    """A remote lookup could not find the requested resource."""
+
 
 class LLMProviderError(GitAgentError):
     """The configured model provider request failed before a valid response was produced."""

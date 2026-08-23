@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import urllib.error
 from typing import Any, Self
@@ -78,6 +79,129 @@ def test_read_files_reports_the_path_that_exhausted_retries(monkeypatch):
 
     with pytest.raises(ToolExecutionError, match=r"failed to read corecoder/session\.py:.*after 3 attempts"):
         GitHubMCPServer().read_files("sample/widgets", [{"path": "corecoder/session.py"}])
+
+
+def test_get_job_logs_preserves_job_status_when_log_download_fails(monkeypatch):
+    jobs = {
+        "jobs": [
+            {
+                "id": 4201,
+                "name": "static-check",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+    }
+
+    def urlopen(request: Any, *, timeout: float) -> PayloadResponse:
+        del timeout
+        if "/actions/runs/42/jobs?" in request.full_url:
+            return PayloadResponse(json.dumps(jobs).encode())
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(github_module.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(github_module.time, "sleep", lambda _seconds: None)
+
+    result = GitHubMCPServer().get_job_logs("sample/widgets", 42)
+
+    assert result == {
+        "run_id": 42,
+        "jobs": [
+            {
+                **jobs["jobs"][0],
+                "log": "",
+                "log_truncated": False,
+                "log_unavailable": True,
+            }
+        ],
+    }
+
+
+def test_get_pr_returns_none_when_github_reports_not_found(monkeypatch):
+    response = urllib.error.HTTPError(
+        "https://api.github.com/repos/sample/widgets/pulls/999999",
+        404,
+        "Not Found",
+        {},
+        io.BytesIO(b'{"message":"Not Found"}'),
+    )
+    monkeypatch.setattr(
+        github_module.urllib.request,
+        "urlopen",
+        lambda request, *, timeout: (_ for _ in ()).throw(response),
+    )
+
+    assert GitHubMCPServer().get_pr("sample/widgets", 999999) is None
+
+
+def test_github_http_error_keeps_raw_debug_message_and_exposes_business_reason(monkeypatch):
+    response = urllib.error.HTTPError(
+        "https://api.github.com/repos/sample/widgets/pulls/11/reviews",
+        422,
+        "Unprocessable Entity",
+        {},
+        io.BytesIO(
+            json.dumps(
+                {
+                    "message": "Unprocessable Entity",
+                    "errors": ["Review Can not approve your own pull request"],
+                    "documentation_url": "https://docs.github.com/rest/pulls/reviews#create-a-review-for-a-pull-request",
+                    "status": "422",
+                }
+            ).encode()
+        ),
+    )
+    monkeypatch.setattr(
+        github_module.urllib.request,
+        "urlopen",
+        lambda request, *, timeout: (_ for _ in ()).throw(response),
+    )
+
+    with pytest.raises(ToolExecutionError) as captured:
+        GitHubMCPServer()._request("POST", "/repos/sample/widgets/pulls/11/reviews", {"event": "APPROVE"})
+
+    assert "documentation_url" in str(captured.value)
+    assert captured.value.user_message == (
+        "GitHub 拒绝了该操作（HTTP 422）：Review Can not approve your own pull request"
+    )
+
+
+def test_review_responses_normalize_github_states_to_request_events(monkeypatch):
+    calls: list[tuple[str, Any]] = []
+
+    def capture_urlopen(request: Any, *, timeout: float) -> PayloadResponse:
+        del timeout
+        payload = json.loads(request.data) if request.data is not None else None
+        calls.append((request.get_method(), payload))
+        if request.get_method() == "POST":
+            return PayloadResponse(b'{"id": 6, "state": "APPROVED"}')
+        return PayloadResponse(
+            json.dumps(
+                [
+                    {"id": 1, "state": "APPROVED"},
+                    {"id": 2, "state": "CHANGES_REQUESTED"},
+                    {"id": 3, "state": "COMMENTED"},
+                    {"id": 4, "state": "PENDING"},
+                    {"id": 5, "state": "DISMISSED"},
+                ]
+            ).encode()
+        )
+
+    monkeypatch.setattr(github_module.urllib.request, "urlopen", capture_urlopen)
+    server = GitHubMCPServer(token="token")
+
+    listed = server.get_pr_reviews("sample/widgets", 11)
+    posted = server.post_review("sample/widgets", 11, "APPROVE", "Ready")
+
+    assert [review.get("event") for review in listed["reviews"]] == [
+        "APPROVE",
+        "REQUEST_CHANGES",
+        "COMMENT",
+        None,
+        None,
+    ]
+    assert posted == {"id": 6, "state": "APPROVED", "event": "APPROVE"}
+    assert calls[-1] == ("POST", {"event": "APPROVE", "body": "Ready"})
 
 
 def test_issue_management_uses_the_expected_rest_methods_and_payloads(monkeypatch):

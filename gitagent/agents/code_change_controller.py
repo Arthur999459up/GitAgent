@@ -79,9 +79,6 @@ class CodeChangeController:
             "summary": context.change_request.description,
         }
 
-    def run_specialist(self, context: AgentContext, specialist: str) -> dict[str, Any]:
-        raise WorkflowError(f"code_change agent has no approved specialist: {specialist}")
-
     @staticmethod
     def _last_tool(context: AgentContext, tool: str) -> Any:
         for observation in reversed(context.observations):

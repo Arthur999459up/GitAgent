@@ -10,7 +10,6 @@ from typing import Any
 class Route(str, Enum):
     ISSUE = "ISSUE"
     PULL_REQUEST = "PULL_REQUEST"
-    CI_DIAGNOSIS = "CI_DIAGNOSIS"
     REPO_QA = "REPO_QA"
     CODE_CHANGE = "CODE_CHANGE"
 
@@ -118,7 +117,6 @@ class MainDecision:
     request: str = ""
     message: str = ""
     clarify: bool = False
-    requested_fix: bool = False
     requested_reply: bool = False
 
 
@@ -182,6 +180,7 @@ class ChangeRequest:
     proposed_files: dict[str, str] = field(default_factory=dict)
     issue_number: int | None = None
     suggested_title: str | None = None
+    source_ref: str | None = None
 
 
 @dataclass
@@ -217,6 +216,14 @@ class DraftResult:
     note: str = ""
 
 
+@dataclass(frozen=True)
+class MutationRejectedResult:
+    """An approved remote mutation was rejected without breaking the Session."""
+
+    summary: str
+    reason: str
+
+
 @dataclass
 class RepoQAResult:
     answer: str
@@ -226,24 +233,31 @@ class RepoQAResult:
 
 
 @dataclass
-class PRReviewResult:
-    summary: str
-    important_changes: list[str]
-    risk_level: str
-    potential_issues: list[str]
-    test_assessment: str
-    recommendation: Recommendation
+class CodeExplanationResult:
+    behavior_changes: list[str]
+    key_symbols: list[str]
+    call_relationships: list[str]
+    impact_scope: list[str]
 
 
 @dataclass
-class CIDiagnosisResult:
-    failed_job: str
-    failure_summary: str
-    relevant_log: str
-    suspected_files: list[str]
-    probable_root_cause: str
-    suggested_fix: str
-    confidence: float
+class CodeReviewResult:
+    summary: str
+    blocking_issues: list[str]
+    impacts: list[str]
+    suggestions: list[str]
+    test_assessment: str
+    risk_level: str
+    recommendation: Recommendation
+    goal_alignment: str
+
+
+@dataclass
+class CodePlanResult:
+    direction: str
+    files: list[str]
+    tradeoffs: list[str]
+    tests: list[str]
 
 
 class DomainAction(str, Enum):
@@ -289,6 +303,16 @@ class PullRequestOperation(str, Enum):
     GET = "GET"
     SEARCH = "SEARCH"
     SUMMARIZE = "SUMMARIZE"
+    EXPLAIN = "EXPLAIN"
+    REVIEW = "REVIEW"
+    REVIEW_DIALOGUE = "REVIEW_DIALOGUE"
+    CI_ANALYZE = "CI_ANALYZE"
+    PLAN = "PLAN"
+    MODIFY = "MODIFY"
+    CI_FIX = "CI_FIX"
+    POST_REVIEW = "POST_REVIEW"
+    MERGE_READINESS = "MERGE_READINESS"
+    MERGE = "MERGE"
 
 
 @dataclass(frozen=True)
@@ -313,6 +337,15 @@ class PullRequestAgentResult:
     pr_number: int | None = None
     requested_outcome: str | None = None
     changed_files: list[str] = field(default_factory=list)
+    interpretation: CodeExplanationResult | None = None
+    review: CodeReviewResult | None = None
+    review_dialogue: dict[str, list[str] | str] | None = None
+    ci_analysis: dict[str, list[str]] | None = None
+    plan: CodePlanResult | None = None
+    candidate: CandidatePatch | None = None
+    verification: VerificationReport | None = None
+    merge_readiness: str = ""
+    execution_result: dict[str, Any] | None = None
     question: str = ""
 
 

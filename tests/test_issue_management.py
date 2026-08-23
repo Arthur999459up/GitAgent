@@ -138,7 +138,6 @@ def test_issue_agent_updates_only_after_approval_and_returns_the_new_state():
                 "request": "关闭 Issue #1，增加 resolved 标签并分配给 alice",
                 "message": "",
                 "clarify": False,
-                "requested_fix": False,
                 "requested_reply": False,
             }
         ],
@@ -179,7 +178,6 @@ def test_issue_agent_can_create_and_lock_issues_through_the_existing_loop():
                 "request": "创建 Issue：New issue",
                 "message": "",
                 "clarify": False,
-                "requested_fix": False,
                 "requested_reply": False,
             }
         ],
@@ -208,7 +206,6 @@ def test_issue_agent_can_create_and_lock_issues_through_the_existing_loop():
                 "request": "锁定 Issue #1 的讨论，原因是 resolved",
                 "message": "",
                 "clarify": False,
-                "requested_fix": False,
                 "requested_reply": False,
             }
         ],

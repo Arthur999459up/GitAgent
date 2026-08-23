@@ -7,12 +7,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..agents import (
-    CIDiagnosisAgent,
     CodeChangeController,
     CodingAgent,
     IssueAgent,
     MainAgent,
-    PRReviewAgent,
     PullRequestAgent,
     RepoQAAgent,
 )
@@ -26,6 +24,7 @@ from ..core.models import (
     DraftResult,
     MainDecision,
     PlannedToolCall,
+    PullRequestOperation,
     Replacement,
     RepositoryRef,
     ResolvedReference,
@@ -72,11 +71,9 @@ class GitAgentService:
         self.harness = AgentHarness(server, trace=trace, input_budget_tokens=input_budget_tokens)
         register_github_mutator(self.harness)
         self.repo_qa = RepoQAAgent(self.harness, agent_reasoner)
-        self.pr_review_agent = PRReviewAgent(self.harness, agent_reasoner)
-        self.pull_request_agent = PullRequestAgent(self.harness, self.pr_review_agent, agent_reasoner)
-        self.ci_diagnosis = CIDiagnosisAgent(self.harness, agent_reasoner)
         self.coding = CodingAgent(self.harness, agent_reasoner)
         self.verifier = StaticVerifier(self.harness)
+        self.pull_request_agent = PullRequestAgent(self.harness, self.coding, self.verifier, agent_reasoner)
         self.issue_agent = IssueAgent(self.harness, self.coding, self.verifier, agent_reasoner)
         self.code_change_controller = CodeChangeController(self.coding, self.verifier)
         self.loop = AgentLoop(self.harness)
@@ -121,7 +118,10 @@ class GitAgentService:
                 )
                 output = self._continue_approval(current, decision, user_input)
                 return self._result_for_context(current, output)
-            if current.question:
+            if current.question and (
+                current.agent != "pull_requests"
+                or self.pull_request_agent.accept_question_reply(current, user_input)
+            ):
                 self.dispatch_started = True
                 self.loop.resume(
                     current,
@@ -197,37 +197,6 @@ class GitAgentService:
                 session_id=scope.session_id,
                 guidance=guidance,
             )
-        if decision.target_agent == "ci_diagnosis":
-            diagnosis = self.ci_diagnosis.diagnose(
-                repository,
-                pr_number=int(decision.entity_id)
-                if decision.entity_type == "pull_request" and decision.entity_id and decision.entity_id.isdigit()
-                else None,
-                workflow_run_id=int(decision.entity_id)
-                if decision.entity_type == "workflow_run" and decision.entity_id and decision.entity_id.isdigit()
-                else None,
-                session_id=scope.session_id,
-                guidance=guidance,
-            )
-            if not decision.requested_fix:
-                return diagnosis
-            context = self.harness.context(
-                "code_change",
-                scope.session_id,
-                repository=repository,
-                goal=diagnosis.suggested_fix,
-                entity_type=decision.entity_type,
-                entity_id=decision.entity_id,
-                guidance=guidance,
-            )
-            context.change_request = ChangeRequest(
-                repository=repository,
-                description=diagnosis.suggested_fix,
-                target_files=list(diagnosis.suspected_files),
-            )
-            self.loop.start(context, self.code_change_controller)
-            return {"diagnosis": diagnosis, "code_change": self._after_loop(context)}
-
         context = self.harness.context(
             decision.target_agent,
             scope.session_id,
@@ -284,10 +253,10 @@ class GitAgentService:
             self._save_context(context)
             return context
         self._clear_context()
-        if context.result is not None:
-            return context.result
         if context.error:
             return context
+        if context.result is not None:
+            return context.result
         return context.final_message or context
 
     def _continue_draft(self, context: AgentContext, user_input: str) -> Any:
@@ -318,15 +287,7 @@ class GitAgentService:
             self.loop.start(context, self.issue_agent)
             return self._after_loop(context)
         instruction = decision.instruction.strip() or user_input.strip()
-        revised = self.reasoner.complete_text(
-            system=(
-                "You revise a GitHub Issue reply draft. Follow the user's editing instruction exactly. "
-                "Return only the revised draft text. Do not claim it was posted and do not add meta commentary."
-            ),
-            prompt=json.dumps({"current_draft": draft, "instruction": instruction}, ensure_ascii=False),
-        ).strip()
-        if not revised:
-            raise RoutingError("draft revision returned empty text")
+        revised = self._revise_text("GitHub Issue reply draft", draft, instruction)
         context.reply_draft = revised
         self._save_context(context)
         return DraftResult(
@@ -393,27 +354,62 @@ class GitAgentService:
                 proposed_files=dict(request.proposed_files),
                 issue_number=request.issue_number,
                 suggested_title=request.suggested_title,
+                source_ref=request.source_ref,
             )
             self.loop.start(revised, self.code_change_controller)
             return self._after_loop(revised)
+
+        if context.agent == "pull_requests" and decision.action == ApprovalIntent.REVISE:
+            return self._revise_pr_review(context, decision.instruction.strip() or user_input.strip())
 
         self.loop.resume(context, self._agent_for(context.agent), decision)
         return self._after_loop(context)
 
     def _revise_draft(self, context: AgentContext, instruction: str) -> DraftResult:
         current = str(context.reply_draft or "")
+        revised = self._revise_text("GitHub Issue reply draft", current, instruction)
+        context.reply_draft = revised
+        self._save_context(context)
+        return DraftResult("issue", context.entity_id, "Issue 回复草稿 · 已修改", revised, "仍未发布。")
+
+    def _revise_pr_review(self, context: AgentContext, instruction: str) -> AgentContext:
+        pending = context.pending
+        if (
+            pending is None
+            or context.operation != PullRequestOperation.POST_REVIEW.value
+            or len(pending.calls) != 1
+            or pending.calls[0].tool != "github.post_review"
+        ):
+            raise RoutingError("当前 Pull Request 提案不是可修改的 Review 正文")
+        call = pending.calls[0]
+        revised = self._revise_text(
+            "GitHub Pull Request review body",
+            str(call.arguments.get("body") or ""),
+            instruction,
+        )
+        arguments = dict(call.arguments)
+        arguments["body"] = revised
+
+        self.harness.approvals.supersede(pending.approval_id)
+        self.loop.restore_pending(
+            context,
+            summary=pending.summary,
+            calls=[PlannedToolCall(call.tool, arguments)],
+        )
+        self._save_context(context)
+        return context
+
+    def _revise_text(self, artifact: str, current: str, instruction: str) -> str:
         revised = self.reasoner.complete_text(
             system=(
-                "You revise a GitHub Issue reply draft. Follow the user's editing instruction exactly. "
-                "Return only the revised draft text. Do not claim it was posted and do not add meta commentary."
+                f"You revise a {artifact}. Follow the user's editing instruction exactly. "
+                "Return only the revised text. Do not claim it was posted and do not add meta commentary."
             ),
             prompt=json.dumps({"current_draft": current, "instruction": instruction}, ensure_ascii=False),
         ).strip()
         if not revised:
-            raise RoutingError("draft revision returned empty text")
-        context.reply_draft = revised
-        self._save_context(context)
-        return DraftResult("issue", context.entity_id, "Issue 回复草稿 · 已修改", revised, "仍未发布。")
+            raise RoutingError(f"{artifact} revision returned empty text")
+        return revised
 
     def _result_for_context(self, context: AgentContext, output: Any) -> ServiceResult:
         return ServiceResult(
@@ -488,7 +484,6 @@ class GitAgentService:
             pending = {
                 "summary": context.pending.summary,
                 "calls": [{"tool": call.tool, "arguments": to_plain(call.arguments)} for call in context.pending.calls],
-                "specialist": context.pending.specialist,
             }
         return {
             "agent": context.agent,
@@ -496,6 +491,8 @@ class GitAgentService:
             "goal": context.goal,
             "entity_type": context.entity_type,
             "entity_id": context.entity_id,
+            "operation": context.operation,
+            "requested_outcome": context.requested_outcome,
             "steps": context.steps,
             "max_steps": context.max_steps,
             "observations": to_plain(context.observations),
@@ -533,6 +530,8 @@ class GitAgentService:
         )
         context.steps = int(raw.get("steps") or 0)
         context.observations = list(raw.get("observations") or [])
+        context.operation = str(raw.get("operation") or "")
+        context.requested_outcome = str(raw.get("requested_outcome") or "")
         context.question = str(raw.get("question") or "")
         context.final_message = str(raw.get("final_message") or "")
         context.code_candidate = self._restore_candidate(raw.get("code_candidate"))
@@ -547,6 +546,8 @@ class GitAgentService:
         context.finished = bool(raw.get("finished", False))
         pending = raw.get("pending")
         if isinstance(pending, dict):
+            if context.finished or context.error:
+                raise RoutingError("stored Session agent context cannot be terminal and pending")
             calls = [
                 PlannedToolCall(str(item["tool"]), dict(item.get("arguments") or {}))
                 for item in pending.get("calls", [])
@@ -560,7 +561,6 @@ class GitAgentService:
                 context,
                 summary=str(pending.get("summary") or ""),
                 calls=calls,
-                specialist=str(pending.get("specialist")) if pending.get("specialist") is not None else None,
             )
         return context
 
@@ -596,6 +596,7 @@ class GitAgentService:
             proposed_files={str(key): str(value) for key, value in dict(raw.get("proposed_files") or {}).items()},
             issue_number=int(raw["issue_number"]) if raw.get("issue_number") is not None else None,
             suggested_title=str(raw.get("suggested_title")) if raw.get("suggested_title") is not None else None,
+            source_ref=str(raw.get("source_ref")) if raw.get("source_ref") is not None else None,
         )
 
     @staticmethod
@@ -700,5 +701,4 @@ class GitAgentService:
         return {
             "issues": "issue",
             "pull_requests": "pull_request",
-            "ci_diagnosis": "workflow_run",
         }.get(owner, "repository")

@@ -19,6 +19,7 @@ _DEFAULT_REQUEST_TIMEOUT = 30.0
 # Keeping the old 30-second default here makes an otherwise healthy provider
 # fail before it can return a candidate patch.
 _DEFAULT_LLM_TIMEOUT = 300.0
+_DEFAULT_MAX_TOKENS = 16_384
 
 
 def _load_dotenv() -> None:
@@ -39,7 +40,7 @@ class CLIConfig:
     github_token: str = ""
     github_api_url: str = "https://api.github.com"
     temperature: float = 0.0
-    max_tokens: int = 4096
+    max_tokens: int = _DEFAULT_MAX_TOKENS
     request_timeout: float = _DEFAULT_REQUEST_TIMEOUT
     llm_timeout: float | None = None
     github_timeout: float | None = None
@@ -110,7 +111,7 @@ class CLIConfig:
             github_token=os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or "",
             github_api_url=os.getenv("GITHUB_API_URL", "https://api.github.com").rstrip("/"),
             temperature=float(os.getenv("GITAGENT_TEMPERATURE", "0")),
-            max_tokens=int(os.getenv("GITAGENT_MAX_TOKENS", "4096")),
+            max_tokens=int(os.getenv("GITAGENT_MAX_TOKENS", str(_DEFAULT_MAX_TOKENS))),
             request_timeout=legacy_timeout,
             llm_timeout=llm_timeout,
             github_timeout=(

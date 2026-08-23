@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import AGENT.GitAgent.gitagent.app.cli as cli_module
 from AGENT.GitAgent.gitagent.app.ui import TerminalUI
+from AGENT.GitAgent.gitagent.core.models import MutationRejectedResult
 from AGENT.GitAgent.gitagent.core.trace import TraceBus, TraceCategory, TraceEvent, TraceStatus
 from AGENT.GitAgent.tests.support import StubMainReasoner, build_test_service, handle
 from rich.console import Console
@@ -77,7 +78,6 @@ def test_code_change_proposal_renders_one_confirmation_and_separates_pr_title_an
                 "request": "修复 Issue #2",
                 "message": "",
                 "clarify": False,
-                "requested_fix": True,
                 "requested_reply": False,
             }
         ]
@@ -102,6 +102,38 @@ def test_code_change_proposal_renders_one_confirmation_and_separates_pr_title_an
     code_change = next(content for title, content in captured if title == "代码变更 · 待批准")
     assert "### Draft PR 标题" in code_change
     assert "### Draft PR 正文" in code_change
+
+
+def test_mutation_rejection_renders_as_explained_business_result(monkeypatch):
+    captured: list[tuple[str, str, str]] = []
+
+    class CapturingUI:
+        def markdown(self, content, *, title, kind, **kwargs):
+            del kwargs
+            captured.append((title, kind, content))
+
+    monkeypatch.setattr(cli_module, "ui", CapturingUI())
+
+    cli_module._render_output(
+        SimpleNamespace(),
+        MutationRejectedResult(
+            summary="发布 APPROVE Review 到 PR #11",
+            reason="GitHub 拒绝了该操作（HTTP 422）：Review Can not approve your own pull request",
+        ),
+    )
+
+    assert captured == [
+        (
+            "操作未执行",
+            "agent",
+            (
+                "**操作：** 发布 APPROVE Review 到 PR #11\n\n"
+                "**结果：** 未执行\n\n"
+                "**失败原因：** GitHub 拒绝了该操作（HTTP 422）："
+                "Review Can not approve your own pull request"
+            ),
+        )
+    ]
 
 
 def test_terminal_ui_labels_main_agent_tool_and_workflow_output():

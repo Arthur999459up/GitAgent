@@ -59,6 +59,8 @@ class AgentContext:
         self.entity_type = entity_type
         self.entity_id = entity_id
         self.guidance = guidance
+        self.operation = ""
+        self.requested_outcome = ""
         self.phase = ""
         self.steps = 0
         self.max_steps = max_steps
@@ -446,7 +448,6 @@ def debug_context_snapshot(context: AgentContext) -> dict[str, Any]:
     if pending is not None:
         pending_summary = {
             "summary": debug_value(getattr(pending, "summary", "")),
-            "specialist": getattr(pending, "specialist", None),
             "calls": debug_value(getattr(pending, "calls", [])),
         }
     verification_summary: dict[str, Any] | None = None
@@ -462,6 +463,7 @@ def debug_context_snapshot(context: AgentContext) -> dict[str, Any]:
             "target_files": debug_value(context.change_request.target_files),
             "issue_number": context.change_request.issue_number,
             "suggested_title": debug_value(context.change_request.suggested_title),
+            "source_ref": context.change_request.source_ref,
         }
     candidate_summary: dict[str, Any] | None = None
     if context.code_candidate is not None:
@@ -479,6 +481,8 @@ def debug_context_snapshot(context: AgentContext) -> dict[str, Any]:
         "goal": debug_value(context.goal, key="goal"),
         "entity_type": context.entity_type,
         "entity_id": context.entity_id,
+        "operation": context.operation,
+        "requested_outcome": context.requested_outcome,
         "steps": context.steps,
         "max_steps": context.max_steps,
         "waiting": context.waiting,

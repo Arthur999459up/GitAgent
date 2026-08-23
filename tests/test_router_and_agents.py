@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from AGENT.GitAgent.gitagent.core.errors import LLMProviderError
-from AGENT.GitAgent.gitagent.core.models import DraftResult, RoutingContext
+from AGENT.GitAgent.gitagent.core.models import DraftResult, PullRequestAgentResult, RoutingContext
 from AGENT.GitAgent.gitagent.mcp.memory import InMemoryMCPServer
 from AGENT.GitAgent.gitagent.runtime import AgentContext
 from AGENT.GitAgent.tests.support import StubMainReasoner, build_test_service, handle, sample_repositories
@@ -29,7 +29,6 @@ class IssueFixReasoner:
                 "summary": "prepare the issue fix",
                 "tool": "",
                 "arguments": {},
-                "specialist": "",
                 "question": "",
                 "message": "",
             }
@@ -222,6 +221,18 @@ def test_simple_conversation_answers_without_child_context():
     assert session is not None and session.agent_context == {}
 
 
+def test_ci_workflow_requests_are_handled_by_pull_request_agent():
+    service = build_test_service()
+
+    result = handle(service, "分析 workflow #42 为什么失败")
+
+    assert result.agent == "pull_requests"
+    assert isinstance(result.output, PullRequestAgentResult)
+    assert "workflow run #42" in result.output.answer
+    assert "static-check" in result.output.answer
+    assert "Returning Any" in result.output.answer
+
+
 def test_issue_calls_coding_directly_and_parent_context_continues_to_approval():
     service = build_test_service(agent_reasoner=IssueFixReasoner())
     main = StubMainReasoner(
@@ -233,7 +244,6 @@ def test_issue_calls_coding_directly_and_parent_context_continues_to_approval():
                 "request": "修复 Issue #2",
                 "message": "",
                 "clarify": False,
-                "requested_fix": True,
                 "requested_reply": False,
             }
         ]
@@ -272,7 +282,6 @@ def test_issue_fix_creates_a_separately_approved_modification_report_after_the_d
                 "request": "修复 Issue #2",
                 "message": "",
                 "clarify": False,
-                "requested_fix": True,
                 "requested_reply": False,
             }
         ],
@@ -318,7 +327,6 @@ def test_issue_confirmation_resumes_the_same_context_and_keeps_structured_handof
                 "request": "分析并处理 Issue #2",
                 "message": "",
                 "clarify": False,
-                "requested_fix": True,
                 "requested_reply": False,
             }
         ],
@@ -362,7 +370,6 @@ def test_main_routes_issue_scoped_code_changes_through_the_issue_agent():
                 "request": "继续修复 Issue #2",
                 "message": "",
                 "clarify": False,
-                "requested_fix": True,
                 "requested_reply": False,
             }
         ],
@@ -411,7 +418,6 @@ def test_issue_three_shaped_two_turn_flow_preserves_late_file_content_and_reache
                 "request": "分析并处理 Issue #3",
                 "message": "",
                 "clarify": False,
-                "requested_fix": True,
                 "requested_reply": False,
             }
         ],
@@ -450,7 +456,6 @@ def test_issue_code_candidate_timeout_is_not_swallowed_by_the_decision_fallback(
                 "request": "分析并处理 Issue #2",
                 "message": "",
                 "clarify": False,
-                "requested_fix": True,
                 "requested_reply": False,
             }
         ],

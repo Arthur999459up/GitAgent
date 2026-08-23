@@ -10,7 +10,7 @@ from ..core.models import AgentSpec, MainDecision, Route, RoutingContext, to_pla
 from ..reasoning import Reasoner, structured_request_payload
 from ..runtime import AgentContext, AgentHarness
 
-_DOMAIN_AGENTS = {"issues", "pull_requests", "ci_diagnosis", "repo_qa", "code_change"}
+_DOMAIN_AGENTS = {"issues", "pull_requests", "repo_qa", "code_change"}
 _MAIN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -20,21 +20,20 @@ _MAIN_SCHEMA = {
         "request": {"type": "string"},
         "message": {"type": "string"},
         "clarify": {"type": "boolean"},
-        "requested_fix": {"type": "boolean"},
         "requested_reply": {"type": "boolean"},
     },
-    "required": ["target_agent", "request", "message", "clarify", "requested_fix", "requested_reply"],
+    "required": ["target_agent", "request", "message", "clarify", "requested_reply"],
 }
 
 _MAIN_SYSTEM = """You are GitAgent's Main Agent. One Session is one continuous Main Agent context.
 Understand the user's current request from the Session summary, recent history, working state, and explicit memories.
 Do not invent or manage tasks, runs, workflow lifecycles, approvals, or tool calls.
-If repository work is needed, choose exactly one target_agent: issues, pull_requests, ci_diagnosis, repo_qa, or code_change.
+If repository work is needed, choose exactly one target_agent: issues, pull_requests, repo_qa, or code_change.
+Route every Pull Request request—including Review, CI, PR-scoped code work, approval, readiness, and merge—to pull_requests.
 If no child agent is needed, return an empty target_agent and answer directly in message.
 Set clarify=true only when a safe interpretation is impossible; otherwise clarify=false.
 When the user refers to a concrete Issue, Pull Request, or workflow run, return its entity_type and entity_id from the request/context.
 Set requested_reply=true only when the user wants to compose, revise, or publish an Issue reply/comment.
-Set requested_fix=true only when the user explicitly wants a code change rather than analysis alone.
 Approval and mutation safety are deterministic runtime responsibilities; never claim write authority."""
 
 _MAIN_SPEC = AgentSpec(
@@ -49,7 +48,6 @@ _MAIN_SPEC = AgentSpec(
         "request",
         "message",
         "clarify",
-        "requested_fix",
         "requested_reply",
     ),
     capabilities=frozenset({"conversation_orchestration"}),
@@ -136,9 +134,23 @@ class MainAgent:
         entity_id = str(raw.get("entity_id") or "").strip() or None
         if target == "code_change" and entity_type == "issue" and entity_id:
             target = "issues"
+        if target == "code_change" and entity_type in {"pull_request", "workflow_run"}:
+            target = "pull_requests"
         message = str(raw.get("message") or "").strip()
         request = str(raw.get("request") or text).strip() or text
         clarify = bool(raw.get("clarify", False))
+        if (
+            target == "pull_requests"
+            and entity_type == "pull_request"
+            and entity_id is not None
+            and not entity_id.isdigit()
+        ):
+            return MainDecision(
+                request=request,
+                message="当前一次只能处理一个 Pull Request；多 PR 对比尚未实现。请改为指定一个 PR 编号。",
+                clarify=True,
+                requested_reply=bool(raw.get("requested_reply", False)),
+            )
         if not target and not message:
             message = "请再具体说明你希望处理的仓库问题。" if clarify else "我需要更多上下文才能回答。"
         return MainDecision(
@@ -148,7 +160,6 @@ class MainAgent:
             request=request,
             message=message,
             clarify=clarify,
-            requested_fix=bool(raw.get("requested_fix", False)),
             requested_reply=bool(raw.get("requested_reply", False)),
         )
 
@@ -156,7 +167,6 @@ class MainAgent:
         names = {
             Route.ISSUE: "issues",
             Route.PULL_REQUEST: "pull_requests",
-            Route.CI_DIAGNOSIS: "ci_diagnosis",
             Route.REPO_QA: "repo_qa",
             Route.CODE_CHANGE: "code_change",
         }

@@ -75,7 +75,7 @@ class OpenAIChatClient:
         base_url: str | None = None,
         *,
         temperature: float = 0.0,
-        max_tokens: int = 4096,
+        max_tokens: int = 16_384,
         timeout: float = 30.0,
         client: Any | None = None,
     ) -> None:
@@ -142,7 +142,7 @@ class LiteLLMChatClient:
         base_url: str | None = None,
         *,
         temperature: float = 0.0,
-        max_tokens: int = 4096,
+        max_tokens: int = 16_384,
         timeout: float = 30.0,
     ) -> None:
         if not api_key:

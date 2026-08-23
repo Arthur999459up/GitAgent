@@ -17,10 +17,10 @@ from rich.table import Table
 from ..context import CompactResult
 from ..core.errors import GitAgentError, ValidationError
 from ..core.models import (
-    CIDiagnosisResult,
     DomainAction,
     DraftResult,
     IssueAgentResult,
+    MutationRejectedResult,
     PullRequestAgentResult,
     RepoQAResult,
     VerificationReport,
@@ -456,9 +456,12 @@ def _render_output(application: LiveApplication, output: Any) -> None:
             content += f"\n\n---\n{output.note}"
         ui.markdown(content, title=output.title, kind="agent")
         return
-    if isinstance(output, dict) and set(output) == {"diagnosis", "code_change"}:
-        _render_output(application, output["diagnosis"])
-        _render_output(application, output["code_change"])
+    if isinstance(output, MutationRejectedResult):
+        ui.markdown(
+            f"**操作：** {output.summary}\n\n**结果：** 未执行\n\n**失败原因：** {output.reason}",
+            title="操作未执行",
+            kind="agent",
+        )
         return
     if isinstance(output, AgentContext):
         _render_context(application, output)
@@ -512,33 +515,18 @@ def _render_output(application: LiveApplication, output: Any) -> None:
             content += "\n\n**相关符号：** " + ", ".join(f"`{symbol}`" for symbol in output.symbols)
         ui.markdown(content, title="Repository", kind="agent")
         return
-    if isinstance(output, CIDiagnosisResult):
-        files = ", ".join(f"`{path}`" for path in output.suspected_files) or "无"
-        content = (
-            f"{output.failure_summary}\n\n"
-            f"**可能根因：** {output.probable_root_cause}\n\n"
-            f"**建议：** {output.suggested_fix}\n\n"
-            f"**相关文件：** {files}"
-        )
-        ui.markdown(
-            content,
-            title=f"CI · {output.failed_job}",
-            kind="ci",
-            subtitle=f"confidence={output.confidence:.0%}",
-        )
-        return
     raise ValidationError(f"不支持渲染结果类型：{type(output).__name__}")
 
 
 def _render_context(application: LiveApplication, context: AgentContext) -> None:
+    if context.error:
+        ui.text(context.error, title="执行失败", kind="error")
+        return
     if context.question:
         ui.text(context.question or context.goal, title="需要补充信息", kind="router")
         return
     if context.pending is not None:
         _render_proposal(application, context)
-        return
-    if context.error:
-        ui.text(context.error, title="执行失败", kind="error")
         return
     if context.result is not None:
         _render_output(application, context.result)

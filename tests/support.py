@@ -103,7 +103,7 @@ class StubMainReasoner:
             entity_type = "pull_request"
             entity_id = _number_after_marker(text, "#")
         elif "workflow" in lowered or "诊断" in text or " ci" in f" {lowered}":
-            target = "ci_diagnosis"
+            target = "pull_requests"
             entity_type = "workflow_run"
             entity_id = _number_after_marker(text, "#")
         elif any(term in words for term in ("fix", "implement", "refactor")) or any(
@@ -119,7 +119,6 @@ class StubMainReasoner:
                 "request": text,
                 "message": "你好，我可以帮你处理这个仓库。",
                 "clarify": False,
-                "requested_fix": False,
                 "requested_reply": False,
             }
         else:
@@ -132,7 +131,6 @@ class StubMainReasoner:
             "request": text,
             "message": "",
             "clarify": False,
-            "requested_fix": target == "ci_diagnosis" and ("fix" in lowered or "修" in text),
             "requested_reply": requested_reply,
         }
 
@@ -241,7 +239,11 @@ def sample_repositories() -> dict[str, dict[str, Any]]:
                     ],
                 }
             },
-            "branches": {"main": {"pushed": True, "commits": []}},
+            "branches": {
+                "main": {"pushed": True, "commits": []},
+                "expression-add": {"base": "main", "pushed": True, "commits": []},
+                "docs": {"base": "main", "pushed": True, "commits": []},
+            },
         }
     }
 

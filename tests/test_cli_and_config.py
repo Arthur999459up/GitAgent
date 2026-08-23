@@ -48,6 +48,14 @@ def test_default_state_path_is_absolute():
     assert config.state_path.startswith("/")
 
 
+def test_default_model_output_budget_is_16k(monkeypatch):
+    monkeypatch.delenv("GITAGENT_MAX_TOKENS", raising=False)
+
+    config = CLIConfig.from_env()
+
+    assert config.max_tokens == 16_384
+
+
 def test_llm_and_github_timeouts_can_be_configured_independently(monkeypatch):
     monkeypatch.setenv("GITAGENT_REQUEST_TIMEOUT", "31")
     monkeypatch.setenv("GITAGENT_LLM_TIMEOUT", "90")
