@@ -151,21 +151,31 @@ class InMemoryMCPServer(MCPServer):
         max_entries: int = 300,
         ref: str | None = None,
     ) -> dict[str, Any]:
-        del ref  # fixture server has one current remote snapshot
         repo = self._repo(repository)
         prefix = "" if not path else safe_repository_path(path).rstrip("/") + "/"
         depth = max(1, min(depth, 8))
         max_entries = max(1, min(max_entries, 500))
         paths = []
+        omitted_by_depth = 0
         for file_path in sorted(repo["files"]):
             if not file_path.startswith(prefix):
                 continue
             relative = file_path[len(prefix) :]
             if len(PurePosixPath(relative).parts) <= depth:
                 paths.append(file_path)
+            else:
+                omitted_by_depth += 1
             if len(paths) >= max_entries:
                 break
-        return {"repository": repository, "path": path, "entries": paths, "truncated": len(paths) >= max_entries}
+        return {
+            "repository": repository,
+            "path": path,
+            "entries": paths,
+            "truncated": len(paths) >= max_entries or omitted_by_depth > 0,
+            "depth": depth,
+            "omitted_by_depth": omitted_by_depth,
+            "ref": ref or "fixture",
+        }
 
     def search_code(
         self,
@@ -181,6 +191,7 @@ class InMemoryMCPServer(MCPServer):
         max_results = max(1, min(max_results, 50))
         needle = query.casefold()
         results: list[dict[str, Any]] = []
+        truncated = False
         for file_path, content in sorted(repo["files"].items()):
             if prefix and not file_path.startswith(prefix):
                 continue
@@ -188,8 +199,19 @@ class InMemoryMCPServer(MCPServer):
                 if needle in line.casefold():
                     results.append({"path": file_path, "line": line_number, "snippet": line[:500]})
                     if len(results) >= max_results:
-                        return {"query": query, "results": results, "truncated": True}
-        return {"query": query, "results": results, "truncated": False}
+                        truncated = True
+                        break
+            if truncated:
+                break
+        return {
+            "query": query,
+            "results": results,
+            "truncated": truncated,
+            "complete": not truncated,
+            "total_count": len(results),
+            "backend": "fixture_scan",
+            "ref": "fixture",
+        }
 
     def read_file(
         self,
@@ -233,7 +255,8 @@ class InMemoryMCPServer(MCPServer):
             raise ValidationError("symbol must be an identifier-like value")
         repo = self._repo(repository)
         pattern = re.compile(
-            rf"^\s*(?:async\s+def|def|class|function|interface|type|const|let|var)\s+{re.escape(symbol)}\b"
+            rf"^\s*(?:(?:async\s+)?def|class|function|interface|type|const|let|var|"
+            rf"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn|func)\s+{re.escape(symbol)}\b"
         )
         results = []
         for file_path, content in sorted(repo["files"].items()):
@@ -241,8 +264,22 @@ class InMemoryMCPServer(MCPServer):
                 if pattern.search(line):
                     results.append({"path": file_path, "line": line_number, "snippet": line[:500]})
                     if len(results) >= min(max_results, 50):
-                        return {"symbol": symbol, "results": results, "truncated": True}
-        return {"symbol": symbol, "results": results, "truncated": False}
+                        return {
+                            "symbol": symbol,
+                            "results": results,
+                            "truncated": True,
+                            "complete": False,
+                            "backend": "fixture_symbol_scan",
+                            "ref": "fixture",
+                        }
+        return {
+            "symbol": symbol,
+            "results": results,
+            "truncated": False,
+            "complete": True,
+            "backend": "fixture_symbol_scan",
+            "ref": "fixture",
+        }
 
     def find_references(self, repository: str, symbol: str, max_results: int = 50) -> dict[str, Any]:
         return self.search_code(repository, symbol, max_results=max_results)

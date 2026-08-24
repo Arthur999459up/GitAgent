@@ -73,6 +73,8 @@ class AgentContext:
         self.change_request: ChangeRequest | None = None
         self.verification: VerificationReport | None = None
         self.reply_draft: str | None = None
+        self.repository_search_plan: dict[str, Any] | None = None
+        self.repository_history_path = ""
         self.read_only = False
         self.result_required = True
         self.read_cache: dict[str, Any] = {}
@@ -498,6 +500,8 @@ def debug_context_snapshot(context: AgentContext) -> dict[str, Any]:
         "code_candidate": candidate_summary,
         "verification": verification_summary,
         "reply_draft": "<present>" if context.reply_draft is not None else None,
+        "repository_search_plan": debug_value(context.repository_search_plan),
+        "repository_history_path": context.repository_history_path,
         "observations": [debug_observation(item) for item in context.observations[-40:]],
     }
 

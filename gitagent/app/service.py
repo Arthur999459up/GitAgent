@@ -192,14 +192,6 @@ class GitAgentService:
         guidance = self._guidance(decision.entity_type, decision.entity_id, routing_context)
         if decision.target_agent == "repository":
             operation = self.repository_agent.operation_for(goal)
-            if operation != RepositoryOperation.MODIFY:
-                return self.repository_agent.answer(
-                    repository,
-                    goal,
-                    session_id=scope.session_id,
-                    operation=operation,
-                    guidance=guidance,
-                )
             context = self.harness.context(
                 "repository",
                 scope.session_id,
@@ -208,7 +200,7 @@ class GitAgentService:
                 entity_type="repository",
                 guidance=guidance,
             )
-            self.repository_agent.prepare_modify(context)
+            self.repository_agent.prepare(context, operation)
             self.loop.start(context, self.repository_agent)
             return self._after_loop(context)
         context = self.harness.context(

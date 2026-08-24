@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from copy import deepcopy
 from typing import Any
 
 from ..core.errors import ResourceNotFoundError, ToolExecutionError, ValidationError
@@ -22,6 +23,10 @@ from .memory import InMemoryMCPServer
 _READ_RETRIES = 2
 _RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
 _RETRY_BACKOFF_SECONDS = 0.25
+_SEARCH_CACHE_SECONDS = 60.0
+_FALLBACK_FILE_LIMIT = 500
+_FALLBACK_BYTE_LIMIT = 20_000_000
+_FALLBACK_FILE_BYTE_LIMIT = 512_000
 
 
 class GitHubMCPServer(InMemoryMCPServer):
@@ -42,6 +47,8 @@ class GitHubMCPServer(InMemoryMCPServer):
         self.api_url = api_url.rstrip("/")
         self.timeout = timeout
         self._default_branches: dict[str, str] = {}
+        self._search_cache: dict[tuple[str, str, str, str, int], tuple[float, dict[str, Any]]] = {}
+        self._text_cache: dict[tuple[str, str, str], str] = {}
         super().__init__({})
 
     # Account namespace ----------------------------------------------------
@@ -132,6 +139,7 @@ class GitHubMCPServer(InMemoryMCPServer):
             f"/repos/{repository}/git/trees/{urllib.parse.quote(actual_ref, safe='')}?recursive=1",
         )
         paths: list[str] = []
+        omitted_by_depth = 0
         for item in value.get("tree", []):
             file_path = str(item.get("path", ""))
             if item.get("type") != "blob" or (prefix and not file_path.startswith(prefix)):
@@ -139,13 +147,19 @@ class GitHubMCPServer(InMemoryMCPServer):
             relative = file_path[len(prefix) :]
             if len(relative.split("/")) <= depth:
                 paths.append(file_path)
+            else:
+                omitted_by_depth += 1
             if len(paths) >= max_entries:
                 break
         return {
             "repository": repository,
             "path": path,
             "entries": paths,
-            "truncated": bool(value.get("truncated")) or len(paths) >= max_entries,
+            "truncated": bool(value.get("truncated")) or len(paths) >= max_entries or omitted_by_depth > 0,
+            "depth": depth,
+            "omitted_by_depth": omitted_by_depth,
+            "ref": actual_ref,
+            "tree_sha": str(value.get("sha") or ""),
         }
 
     def search_code(
@@ -156,12 +170,47 @@ class GitHubMCPServer(InMemoryMCPServer):
         max_results: int = 20,
     ) -> dict[str, Any]:
         repository = self._repository(repository)
-        if not query.strip():
+        query = query.strip()
+        if not query:
             raise ValidationError("search query cannot be empty")
         max_results = max(1, min(max_results, 30))
-        qualifier = f"{query} repo:{repository}" + (f" path:{safe_repository_path(path)}" if path else "")
+        safe_path = safe_repository_path(path) if path else ""
+        head_sha = self._default_head_sha(repository)
+        cache_key = (repository, head_sha, query.casefold(), safe_path, max_results)
+        cached = self._search_cache.get(cache_key)
+        if cached is not None and time.monotonic() - cached[0] <= _SEARCH_CACHE_SECONDS:
+            return deepcopy(cached[1])
+
+        qualifier = f"{query} repo:{repository}" + (f" path:{safe_path}" if safe_path else "")
         encoded = urllib.parse.urlencode({"q": qualifier, "per_page": max_results})
-        value = self._request("GET", f"/search/code?{encoded}")
+        try:
+            value = self._request("GET", f"/search/code?{encoded}")
+        except ResourceNotFoundError:
+            raise
+        except ToolExecutionError as exc:
+            result = self._scan_default_branch(
+                repository,
+                head_sha,
+                query,
+                path=safe_path,
+                max_results=max_results,
+                native_error=exc.user_message,
+            )
+            self._search_cache[cache_key] = (time.monotonic(), deepcopy(result))
+            return result
+
+        if bool(value.get("incomplete_results")):
+            result = self._scan_default_branch(
+                repository,
+                head_sha,
+                query,
+                path=safe_path,
+                max_results=max_results,
+                native_incomplete=True,
+            )
+            self._search_cache[cache_key] = (time.monotonic(), deepcopy(result))
+            return result
+
         items = list(value.get("items", []))[:max_results]
         results: list[dict[str, Any]] = []
         fetch_errors: list[dict[str, str]] = []
@@ -169,23 +218,14 @@ class GitHubMCPServer(InMemoryMCPServer):
         for item in items:
             file_path = str(item.get("path", ""))
             try:
-                fetched = self.read_file(repository, file_path, limit=400)
+                content = self._read_text(repository, file_path, head_sha)
             except ToolExecutionError as exc:
                 fetch_errors.append({"path": file_path, "error": str(exc)[:500]})
                 continue
             files_checked += 1
-            for line_number, line in enumerate(str(fetched["content"]).splitlines(), 1):
-                if query.casefold() in line.casefold():
-                    results.append({"path": file_path, "line": line_number, "snippet": line[:500]})
-                    if len(results) >= max_results:
-                        return {
-                            "query": query,
-                            "results": results,
-                            "truncated": True,
-                            "candidates": len(items),
-                            "files_checked": files_checked,
-                            "fetch_errors": fetch_errors,
-                        }
+            results.extend(self._literal_matches(file_path, content, query, limit=min(2, max_results - len(results))))
+            if len(results) >= max_results:
+                break
         if items and files_checked == 0:
             details = "; ".join(
                 f"{item['path'] or '<unknown>'}: {item['error']}" for item in fetch_errors[:3]
@@ -194,14 +234,153 @@ class GitHubMCPServer(InMemoryMCPServer):
                 f"GitHub code search returned {len(items)} candidate file(s), but none could be read"
                 + (f": {details}" if details else "")
             )
-        return {
+        total_count = int(value.get("total_count") or 0)
+        truncated = total_count > len(items) or len(results) >= max_results
+        result = {
             "query": query,
             "results": results,
-            "truncated": len(value.get("items", [])) >= max_results,
+            "truncated": truncated,
+            "complete": not truncated and not fetch_errors,
+            "total_count": total_count,
             "candidates": len(items),
             "files_checked": files_checked,
             "fetch_errors": fetch_errors,
+            "backend": "github_code_search",
+            "ref": head_sha,
+            "native_incomplete": False,
         }
+        self._search_cache[cache_key] = (time.monotonic(), deepcopy(result))
+        return result
+
+    def _scan_default_branch(
+        self,
+        repository: str,
+        head_sha: str,
+        query: str,
+        *,
+        path: str,
+        max_results: int,
+        native_incomplete: bool = False,
+        native_error: str = "",
+    ) -> dict[str, Any]:
+        value = self._request(
+            "GET",
+            f"/repos/{repository}/git/trees/{urllib.parse.quote(head_sha, safe='')}?recursive=1",
+        )
+        prefix = "" if not path else path.rstrip("/") + "/"
+        results: list[dict[str, Any]] = []
+        fetch_errors: list[dict[str, str]] = []
+        files_considered = 0
+        files_scanned = 0
+        bytes_scanned = 0
+        skipped_binary = 0
+        skipped_large = 0
+        budget_exhausted = False
+        result_limit_reached = False
+        for item in value.get("tree", []):
+            file_path = str(item.get("path") or "")
+            if item.get("type") != "blob" or (prefix and not file_path.startswith(prefix)):
+                continue
+            if files_considered >= _FALLBACK_FILE_LIMIT:
+                budget_exhausted = True
+                break
+            files_considered += 1
+            size = item.get("size")
+            if isinstance(size, int) and size > _FALLBACK_FILE_BYTE_LIMIT:
+                skipped_large += 1
+                continue
+            if isinstance(size, int) and bytes_scanned + size > _FALLBACK_BYTE_LIMIT:
+                budget_exhausted = True
+                break
+            try:
+                content = self._read_text(repository, file_path, head_sha)
+            except ToolExecutionError as exc:
+                if "not UTF-8 text" in str(exc):
+                    skipped_binary += 1
+                else:
+                    fetch_errors.append({"path": file_path, "error": str(exc)[:500]})
+                continue
+            files_scanned += 1
+            bytes_scanned += len(content.encode("utf-8"))
+            results.extend(self._literal_matches(file_path, content, query, limit=min(2, max_results - len(results))))
+            if len(results) >= max_results:
+                result_limit_reached = True
+                break
+        truncated = (
+            bool(value.get("truncated"))
+            or budget_exhausted
+            or result_limit_reached
+            or bool(fetch_errors)
+            or skipped_large > 0
+        )
+        result = {
+            "query": query,
+            "results": results,
+            "truncated": truncated,
+            "complete": not truncated,
+            "total_count": len(results),
+            "candidates": files_scanned,
+            "files_checked": files_scanned,
+            "fetch_errors": fetch_errors,
+            "backend": "github_tree_scan",
+            "ref": head_sha,
+            "native_incomplete": native_incomplete,
+            "fallback": {
+                "files_scanned": files_scanned,
+                "files_considered": files_considered,
+                "bytes_scanned": bytes_scanned,
+                "skipped_binary": skipped_binary,
+                "skipped_large": skipped_large,
+                "budget_exhausted": budget_exhausted,
+            },
+        }
+        if native_error:
+            result["native_error"] = native_error[:500]
+        return result
+
+    @staticmethod
+    def _literal_matches(path: str, content: str, query: str, *, limit: int) -> list[dict[str, Any]]:
+        if limit < 1:
+            return []
+        needle = query.casefold()
+        results = []
+        for line_number, line in enumerate(content.splitlines(), 1):
+            if needle not in line.casefold():
+                continue
+            results.append({"path": path, "line": line_number, "snippet": line[:500]})
+            if len(results) >= limit:
+                break
+        return results
+
+    def _read_text(self, repository: str, path: str, ref: str) -> str:
+        safe = safe_repository_path(path)
+        cache_key = (repository, ref, safe)
+        cacheable = bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", ref))
+        if cacheable and cache_key in self._text_cache:
+            return self._text_cache[cache_key]
+        encoded_path = urllib.parse.quote(safe, safe="/")
+        query = urllib.parse.urlencode({"ref": ref})
+        value = self._request("GET", f"/repos/{repository}/contents/{encoded_path}?{query}")
+        if value.get("type") != "file" or value.get("encoding") != "base64":
+            raise ToolExecutionError(f"GitHub did not return base64 file content for {safe}")
+        try:
+            content = base64.b64decode(str(value.get("content", "")), validate=False).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ToolExecutionError(f"file is not UTF-8 text: {safe}") from exc
+        if cacheable:
+            self._text_cache[cache_key] = content
+        return content
+
+    def _default_head_sha(self, repository: str) -> str:
+        branch = self._default_branch(repository)
+        value = self._request(
+            "GET",
+            f"/repos/{repository}/commits/{urllib.parse.quote(branch, safe='')}",
+        )
+        sha = str(value.get("sha") or "")
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
+            raise ToolExecutionError(f"GitHub returned no commit SHA for {repository}:{branch}")
+        return sha
 
     def read_file(
         self,
@@ -214,15 +393,7 @@ class GitHubMCPServer(InMemoryMCPServer):
         repository = self._repository(repository)
         safe = safe_repository_path(path)
         actual_ref = ref or self._default_branch(repository)
-        encoded_path = urllib.parse.quote(safe, safe="/")
-        query = urllib.parse.urlencode({"ref": actual_ref})
-        value = self._request("GET", f"/repos/{repository}/contents/{encoded_path}?{query}")
-        if value.get("type") != "file" or value.get("encoding") != "base64":
-            raise ToolExecutionError(f"GitHub did not return base64 file content for {safe}")
-        try:
-            content = base64.b64decode(str(value.get("content", "")), validate=False).decode("utf-8")
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise ToolExecutionError(f"file is not UTF-8 text: {safe}") from exc
+        content = self._read_text(repository, safe, actual_ref)
         return {"path": safe, **select_file_lines(content, start_line=start_line, limit=limit)}
 
     def read_files(
@@ -252,14 +423,32 @@ class GitHubMCPServer(InMemoryMCPServer):
     def find_symbol(self, repository: str, symbol: str, max_results: int = 20) -> dict[str, Any]:
         if not re.fullmatch(r"[A-Za-z_$][\w$.:<>-]*", symbol):
             raise ValidationError("symbol must be an identifier-like value")
+        repository = self._repository(repository)
         search = self.search_code(repository, symbol, max_results=max_results)
         pattern = re.compile(
-            rf"^\s*(?:async\s+def|def|class|function|interface|type|const|let|var)\s+{re.escape(symbol)}\b"
+            rf"^\s*(?:(?:async\s+)?def|class|function|interface|type|const|let|var|"
+            rf"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn|func)\s+{re.escape(symbol)}\b"
         )
+        results: list[dict[str, Any]] = []
+        for path in dict.fromkeys(str(item.get("path") or "") for item in search["results"]):
+            if not path:
+                continue
+            content = self._read_text(repository, path, str(search["ref"]))
+            for line_number, line in enumerate(content.splitlines(), 1):
+                if not pattern.search(line):
+                    continue
+                results.append({"path": path, "line": line_number, "snippet": line[:500]})
+                if len(results) >= min(max_results, 30):
+                    break
+            if len(results) >= min(max_results, 30):
+                break
         return {
             "symbol": symbol,
-            "results": [item for item in search["results"] if pattern.search(item["snippet"])],
+            "results": results,
             "truncated": search["truncated"],
+            "complete": search["complete"],
+            "backend": search["backend"],
+            "ref": search["ref"],
         }
 
     def find_references(self, repository: str, symbol: str, max_results: int = 50) -> dict[str, Any]:
