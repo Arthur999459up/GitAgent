@@ -10,8 +10,7 @@ from typing import Any
 class Route(str, Enum):
     ISSUE = "ISSUE"
     PULL_REQUEST = "PULL_REQUEST"
-    REPO_QA = "REPO_QA"
-    CODE_CHANGE = "CODE_CHANGE"
+    REPOSITORY = "REPOSITORY"
 
 
 class ApprovalIntent(str, Enum):
@@ -225,14 +224,6 @@ class MutationRejectedResult:
 
 
 @dataclass
-class RepoQAResult:
-    answer: str
-    files: list[str]
-    symbols: list[str]
-    reasoning: str
-
-
-@dataclass
 class CodeExplanationResult:
     behavior_changes: list[str]
     key_symbols: list[str]
@@ -263,6 +254,32 @@ class CodePlanResult:
 class DomainAction(str, Enum):
     ANSWER = "ANSWER"
     CLARIFY = "CLARIFY"
+
+
+class RepositoryOperation(str, Enum):
+    EXPLORE = "EXPLORE"
+    SEARCH = "SEARCH"
+    EXPLAIN = "EXPLAIN"
+    IMPACT_ANALYZE = "IMPACT_ANALYZE"
+    PLAN = "PLAN"
+    HISTORY = "HISTORY"
+    MODIFY = "MODIFY"
+
+
+@dataclass
+class RepositoryResult:
+    action: DomainAction
+    operation: RepositoryOperation
+    answer: str
+    files: list[str] = field(default_factory=list)
+    symbols: list[str] = field(default_factory=list)
+    reasoning: str = ""
+    history: list[dict[str, Any]] = field(default_factory=list)
+    interpretation: CodeExplanationResult | None = None
+    plan: CodePlanResult | None = None
+    candidate: CandidatePatch | None = None
+    verification: VerificationReport | None = None
+    question: str = ""
 
 
 class IssueOperation(str, Enum):

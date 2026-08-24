@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -18,8 +17,10 @@ def _canonical(arguments: dict[str, Any]) -> str:
     return json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _fingerprint(tool: str, arguments: dict[str, Any]) -> str:
-    return hashlib.sha256(f"{tool}\0{_canonical(arguments)}".encode()).hexdigest()
+def _exact_call(tool: str, arguments: dict[str, Any]) -> str:
+    """Keep an exact canonical tool-and-arguments snapshot for direct comparison."""
+
+    return _canonical({"tool": tool, "arguments": arguments})
 
 
 @dataclass
@@ -29,8 +30,6 @@ class ApprovalRequest:
     repository: str
     summary: str
     calls: list[PlannedToolCall]
-    proposal_revision: int
-    proposal_hash: str
     created_at: str
     decision: str | None = None
     decided_at: str | None = None
@@ -53,8 +52,6 @@ class ApprovalStore:
         repository: str,
         summary: str,
         calls: list[PlannedToolCall],
-        proposal_revision: int,
-        proposal_content: str,
     ) -> ApprovalRequest:
         if not calls:
             raise ValidationError("an approval request must describe at least one mutation")
@@ -64,10 +61,8 @@ class ApprovalStore:
             repository=repository,
             summary=summary,
             calls=calls,
-            proposal_revision=proposal_revision,
-            proposal_hash=self._proposal_hash(proposal_revision, proposal_content, calls),
             created_at=datetime.now(timezone.utc).isoformat(),
-            _remaining=[_fingerprint(call.tool, call.arguments) for call in calls],
+            _remaining=[_exact_call(call.tool, call.arguments) for call in calls],
         )
         with self._lock:
             self._requests[request.approval_id] = request
@@ -122,7 +117,7 @@ class ApprovalStore:
                 raise ApprovalRequired("approval belongs to a different Session")
             if request.decision != "Approve":
                 raise ApprovalRequired("only an explicit Approve decision authorizes mutation")
-            actual = _fingerprint(tool, arguments)
+            actual = _exact_call(tool, arguments)
             if not request._remaining or request._remaining[0] != actual:
                 raise ApprovalRequired("approval scope or mutation order does not match the actual operation")
             request._remaining.pop(0)
@@ -141,12 +136,3 @@ class ApprovalStore:
             return self._requests[approval_id]
         except KeyError as exc:
             raise ApprovalRequired("unknown approval") from exc
-
-    @staticmethod
-    def _proposal_hash(revision: int, content: str, calls: list[PlannedToolCall]) -> str:
-        payload = {
-            "revision": revision,
-            "content": content,
-            "calls": [{"tool": call.tool, "arguments": call.arguments} for call in calls],
-        }
-        return hashlib.sha256(_canonical(payload).encode()).hexdigest()

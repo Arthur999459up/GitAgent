@@ -22,7 +22,7 @@ from ..core.models import (
     IssueAgentResult,
     MutationRejectedResult,
     PullRequestAgentResult,
-    RepoQAResult,
+    RepositoryResult,
     VerificationReport,
     to_plain,
 )
@@ -507,13 +507,16 @@ def _render_output(application: LiveApplication, output: Any) -> None:
         title = f"PR #{output.pr_number}" if output.pr_number else f"Pull Requests · {len(output.pull_requests)}"
         ui.markdown(content, title=title, kind="agent")
         return
-    if isinstance(output, RepoQAResult):
+    if isinstance(output, RepositoryResult):
+        if output.action == DomainAction.CLARIFY:
+            ui.text(output.question or output.answer, title="需要补充信息 · Repository", kind="router")
+            return
         content = output.answer
         if output.files:
             content += "\n\n---\n**相关文件：** " + ", ".join(f"`{path}`" for path in output.files)
         if output.symbols:
             content += "\n\n**相关符号：** " + ", ".join(f"`{symbol}`" for symbol in output.symbols)
-        ui.markdown(content, title="Repository", kind="agent")
+        ui.markdown(content, title=f"Repository · {output.operation.value}", kind="agent")
         return
     raise ValidationError(f"不支持渲染结果类型：{type(output).__name__}")
 

@@ -96,8 +96,6 @@ class AgentLoop:
             repository=context.repository,
             summary=summary,
             calls=calls,
-            proposal_revision=1,
-            proposal_content=summary,
         )
         context.pending = PendingAction(approval.approval_id, summary, calls)
 
@@ -212,8 +210,6 @@ class AgentLoop:
                 repository=context.repository,
                 summary=action.summary or f"执行 {action.tool}",
                 calls=[call],
-                proposal_revision=1,
-                proposal_content=action.summary or f"执行 {action.tool}",
             )
             context.pending = PendingAction(approval.approval_id, approval.summary, [call])
             self._emit(context, TraceStatus.WAITING, message=approval.summary)
@@ -243,8 +239,6 @@ class AgentLoop:
             repository=context.repository,
             summary=summary,
             calls=calls,
-            proposal_revision=1,
-            proposal_content=action.summary or review.change_summary,
         )
         context.pending = PendingAction(approval.approval_id, approval.summary, calls)
         self._emit(context, TraceStatus.WAITING, message=approval.summary)

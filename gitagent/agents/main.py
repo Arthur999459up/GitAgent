@@ -10,7 +10,7 @@ from ..core.models import AgentSpec, MainDecision, Route, RoutingContext, to_pla
 from ..reasoning import Reasoner, structured_request_payload
 from ..runtime import AgentContext, AgentHarness
 
-_DOMAIN_AGENTS = {"issues", "pull_requests", "repo_qa", "code_change"}
+_DOMAIN_AGENTS = {"issues", "pull_requests", "repository"}
 _MAIN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -28,8 +28,10 @@ _MAIN_SCHEMA = {
 _MAIN_SYSTEM = """You are GitAgent's Main Agent. One Session is one continuous Main Agent context.
 Understand the user's current request from the Session summary, recent history, working state, and explicit memories.
 Do not invent or manage tasks, runs, workflow lifecycles, approvals, or tool calls.
-If repository work is needed, choose exactly one target_agent: issues, pull_requests, repo_qa, or code_change.
+If repository work is needed, choose exactly one target_agent: issues, pull_requests, or repository.
 Route every Pull Request request—including Review, CI, PR-scoped code work, approval, readiness, and merge—to pull_requests.
+Route direct repository exploration, search, explanation, impact analysis, planning, history, and arbitrary repository modification to repository.
+Route Issue-scoped code fixes to issues rather than repository.
 If no child agent is needed, return an empty target_agent and answer directly in message.
 Set clarify=true only when a safe interpretation is impossible; otherwise clarify=false.
 When the user refers to a concrete Issue, Pull Request, or workflow run, return its entity_type and entity_id from the request/context.
@@ -132,10 +134,6 @@ class MainAgent:
             raise ValidationError("Main Agent selected an unknown domain agent")
         entity_type = str(raw.get("entity_type") or "").strip() or None
         entity_id = str(raw.get("entity_id") or "").strip() or None
-        if target == "code_change" and entity_type == "issue" and entity_id:
-            target = "issues"
-        if target == "code_change" and entity_type in {"pull_request", "workflow_run"}:
-            target = "pull_requests"
         message = str(raw.get("message") or "").strip()
         request = str(raw.get("request") or text).strip() or text
         clarify = bool(raw.get("clarify", False))
@@ -167,8 +165,7 @@ class MainAgent:
         names = {
             Route.ISSUE: "issues",
             Route.PULL_REQUEST: "pull_requests",
-            Route.REPO_QA: "repo_qa",
-            Route.CODE_CHANGE: "code_change",
+            Route.REPOSITORY: "repository",
         }
         catalog: list[dict[str, Any]] = []
         for route, target in names.items():

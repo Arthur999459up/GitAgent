@@ -6,14 +6,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from ..agents import (
-    CodeChangeController,
-    CodingAgent,
-    IssueAgent,
-    MainAgent,
-    PullRequestAgent,
-    RepoQAAgent,
-)
+from ..agents import CodingAgent, IssueAgent, MainAgent, PullRequestAgent, RepositoryAgent
+from ..agents.code_change_controller import CodeChangeController
 from ..core.errors import RoutingError
 from ..core.models import (
     AgentGuidance,
@@ -26,6 +20,7 @@ from ..core.models import (
     PlannedToolCall,
     PullRequestOperation,
     Replacement,
+    RepositoryOperation,
     RepositoryRef,
     ResolvedReference,
     RoutingContext,
@@ -70,12 +65,17 @@ class GitAgentService:
     ) -> None:
         self.harness = AgentHarness(server, trace=trace, input_budget_tokens=input_budget_tokens)
         register_github_mutator(self.harness)
-        self.repo_qa = RepoQAAgent(self.harness, agent_reasoner)
         self.coding = CodingAgent(self.harness, agent_reasoner)
         self.verifier = StaticVerifier(self.harness)
+        self.code_change_controller = CodeChangeController(self.coding, self.verifier)
+        self.repository_agent = RepositoryAgent(
+            self.harness,
+            self.coding,
+            self.code_change_controller,
+            agent_reasoner,
+        )
         self.pull_request_agent = PullRequestAgent(self.harness, self.coding, self.verifier, agent_reasoner)
         self.issue_agent = IssueAgent(self.harness, self.coding, self.verifier, agent_reasoner)
-        self.code_change_controller = CodeChangeController(self.coding, self.verifier)
         self.loop = AgentLoop(self.harness)
         self.main_agent = MainAgent(self.harness, main_reasoner)
         self.classifier = ApprovalIntentClassifier(main_reasoner)
@@ -190,13 +190,27 @@ class GitAgentService:
         scope = self._scope()
         goal = decision.request.strip()
         guidance = self._guidance(decision.entity_type, decision.entity_id, routing_context)
-        if decision.target_agent == "repo_qa":
-            return self.repo_qa.answer(
-                repository,
-                goal,
-                session_id=scope.session_id,
+        if decision.target_agent == "repository":
+            operation = self.repository_agent.operation_for(goal)
+            if operation != RepositoryOperation.MODIFY:
+                return self.repository_agent.answer(
+                    repository,
+                    goal,
+                    session_id=scope.session_id,
+                    operation=operation,
+                    guidance=guidance,
+                )
+            context = self.harness.context(
+                "repository",
+                scope.session_id,
+                repository=repository,
+                goal=goal,
+                entity_type="repository",
                 guidance=guidance,
             )
+            self.repository_agent.prepare_modify(context)
+            self.loop.start(context, self.repository_agent)
+            return self._after_loop(context)
         context = self.harness.context(
             decision.target_agent,
             scope.session_id,
@@ -206,19 +220,6 @@ class GitAgentService:
             entity_id=decision.entity_id,
             guidance=guidance,
         )
-        if decision.target_agent == "code_change":
-            issue_number = (
-                int(decision.entity_id)
-                if decision.entity_type == "issue" and decision.entity_id and decision.entity_id.isdigit()
-                else None
-            )
-            context.change_request = ChangeRequest(
-                repository=repository,
-                description=goal,
-                issue_number=issue_number,
-            )
-            self.loop.start(context, self.code_change_controller)
-            return self._after_loop(context)
         if decision.target_agent == "issues":
             if decision.requested_reply and context.entity_id:
                 context.read_only = True
@@ -330,21 +331,21 @@ class GitAgentService:
                 "已拒绝本次发布提案；草稿保留，可继续修改。",
             )
 
-        if context.agent == "code_change" and decision.action == ApprovalIntent.REVISE:
+        if context.agent == "repository" and decision.action == ApprovalIntent.REVISE:
             self.harness.approvals.decide(context.pending.approval_id, "Reject")
             request = context.change_request
             if request is None:
-                raise RoutingError("code-change revision has no change request")
+                raise RoutingError("repository modification revision has no change request")
             instruction = decision.instruction.strip() or user_input.strip()
             revised = self.harness.context(
-                "code_change",
+                "repository",
                 context.session_id,
                 repository=context.repository,
                 goal=f"{request.description}\n\nUser revision: {instruction}",
-                entity_type=context.entity_type,
-                entity_id=context.entity_id,
+                entity_type="repository",
                 guidance=context.guidance,
             )
+            revised.operation = RepositoryOperation.MODIFY.value
             revised.change_request = ChangeRequest(
                 repository=request.repository,
                 description=f"{request.description}\n\nUser revision: {instruction}",
@@ -356,7 +357,7 @@ class GitAgentService:
                 suggested_title=request.suggested_title,
                 source_ref=request.source_ref,
             )
-            self.loop.start(revised, self.code_change_controller)
+            self.loop.start(revised, self.repository_agent)
             return self._after_loop(revised)
 
         if context.agent == "pull_requests" and decision.action == ApprovalIntent.REVISE:
@@ -513,7 +514,7 @@ class GitAgentService:
 
     def _restore_context(self, raw: dict[str, Any], *, repository: str) -> AgentContext:
         agent = str(raw.get("agent") or "")
-        if agent not in {"issues", "pull_requests", "code_change"}:
+        if agent not in {"issues", "pull_requests", "repository"}:
             raise RoutingError("stored Session agent context is invalid")
         stored_repository = str(raw.get("repository") or "")
         if stored_repository != repository:
@@ -664,7 +665,7 @@ class GitAgentService:
         agents = {
             "issues": self.issue_agent,
             "pull_requests": self.pull_request_agent,
-            "code_change": self.code_change_controller,
+            "repository": self.repository_agent,
         }
         try:
             return agents[name]

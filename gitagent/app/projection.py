@@ -14,7 +14,7 @@ from ..core.models import (
     IssueAgentResult,
     MutationRejectedResult,
     PullRequestAgentResult,
-    RepoQAResult,
+    RepositoryResult,
 )
 from ..runtime import AgentContext
 from .service import ServiceResult
@@ -113,9 +113,10 @@ def project_output(
         return _bounded(text, 8 * 1024, text_sanitizer), [], None
     if isinstance(output, AgentContext):
         return _project_context(output, turn_seq=turn_seq, text_sanitizer=text_sanitizer)
-    if isinstance(output, RepoQAResult):
+    if isinstance(output, RepositoryResult):
+        text = output.question if output.action == DomainAction.CLARIFY and output.question else output.answer
         files = ", ".join(output.files[:20])
-        text = output.answer + (f"\n相关文件：{files}" if files else "")
+        text += f"\n相关文件：{files}" if files else ""
         return _bounded(text, 8 * 1024, text_sanitizer), [], None
     if isinstance(output, IssueAgentResult):
         if output.action == DomainAction.CLARIFY:

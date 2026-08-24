@@ -1,17 +1,15 @@
 """Specialized maintenance agents."""
 
-from .code_change_controller import CodeChangeController
 from .coding import CodingAgent
 from .issues import IssueAgent
 from .main import MainAgent
 from .pull_requests import PullRequestAgent
-from .repo_qa import RepoQAAgent
+from .repository import RepositoryAgent
 
 __all__ = [
-    "CodeChangeController",
     "CodingAgent",
     "IssueAgent",
     "MainAgent",
     "PullRequestAgent",
-    "RepoQAAgent",
+    "RepositoryAgent",
 ]

@@ -49,9 +49,8 @@ _AGENT_NAMES = {
     "main": "Main Agent",
     "issues": "Issues",
     "pull_requests": "Pull Requests",
-    "repo_qa": "Repository QA",
+    "repository": "Repository",
     "coding": "Coding",
-    "code_change": "Code Change",
     "github_mutator": "GitHub Mutator",
     "static_verifier": "Static Verifier",
 }

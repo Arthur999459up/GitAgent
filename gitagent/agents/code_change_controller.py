@@ -1,34 +1,25 @@
-"""Scripted controller for direct code-change routes and approved patch application."""
+"""Internal repository workflow controller for verified code changes."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from ..core.errors import WorkflowError
-from ..core.models import AgentSpec
 from ..runtime import AgentAction, AgentActionKind, AgentContext, rejection_feedback
 from ..verification import StaticVerifier
 from .coding import CodingAgent, prepare_verified_candidate
 
-CODE_CHANGE_SPEC = AgentSpec(
-    name="code_change",
-    role="Coordinate candidate generation, static verification, and approved Draft PR application.",
-    system_prompt="Coordinate an already-routed code change without independently selecting tools.",
-    allowed_tools=frozenset(),
-    output_schema=(),
-    capabilities=frozenset(),
-)
-
 
 class CodeChangeController:
+    """Drive the RepositoryAgent MODIFY path without owning a Session context."""
+
     def __init__(self, coding: CodingAgent, verifier: StaticVerifier) -> None:
         self.coding = coding
         self.verifier = verifier
-        coding.harness.register(CODE_CHANGE_SPEC)
 
     def decide(self, context: AgentContext) -> AgentAction:
         if context.change_request is None:
-            raise WorkflowError("code_change requires a change request")
+            raise WorkflowError("repository modification requires a change request")
         draft = self._last_tool(context, "github.create_draft_pr")
         if draft is not None:
             return AgentAction(
@@ -72,7 +63,7 @@ class CodeChangeController:
 
     def build_result(self, context: AgentContext) -> dict[str, Any]:
         if context.change_request is None:
-            raise WorkflowError("code_change requires a change request")
+            raise WorkflowError("repository modification requires a change request")
         draft = self._last_tool(context, "github.create_draft_pr")
         return {
             "draft_pr": {"number": draft.get("number")} if draft else None,

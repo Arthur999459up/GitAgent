@@ -16,7 +16,6 @@ from ..core.models import (
     CodePlanResult,
     CodeReviewResult,
     Recommendation,
-    Route,
     VerificationReport,
 )
 from ..prompts import get_prompt_library
@@ -110,7 +109,7 @@ CODING_SPEC = AgentSpec(
         }
     ),
     output_schema=(),
-    capabilities=frozenset({Route.CODE_CHANGE}),
+    capabilities=frozenset({"coding"}),
     required_context=("repository",),
     routing_examples=(
         "修复登录接口的空指针问题",
