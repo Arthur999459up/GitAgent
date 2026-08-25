@@ -549,7 +549,7 @@ def _render_proposal(application: LiveApplication, context: AgentContext) -> Non
             title=f"Issue #{issue_number} 修改报告 · 待发布",
             kind="agent",
         )
-    elif any(call.tool == "github.create_draft_pr" for call in calls):
+    elif any(call.tool in {"github.create_draft_pr", "github.commit_to_default_branch"} for call in calls):
         _render_code_change_proposal(application, context)
     else:
         details = []
@@ -574,9 +574,21 @@ def _render_code_change_proposal(application: LiveApplication, context: AgentCon
     content = (
         f"{candidate.summary}\n\n"
         f"**根因：** {candidate.root_cause}\n\n"
-        f"**变更文件：** {files}\n\n"
+        f"**新增文件：** {', '.join(f'`{path}`' for path in candidate.added_files) or '无'}\n\n"
+        f"**修改文件：** {', '.join(f'`{path}`' for path in candidate.modified_files) or '无'}\n\n"
+        f"**删除文件：** {', '.join(f'`{path}`' for path in candidate.deleted_files) or '无'}\n\n"
+        f"**全部变更：** {files}\n\n"
         f"### Diff\n```diff\n{candidate.patch}\n```"
     )
+    direct_call = next(
+        (call for call in context.pending.calls if call.tool == "github.commit_to_default_branch"),
+        None,
+    )
+    if direct_call is not None:
+        content += (
+            f"\n\n### 目标\n直接提交到默认分支 `{context.change_request.base_branch if context.change_request else ''}`"
+            f"\n\n### Commit message\n{direct_call.arguments.get('message', '')}"
+        )
     pr_call = next(
         (call for call in context.pending.calls if call.tool == "github.create_draft_pr"),
         None,

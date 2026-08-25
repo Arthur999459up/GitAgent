@@ -177,6 +177,7 @@ class ChangeRequest:
     target_files: list[str] = field(default_factory=list)
     replacements: list[Replacement] = field(default_factory=list)
     proposed_files: dict[str, str] = field(default_factory=dict)
+    deleted_files: list[str] = field(default_factory=list)
     issue_number: int | None = None
     suggested_title: str | None = None
     source_ref: str | None = None
@@ -186,12 +187,25 @@ class ChangeRequest:
 class CandidatePatch:
     summary: str
     root_cause: str
-    changed_files: list[str]
+    added_files: list[str]
+    modified_files: list[str]
+    deleted_files: list[str]
     patch: str
     files: dict[str, str]
     static_checks: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
     verification_required: list[str] = field(default_factory=list)
+
+    @property
+    def changed_files(self) -> list[str]:
+        return sorted({*self.added_files, *self.modified_files, *self.deleted_files})
+
+
+@dataclass(frozen=True)
+class CandidatePreparationResult:
+    candidate: CandidatePatch | None
+    verification: VerificationReport | None = None
+    message: str = ""
 
 
 @dataclass

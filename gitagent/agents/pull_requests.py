@@ -27,7 +27,13 @@ from ..core.reviews import canonical_review_event, effective_review_events
 from ..core.trace import TraceCategory, TraceStatus
 from ..prompts import get_prompt_library
 from ..reasoning import Reasoner
-from ..runtime import AgentAction, AgentActionKind, AgentContext, AgentHarness, rejection_feedback
+from ..runtime import (
+    AgentAction,
+    AgentActionKind,
+    AgentContext,
+    AgentHarness,
+    rejection_feedback,
+)
 from ..runtime.mutation import code_change_review_package
 from ..verification import StaticVerifier
 from .coding import CodingAgent, prepare_verified_candidate
@@ -394,7 +400,13 @@ class PullRequestAgent:
                 summary="候选改动已应用",
                 message=f"候选改动已写入 PR 分支 `{applied.get('branch', '')}`，涉及：{', '.join(applied.get('files', []))}。",
             )
-        self._ensure_candidate(context, pull_request)
+        message = self._ensure_candidate(context, pull_request)
+        if message:
+            return AgentAction(
+                AgentActionKind.FINISH,
+                summary="模型未生成文件内容",
+                message=message,
+            )
         if self._is_fork(context.repository, pull_request):
             candidate = context.code_candidate
             return AgentAction(
@@ -413,7 +425,12 @@ class PullRequestAgent:
             raise WorkflowError("Pull Request head branch is missing")
         return self._tool(
             "github.commit",
-            {"branch": branch, "files": candidate.files, "message": candidate.summary},
+            {
+                "branch": branch,
+                "files": candidate.files,
+                "deleted_files": candidate.deleted_files,
+                "message": candidate.summary,
+            },
             self._candidate_approval_summary(candidate, context.verification),
         )
 
@@ -609,9 +626,9 @@ class PullRequestAgent:
         self._record_coding(context, "plan", result)
         return result
 
-    def _ensure_candidate(self, context: AgentContext, pull_request: dict[str, Any]) -> None:
+    def _ensure_candidate(self, context: AgentContext, pull_request: dict[str, Any]) -> str:
         if context.code_candidate is not None:
-            return
+            return ""
         plan = self._ensure_plan(context)
         head = pull_request.get("head") or {}
         source_ref = str(head.get("sha") or head.get("ref") or "") if isinstance(head, dict) else str(head)
@@ -623,20 +640,27 @@ class PullRequestAgent:
             suggested_title=f"Improve PR #{self._require_pr_number(context)}",
             source_ref=source_ref or None,
         )
-        candidate, report = prepare_verified_candidate(
+        prepared = prepare_verified_candidate(
             self.coding,
             self.verifier,
             request,
             session_id=context.session_id,
             guidance=context.guidance,
         )
+        if prepared.candidate is None:
+            return prepared.message
+        candidate = prepared.candidate
+        report = prepared.verification
         context.change_request = request
         context.code_candidate = candidate
         context.verification = report
+        if report is None:
+            raise WorkflowError("candidate verification returned no report")
         package = code_change_review_package(request, candidate, report)
         self._record_domain(context, "code_review_package", to_plain(package))
         if not report.passed:
             raise WorkflowError("静态验证失败；未生成 Pull Request 写入提案")
+        return ""
 
     def _build_review_dialogue(self, context: AgentContext) -> dict[str, list[str] | str]:
         reviews = (self._last_tool(context, "github.get_pr_reviews") or {}).get("reviews", [])

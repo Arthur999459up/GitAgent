@@ -124,7 +124,7 @@ class IssueAgent:
             if rejection_feedback(context) is not None and not rejection_feedback(context):
                 return self._abandon()
             return AgentAction(
-                AgentActionKind.APPLY_CODE_CHANGE,
+                AgentActionKind.APPLY_ISSUE_FIX,
                 summary="提交 Coding Agent 生成并验证的候选补丁供你审阅",
             )
         required = self._required_entity_evidence(context)
@@ -318,14 +318,20 @@ class IssueAgent:
                 summary=str(value.get("summary") or "等待用户补充信息"),
                 question=str(value["question"]).strip(),
             )
-        if value.get("kind") == AgentActionKind.APPLY_CODE_CHANGE.value:
+        if value.get("kind") == AgentActionKind.APPLY_ISSUE_FIX.value:
             if context.code_candidate is None:
                 try:
-                    self._prepare_code_change(context)
+                    message = self._prepare_code_change(context)
                 except (LLMProviderError, ValidationError) as exc:
                     raise WorkflowError(f"code candidate preparation failed: {exc}") from exc
+                if message:
+                    return AgentAction(
+                        AgentActionKind.FINISH,
+                        summary="模型未生成文件内容",
+                        message=message,
+                    )
             return AgentAction(
-                AgentActionKind.APPLY_CODE_CHANGE,
+                AgentActionKind.APPLY_ISSUE_FIX,
                 summary=str(value.get("summary") or "提交 Coding Agent 生成并验证的候选补丁供你审阅"),
             )
         action = parse_action(value, requires_candidate=False)
@@ -448,19 +454,23 @@ class IssueAgent:
             suggested_title=raw.get("suggested_title"),
         )
 
-    def _prepare_code_change(self, context: AgentContext) -> None:
+    def _prepare_code_change(self, context: AgentContext) -> str:
         issue = self._last_tool(context, "github.get_issue")
         if issue is None:
             raise WorkflowError("code repair requires Issue evidence")
         request = self._change_request(context, issue)
-        candidate, report = prepare_verified_candidate(
+        prepared = prepare_verified_candidate(
             self.coding,
             self.verifier,
             request,
             session_id=context.session_id,
             guidance=context.guidance,
         )
-        if not report.passed:
+        if prepared.candidate is None:
+            return prepared.message
+        candidate = prepared.candidate
+        report = prepared.verification
+        if report is None or not report.passed:
             raise WorkflowError("静态验证失败；拒绝生成 GitHub 变更提案")
         context.change_request = request
         context.code_candidate = candidate
@@ -476,6 +486,7 @@ class IssueAgent:
                 },
             }
         )
+        return ""
 
     def _draft_reply(self, context: AgentContext, reasoner: Reasoner) -> str:
         return reasoner.complete_text(

@@ -52,6 +52,22 @@ class InMemoryMCPServer(MCPServer):
         self.register(
             tool_spec("repository.get_repo_tree", read, "List a bounded remote repository tree.", self.get_repo_tree)
         )
+        self.register(
+            tool_spec(
+                "repository.get_default_branch",
+                read,
+                "Fetch the repository default branch and its current commit SHA.",
+                self.get_default_branch,
+            )
+        )
+        self.register(
+            tool_spec(
+                "repository.get_file_status",
+                read,
+                "Check which targeted repository file paths exist at a ref.",
+                self.get_file_status,
+            )
+        )
         self.register(tool_spec("repository.search_code", read, "Search remote file content.", self.search_code))
         self.register(tool_spec("repository.read_file", read, "Read a bounded line range from one file.", self.read_file))
         self.register(
@@ -123,7 +139,22 @@ class InMemoryMCPServer(MCPServer):
         )
         self.register(tool_spec("github.update_pr", write, "Update pull-request state.", self.update_pr))
         self.register(tool_spec("github.create_branch", write, "Create a branch.", self.create_branch))
-        self.register(tool_spec("github.commit", write, "Commit exact proposed file contents.", self.commit))
+        self.register(
+            tool_spec(
+                "github.commit",
+                destructive,
+                "Commit exact file additions, modifications, and deletions.",
+                self.commit,
+            )
+        )
+        self.register(
+            tool_spec(
+                "github.commit_to_default_branch",
+                destructive,
+                "Atomically add, modify, and delete files in one commit on the default branch.",
+                self.commit_to_default_branch,
+            )
+        )
         self.register(tool_spec("github.push", write, "Publish a prepared branch.", self.push))
         self.register(tool_spec("github.create_draft_pr", write, "Create a draft pull request.", self.create_draft_pr))
         self.register(tool_spec("github.post_review", write, "Publish a pull-request review.", self.post_review))
@@ -142,6 +173,32 @@ class InMemoryMCPServer(MCPServer):
         )
 
     # Repository namespace -------------------------------------------------
+
+    def get_default_branch(self, repository: str) -> dict[str, Any]:
+        repo = self._repo(repository)
+        branch = str(repo.get("default_branch") or "main")
+        state = repo["branches"].setdefault(branch, {"pushed": True, "commits": []})
+        commit_sha = str(state.get("head_sha") or f"fixture-head-{len(state.get('commits', []))}")
+        state["head_sha"] = commit_sha
+        return {"repository": repository, "branch": branch, "commit_sha": commit_sha}
+
+    def get_file_status(
+        self,
+        repository: str,
+        paths: list[str],
+        ref: str | None = None,
+    ) -> dict[str, Any]:
+        del ref
+        if not paths or len(paths) > 20:
+            raise ValidationError("file status requires between 1 and 20 paths")
+        safe_paths = [safe_repository_path(path) for path in paths]
+        if len(set(safe_paths)) != len(safe_paths):
+            raise ValidationError("file status paths must be unique")
+        files = self._repo(repository)["files"]
+        return {
+            "existing_files": sorted(path for path in safe_paths if path in files),
+            "missing_files": sorted(path for path in safe_paths if path not in files),
+        }
 
     def get_repo_tree(
         self,
@@ -539,20 +596,94 @@ class InMemoryMCPServer(MCPServer):
             repo["branches"][branch] = {"base": base, "commits": [], "pushed": False}
         return {"repository": repository, "branch": branch, "base": base}
 
-    def commit(self, repository: str, branch: str, files: dict[str, str], message: str) -> dict[str, Any]:
-        if not files or not message.strip():
-            raise ValidationError("commit requires exact file contents and a message")
+    def commit(
+        self,
+        repository: str,
+        branch: str,
+        files: dict[str, str],
+        deleted_files: list[str],
+        message: str,
+    ) -> dict[str, Any]:
+        if (not files and not deleted_files) or not message.strip():
+            raise ValidationError("commit requires file changes and a message")
         safe_files = {safe_repository_path(path): content for path, content in files.items()}
+        safe_deletions = {safe_repository_path(path) for path in deleted_files}
+        if set(safe_files) & safe_deletions:
+            raise ValidationError("commit cannot write and delete the same file")
         with self._lock:
             repo = self._repo(repository)
             if branch not in repo["branches"]:
                 raise ToolExecutionError(f"branch not found: {branch}")
+            missing = safe_deletions - set(repo["files"])
+            if missing:
+                raise ToolExecutionError(f"cannot delete missing file: {min(missing)}")
             commit_id = f"commit-{len(repo['branches'][branch].setdefault('commits', [])) + 1}"
             repo["branches"][branch]["commits"].append(
-                {"id": commit_id, "message": message, "files": deepcopy(safe_files)}
+                {
+                    "id": commit_id,
+                    "message": message,
+                    "files": deepcopy(safe_files),
+                    "deleted_files": sorted(safe_deletions),
+                }
             )
             repo["files"].update(safe_files)
-        return {"commit": commit_id, "branch": branch, "files": sorted(safe_files)}
+            for path in safe_deletions:
+                del repo["files"][path]
+        return {
+            "commit": commit_id,
+            "branch": branch,
+            "files": sorted({*safe_files, *safe_deletions}),
+            "deleted_files": sorted(safe_deletions),
+        }
+
+    def commit_to_default_branch(
+        self,
+        repository: str,
+        expected_head_sha: str,
+        files: dict[str, str],
+        deleted_files: list[str],
+        message: str,
+    ) -> dict[str, Any]:
+        if (not files and not deleted_files) or not message.strip():
+            raise ValidationError("default-branch commit requires file changes and a message")
+        safe_files = {safe_repository_path(path): content for path, content in files.items()}
+        safe_deletions = {safe_repository_path(path) for path in deleted_files}
+        if set(safe_files) & safe_deletions:
+            raise ValidationError("default-branch commit cannot write and delete the same file")
+        with self._lock:
+            repo = self._repo(repository)
+            branch = str(repo.get("default_branch") or "main")
+            state = repo["branches"].setdefault(branch, {"pushed": True, "commits": []})
+            actual_head_sha = str(state.get("head_sha") or f"fixture-head-{len(state.get('commits', []))}")
+            if expected_head_sha != actual_head_sha:
+                raise ToolExecutionError("default branch changed after the candidate was prepared")
+            missing = safe_deletions - set(repo["files"])
+            if missing:
+                raise ToolExecutionError(f"cannot delete missing file: {min(missing)}")
+            added_files = sorted(set(safe_files) - set(repo["files"]))
+            modified_files = sorted(set(safe_files) & set(repo["files"]))
+            commit_id = f"commit-{len(state.setdefault('commits', [])) + 1}"
+            state["commits"].append(
+                {
+                    "id": commit_id,
+                    "message": message,
+                    "files": deepcopy(safe_files),
+                    "deleted_files": sorted(safe_deletions),
+                }
+            )
+            state["head_sha"] = commit_id
+            repo["files"].update(safe_files)
+            for path in safe_deletions:
+                del repo["files"][path]
+        return {
+            "repository": repository,
+            "branch": branch,
+            "commit": commit_id,
+            "added_files": added_files,
+            "modified_files": modified_files,
+            "deleted_files": sorted(safe_deletions),
+            "files": sorted({*safe_files, *safe_deletions}),
+        }
 
     def push(self, repository: str, branch: str) -> dict[str, Any]:
         with self._lock:

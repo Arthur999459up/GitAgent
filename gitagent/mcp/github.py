@@ -121,6 +121,43 @@ class GitHubMCPServer(InMemoryMCPServer):
 
     # Repository namespace -------------------------------------------------
 
+    def get_default_branch(self, repository: str) -> dict[str, Any]:
+        repository = self._repository(repository)
+        branch = self._default_branch(repository)
+        ref = self._request("GET", f"/repos/{repository}/git/ref/heads/{urllib.parse.quote(branch, safe='')}")
+        commit_sha = str((ref.get("object") or {}).get("sha") or "")
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", commit_sha):
+            raise ToolExecutionError(f"GitHub returned no commit SHA for {repository}:{branch}")
+        return {"repository": repository, "branch": branch, "commit_sha": commit_sha}
+
+    def get_file_status(
+        self,
+        repository: str,
+        paths: list[str],
+        ref: str | None = None,
+    ) -> dict[str, Any]:
+        repository = self._repository(repository)
+        if not paths or len(paths) > 20:
+            raise ValidationError("file status requires between 1 and 20 paths")
+        safe_paths = [safe_repository_path(path) for path in paths]
+        if len(set(safe_paths)) != len(safe_paths):
+            raise ValidationError("file status paths must be unique")
+        actual_ref = ref or self._default_branch(repository)
+        existing: list[str] = []
+        missing: list[str] = []
+        for path in safe_paths:
+            encoded_path = urllib.parse.quote(path, safe="/")
+            query = urllib.parse.urlencode({"ref": actual_ref})
+            try:
+                value = self._request("GET", f"/repos/{repository}/contents/{encoded_path}?{query}")
+            except ResourceNotFoundError:
+                missing.append(path)
+                continue
+            if value.get("type") != "file":
+                raise ToolExecutionError(f"repository path is not a file: {path}")
+            existing.append(path)
+        return {"existing_files": sorted(existing), "missing_files": sorted(missing)}
+
     def get_repo_tree(
         self,
         repository: str,
@@ -721,24 +758,53 @@ class GitHubMCPServer(InMemoryMCPServer):
         )
         return {"repository": repository, "branch": branch, "base": base}
 
-    def commit(self, repository: str, branch: str, files: dict[str, str], message: str) -> dict[str, Any]:
+    def commit(
+        self,
+        repository: str,
+        branch: str,
+        files: dict[str, str],
+        deleted_files: list[str],
+        message: str,
+    ) -> dict[str, Any]:
         self._require_token()
         repository = self._repository(repository)
         self._validate_branch(branch)
-        if not files or not message.strip():
-            raise ValidationError("commit requires exact file contents and a message")
+        if (not files and not deleted_files) or not message.strip():
+            raise ValidationError("commit requires file changes and a message")
         ref = self._request("GET", f"/repos/{repository}/git/ref/heads/{urllib.parse.quote(branch, safe='')}")
         parent_sha = ref["object"]["sha"]
         parent = self._request("GET", f"/repos/{repository}/git/commits/{parent_sha}")
+        base_tree_sha = str(parent["tree"]["sha"])
+        existing_entries = self._tree_entries(repository, base_tree_sha)
         tree_entries = []
-        for path, content in files.items():
-            safe = safe_repository_path(path)
+        safe_files = {safe_repository_path(path): content for path, content in files.items()}
+        safe_deletions = {safe_repository_path(path) for path in deleted_files}
+        if set(safe_files) & safe_deletions:
+            raise ValidationError("commit cannot write and delete the same file")
+        for safe, content in safe_files.items():
             blob = self._request("POST", f"/repos/{repository}/git/blobs", {"content": content, "encoding": "utf-8"})
-            tree_entries.append({"path": safe, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+            current = existing_entries.get(safe) or {}
+            tree_entries.append(
+                {
+                    "path": safe,
+                    "mode": str(current.get("mode") or "100644"),
+                    "type": "blob",
+                    "sha": blob["sha"],
+                }
+            )
+        tree_entries.extend(
+            {
+                "path": path,
+                "mode": str((existing_entries.get(path) or {}).get("mode") or "100644"),
+                "type": "blob",
+                "sha": None,
+            }
+            for path in sorted(safe_deletions)
+        )
         tree = self._request(
             "POST",
             f"/repos/{repository}/git/trees",
-            {"base_tree": parent["tree"]["sha"], "tree": tree_entries},
+            {"base_tree": base_tree_sha, "tree": tree_entries},
         )
         commit = self._request(
             "POST",
@@ -750,7 +816,100 @@ class GitHubMCPServer(InMemoryMCPServer):
             f"/repos/{repository}/git/refs/heads/{urllib.parse.quote(branch, safe='')}",
             {"sha": commit["sha"], "force": False},
         )
-        return {"commit": commit["sha"], "branch": branch, "files": sorted(files)}
+        return {
+            "commit": commit["sha"],
+            "branch": branch,
+            "files": sorted({*safe_files, *safe_deletions}),
+            "deleted_files": sorted(safe_deletions),
+        }
+
+    def commit_to_default_branch(
+        self,
+        repository: str,
+        expected_head_sha: str,
+        files: dict[str, str],
+        deleted_files: list[str],
+        message: str,
+    ) -> dict[str, Any]:
+        self._require_token()
+        repository = self._repository(repository)
+        if (not files and not deleted_files) or not message.strip():
+            raise ValidationError("default-branch commit requires file changes and a message")
+        branch = self._default_branch(repository)
+        encoded_branch = urllib.parse.quote(branch, safe="")
+        ref = self._request("GET", f"/repos/{repository}/git/ref/heads/{encoded_branch}")
+        actual_head_sha = str((ref.get("object") or {}).get("sha") or "")
+        if not expected_head_sha.strip() or actual_head_sha != expected_head_sha.strip():
+            raise ToolExecutionError("default branch changed after the candidate was prepared")
+        parent = self._request("GET", f"/repos/{repository}/git/commits/{actual_head_sha}")
+        base_tree_sha = str(parent["tree"]["sha"])
+        existing_entries = self._tree_entries(repository, base_tree_sha)
+        safe_files = {safe_repository_path(path): content for path, content in files.items()}
+        safe_deletions = {safe_repository_path(path) for path in deleted_files}
+        if set(safe_files) & safe_deletions:
+            raise ValidationError("default-branch commit cannot write and delete the same file")
+        tree_entries = []
+        for path, content in safe_files.items():
+            blob = self._request(
+                "POST",
+                f"/repos/{repository}/git/blobs",
+                {"content": content, "encoding": "utf-8"},
+            )
+            current = existing_entries.get(path) or {}
+            tree_entries.append(
+                {
+                    "path": path,
+                    "mode": str(current.get("mode") or "100644"),
+                    "type": "blob",
+                    "sha": blob["sha"],
+                }
+            )
+        tree_entries.extend(
+            {
+                "path": path,
+                "mode": str((existing_entries.get(path) or {}).get("mode") or "100644"),
+                "type": "blob",
+                "sha": None,
+            }
+            for path in sorted(safe_deletions)
+        )
+        tree = self._request(
+            "POST",
+            f"/repos/{repository}/git/trees",
+            {"base_tree": base_tree_sha, "tree": tree_entries},
+        )
+        commit = self._request(
+            "POST",
+            f"/repos/{repository}/git/commits",
+            {"message": message, "tree": tree["sha"], "parents": [actual_head_sha]},
+        )
+        self._request(
+            "PATCH",
+            f"/repos/{repository}/git/refs/heads/{encoded_branch}",
+            {"sha": commit["sha"], "force": False},
+        )
+        self._search_cache.clear()
+        self._text_cache.clear()
+        return {
+            "repository": repository,
+            "branch": branch,
+            "commit": commit["sha"],
+            "files": sorted({*safe_files, *safe_deletions}),
+            "deleted_files": sorted(safe_deletions),
+        }
+
+    def _tree_entries(self, repository: str, tree_sha: str) -> dict[str, dict[str, Any]]:
+        value = self._request(
+            "GET",
+            f"/repos/{repository}/git/trees/{urllib.parse.quote(tree_sha, safe='')}?recursive=1",
+        )
+        if value.get("truncated"):
+            raise ToolExecutionError("repository tree is too large to preserve file modes safely")
+        return {
+            str(item["path"]): dict(item)
+            for item in value.get("tree", [])
+            if item.get("type") == "blob" and item.get("path")
+        }
 
     def push(self, repository: str, branch: str) -> dict[str, Any]:
         self._require_token()

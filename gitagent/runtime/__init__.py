@@ -13,10 +13,12 @@ from .loop import (
 )
 from .mutation import (
     GITHUB_MUTATOR_SPEC,
-    code_change_approval_summary,
-    code_change_mutation_plan,
     code_change_review_package,
+    issue_fix_approval_summary,
+    issue_fix_mutation_plan,
     register_github_mutator,
+    repository_change_approval_summary,
+    repository_change_mutation_plan,
 )
 
 __all__ = [
@@ -29,10 +31,12 @@ __all__ = [
     "AgentLoopAgent",
     "FileReadLedger",
     "PendingAction",
-    "code_change_approval_summary",
-    "code_change_mutation_plan",
     "code_change_review_package",
+    "issue_fix_approval_summary",
+    "issue_fix_mutation_plan",
     "register_github_mutator",
     "rejection_feedback",
     "render_observations",
+    "repository_change_approval_summary",
+    "repository_change_mutation_plan",
 ]

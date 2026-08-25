@@ -12,7 +12,7 @@ AGENT_ACTION_SCHEMA = {
     "properties": {
         "kind": {
             "type": "string",
-            "enum": ["tool", "apply_code_change", "ask", "finish"],
+            "enum": ["tool", "apply_issue_fix", "ask", "finish"],
         },
         "summary": {"type": "string", "description": "One-line user-facing explanation of the next action."},
         "tool": {"type": "string", "description": "The registered tool name when kind is tool."},
@@ -45,9 +45,9 @@ def parse_action(value: Any, *, requires_candidate: bool) -> AgentAction:
         action.question = str(value.get("question", "")).strip()
         if not action.question:
             raise ValidationError("ask action requires a question")
-    elif kind == AgentActionKind.APPLY_CODE_CHANGE:
+    elif kind == AgentActionKind.APPLY_ISSUE_FIX:
         if not requires_candidate:
-            raise ValidationError("apply_code_change is not allowed for this agent")
+            raise ValidationError("apply_issue_fix is not allowed for this agent")
     elif kind == AgentActionKind.FINISH:
         action.message = str(value.get("message", "")).strip()
     return action

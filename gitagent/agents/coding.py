@@ -4,20 +4,22 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 from typing import Any
 
-from ..core.errors import LLMProviderError, StructuredOutputError, ValidationError, WorkflowError
+from ..core.errors import LLMProviderError, ValidationError, WorkflowError
 from ..core.models import (
     AgentGuidance,
     AgentSpec,
     CandidatePatch,
+    CandidatePreparationResult,
     ChangeRequest,
     CodeExplanationResult,
     CodePlanResult,
     CodeReviewResult,
     Recommendation,
-    VerificationReport,
 )
+from ..mcp.base import safe_repository_path
 from ..prompts import get_prompt_library
 from ..reasoning import Reasoner
 from ..runtime import AgentContext, AgentHarness
@@ -25,22 +27,35 @@ from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
 
-_CANDIDATE_SCHEMA = {
+_CHANGE_PLAN_SCHEMA = {
     "type": "object",
     "properties": {
-        "summary": {"type": "string"},
-        "root_cause": {"type": "string"},
-        "files": {
-            "type": "object",
-            "description": "Complete new UTF-8 content keyed by the supplied repository path.",
-            "additionalProperties": {"type": "string"},
+        "changes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["ADD", "MODIFY", "DELETE"]},
+                    "path": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "evidence_queries": {
+                        "type": "array",
+                        "maxItems": 3,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 120},
+                    },
+                },
+                "required": ["action", "path", "evidence_queries"],
+                "additionalProperties": False,
+            },
         },
-        "risks": {"type": "array", "items": {"type": "string"}},
-        "verification_required": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["summary", "root_cause", "files", "risks", "verification_required"],
+    "required": ["changes"],
     "additionalProperties": False,
 }
+
+_EXPLICIT_PATH = re.compile(r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9_-]+")
+
 
 _EXPLANATION_SCHEMA = {
     "type": "object",
@@ -100,6 +115,8 @@ CODING_SPEC = AgentSpec(
     system_prompt=_PROMPTS.text("system.coding"),
     allowed_tools=frozenset(
         {
+            "repository.get_default_branch",
+            "repository.get_file_status",
             "repository.get_repo_tree",
             "repository.search_code",
             "repository.read_file",
@@ -184,7 +201,7 @@ class CodingAgent:
         *,
         session_id: str,
         guidance: AgentGuidance | None = None,
-    ) -> CandidatePatch:
+    ) -> CandidatePreparationResult:
         return self.harness.run(
             "coding",
             session_id=session_id,
@@ -204,9 +221,9 @@ class CodingAgent:
         *,
         session_id: str,
         guidance: AgentGuidance | None = None,
-    ) -> CandidatePatch:
+    ) -> CandidatePreparationResult:
         if not self.reasoner:
-            return candidate
+            return CandidatePreparationResult(candidate)
         return self.harness.run(
             "coding",
             session_id=session_id,
@@ -341,30 +358,44 @@ class CodingAgent:
         context: AgentContext,
         request: ChangeRequest,
         guidance: AgentGuidance | None,
-    ) -> CandidatePatch:
+    ) -> CandidatePreparationResult:
         context.phase = "discovering_targets"
+        if request.source_ref is None:
+            default = context.tool("repository.get_default_branch", repository=request.repository)
+            request.base_branch = str(default["branch"])
+            request.source_ref = str(default["commit_sha"])
         tree = context.tool(
             "repository.get_repo_tree",
             repository=request.repository,
-            depth=4,
+            depth=8,
+            max_entries=500,
             ref=request.source_ref,
         )
         tree_paths = [str(path) for path in tree["entries"]]
-        known_paths = set(tree_paths)
-        paths = list(dict.fromkeys(request.target_files + [replacement.path for replacement in request.replacements]))
-        if not paths:
-            paths = [path for path in tree_paths if path in request.description]
-        existing_paths = [path for path in paths if path in known_paths]
-        if not existing_paths and not request.proposed_files:
-            context.phase = "searching_repository"
-            query = self._search_term(request.description)
-            hits = context.tool("repository.search_code", repository=request.repository, query=query, max_results=15)["results"]
-            existing_paths = list(dict.fromkeys(hit["path"] for hit in hits))[:6]
-            if not existing_paths:
-                raise WorkflowError(
-                    "cannot determine a safe editable target file; "
-                    f"repository search returned no matches for {query!r}"
+        explicit_request = bool(request.proposed_files or request.replacements or request.deleted_files)
+        if explicit_request:
+            explicit_paths = list(
+                dict.fromkeys(
+                    [*request.proposed_files, *[item.path for item in request.replacements], *request.deleted_files]
                 )
+            )
+            existing_files = self._existing_files(context, request, explicit_paths)
+            planned_changes = self._explicit_change_plan(request, existing_files)
+        elif self.reasoner is not None:
+            planned_changes = self._reasoned_change_plan(context, request, tree_paths, guidance)
+            existing_files = self._existing_files(
+                context,
+                request,
+                [change["path"] for change in planned_changes],
+            )
+        else:
+            raise WorkflowError(
+                "coding without a reasoner requires explicit replacements, proposed_files, or deleted_files"
+            )
+        self._validate_change_plan(planned_changes, existing_files)
+
+        request.target_files = [change["path"] for change in planned_changes]
+        existing_paths = [change["path"] for change in planned_changes if change["action"] != "ADD"]
         context.phase = "reading_targets"
         fetched = (
             context.tool(
@@ -380,76 +411,222 @@ class CodingAgent:
             raise WorkflowError("a target file exceeds the safe fetch bound; refusing to risk a truncated overwrite")
         originals = {item["path"]: item["content"] for item in fetched}
 
-        if request.proposed_files:
+        deleted_files = [change["path"] for change in planned_changes if change["action"] == "DELETE"]
+        if explicit_request:
             new_files = dict(request.proposed_files)
-            missing_context = [path for path in new_files if path in known_paths and path not in originals]
-            if missing_context:
-                more = context.tool(
-                    "repository.read_files",
-                    repository=request.repository,
-                    requests=[{"path": path, "limit": 400} for path in missing_context],
-                    ref=request.source_ref,
-                )["files"]
-                if any(item.get("truncated") for item in more):
-                    raise WorkflowError(
-                        "a target file exceeds the safe fetch bound; refusing to risk a truncated overwrite"
-                    )
-                originals.update({item["path"]: item["content"] for item in more})
-        elif request.replacements:
-            new_files = dict(originals)
             for replacement in request.replacements:
-                if replacement.path not in new_files:
+                if replacement.path not in originals:
                     raise WorkflowError(f"replacement target was not fetched: {replacement.path}")
-                count = new_files[replacement.path].count(replacement.old)
+                content = new_files.get(replacement.path, originals[replacement.path])
+                count = content.count(replacement.old)
                 if count != 1:
                     raise WorkflowError(
                         f"replacement anchor in {replacement.path} must match exactly once; found {count}"
                     )
-                new_files[replacement.path] = new_files[replacement.path].replace(replacement.old, replacement.new, 1)
-        elif self.reasoner:
+                new_files[replacement.path] = content.replace(replacement.old, replacement.new, 1)
+        else:
+            planned_operations = [
+                {
+                    "id": f"change-{index}",
+                    "action": change["action"],
+                    "path": change["path"],
+                    "evidence_queries": change["evidence_queries"],
+                }
+                for index, change in enumerate(planned_changes, start=1)
+            ]
+            writable_operations = [
+                operation for operation in planned_operations if operation["action"] in {"ADD", "MODIFY"}
+            ]
+            evidence = self._collect_operation_evidence(
+                context,
+                request,
+                writable_operations,
+                existing_paths=set(originals),
+            )
+            evidence_by_id = {item["operation_id"]: item for item in evidence}
             context.phase = "generating_candidate"
-            try:
-                value = self.reasoner.complete_structured(
-                    system=context.system_prompt,
-                    prompt=_PROMPTS.render(
-                        "agents.coding_create",
-                        repository=request.repository,
-                        description=request.description,
-                        files=json.dumps(originals, ensure_ascii=False),
-                        guidance=guidance_section(guidance),
-                    ),
-                    schema=_CANDIDATE_SCHEMA,
-                    tool_name="prepare_candidate",
-                )
-            except LLMProviderError as exc:
-                raise LLMProviderError(f"候选补丁生成阶段失败：{exc}") from exc
-            except StructuredOutputError as exc:
-                raise StructuredOutputError(f"候选补丁结构化输出无效：{exc}") from exc
-            new_files = {str(path): str(content) for path, content in value.get("files", {}).items()}
-            outside = set(new_files) - set(originals)
-            if outside:
-                raise ValidationError(f"reasoner changed unfetched files: {', '.join(sorted(outside))}")
-            return self._candidate(
+            new_files = {}
+            for operation in writable_operations:
+                try:
+                    content = self.reasoner.complete_text(
+                        system=context.system_prompt,
+                        prompt=_PROMPTS.render(
+                            "agents.coding_create",
+                            repository=request.repository,
+                            description=request.description,
+                            operation=json.dumps(operation, ensure_ascii=False),
+                            current_content=originals.get(operation["path"], ""),
+                            evidence=json.dumps(evidence_by_id[operation["id"]], ensure_ascii=False),
+                            guidance=guidance_section(guidance),
+                        ),
+                    )
+                except LLMProviderError as exc:
+                    raise LLMProviderError(f"候选文件生成阶段失败：{exc}") from exc
+                if not content:
+                    return CandidatePreparationResult(
+                        None,
+                        message=(
+                            f"模型没有为 `{operation['path']}` 返回文件内容，本次未生成审批，也没有写入仓库。"
+                            "请补充文件要求后重试。"
+                        ),
+                    )
+                new_files[operation["path"]] = content
+
+        return CandidatePreparationResult(
+            self._candidate(
                 originals,
                 new_files,
-                summary=str(value.get("summary", request.description)),
-                root_cause=str(value.get("root_cause", request.description)),
-                risks=[str(item) for item in value.get("risks", [])],
-                verification_required=[str(item) for item in value.get("verification_required", [])],
+                deleted_files=deleted_files,
+                summary=request.suggested_title or request.description,
+                root_cause=request.description,
+                risks=["模型生成的文件内容需要人工审阅。"],
+                verification_required=["人工审阅", "提交默认分支后运行项目测试"],
             )
-        else:
-            raise WorkflowError(
-                "coding without a reasoner requires explicit replacements/proposed_files; configure LLMReasoner otherwise"
-            )
-
-        return self._candidate(
-            originals,
-            new_files,
-            summary=request.description,
-            root_cause=f"The requested behavior requires a minimal targeted change: {request.description}",
-            risks=["Only static checks are performed; runtime behavior still needs human verification."],
-            verification_required=["Human review", "Project tests after the draft PR is created"],
         )
+
+    def _reasoned_change_plan(
+        self,
+        context: AgentContext,
+        request: ChangeRequest,
+        tree_paths: list[str],
+        guidance: AgentGuidance | None,
+    ) -> list[dict[str, Any]]:
+        if self.reasoner is None:
+            raise WorkflowError("repository change planning requires a reasoner")
+        mentioned = list(
+            dict.fromkeys(
+                [safe_repository_path(path) for path in request.target_files]
+                + _EXPLICIT_PATH.findall(request.description)
+            )
+        )
+        mentioned.extend(path for path in tree_paths if path in request.description and path not in mentioned)
+        context.phase = "planning_changes"
+        value = self.reasoner.complete_structured(
+            system=context.system_prompt,
+            prompt=json.dumps(
+                {
+                    "request": request.description,
+                    "repository_tree": tree_paths,
+                    "mentioned_paths": mentioned,
+                    "guidance": guidance_section(guidance),
+                    "instruction": (
+                        "Return every requested file operation in one plan. ADD is only when the user requests "
+                        "a new path; MODIFY and DELETE target existing files. repository_tree is bounded, so keep "
+                        "an explicitly mentioned path even when it is not listed there; path status is validated next. "
+                        "For each ADD or MODIFY operation, return one to three short, independent literal "
+                        "evidence_queries likely to occur in repository source. Each query must concern only that "
+                        "operation; never combine unrelated requested topics in one query. DELETE uses an empty list."
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            schema=_CHANGE_PLAN_SCHEMA,
+            tool_name="plan_repository_file_changes",
+        )
+        changes: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in value.get("changes", []):
+            path = safe_repository_path(str(raw.get("path") or ""))
+            action = str(raw.get("action") or "")
+            if path in seen:
+                raise ValidationError(f"repository change plan contains duplicate path: {path}")
+            seen.add(path)
+            changes.append(
+                {
+                    "action": action,
+                    "path": path,
+                    "evidence_queries": [str(item) for item in raw["evidence_queries"]],
+                }
+            )
+        return changes
+
+    @staticmethod
+    def _explicit_change_plan(request: ChangeRequest, existing_files: set[str]) -> list[dict[str, str]]:
+        actions: dict[str, str] = {}
+
+        def add(path: str, action: str) -> None:
+            safe = safe_repository_path(path)
+            previous = actions.get(safe)
+            if previous is not None and previous != action:
+                raise ValidationError(f"conflicting repository operations for {safe}: {previous} and {action}")
+            actions[safe] = action
+
+        for path in request.proposed_files:
+            add(path, "MODIFY" if path in existing_files else "ADD")
+        for replacement in request.replacements:
+            add(replacement.path, "MODIFY")
+        for path in request.deleted_files:
+            add(path, "DELETE")
+        return [{"action": action, "path": path} for path, action in actions.items()]
+
+    @staticmethod
+    def _existing_files(
+        context: AgentContext,
+        request: ChangeRequest,
+        paths: list[str],
+    ) -> set[str]:
+        status = context.tool(
+            "repository.get_file_status",
+            repository=request.repository,
+            paths=paths,
+            ref=request.source_ref,
+        )
+        return {str(path) for path in status.get("existing_files", [])}
+
+    @staticmethod
+    def _validate_change_plan(changes: list[dict[str, Any]], existing_files: set[str]) -> None:
+        for change in changes:
+            action = change["action"]
+            path = change["path"]
+            if action == "ADD" and path in existing_files:
+                raise ValidationError(f"repository change plan cannot add an existing file: {path}")
+            if action in {"MODIFY", "DELETE"} and path not in existing_files:
+                raise ValidationError(f"repository change plan cannot {action.casefold()} a missing file: {path}")
+
+    @staticmethod
+    def _collect_operation_evidence(
+        context: AgentContext,
+        request: ChangeRequest,
+        operations: list[dict[str, Any]],
+        *,
+        existing_paths: set[str],
+    ) -> list[dict[str, Any]]:
+        context.phase = "collecting_evidence"
+        evidence: list[dict[str, Any]] = []
+        for operation in operations:
+            selected: dict[str, int] = {}
+            queries = [str(query) for query in operation["evidence_queries"]]
+            for query in queries:
+                result = context.tool(
+                    "repository.search_code",
+                    repository=request.repository,
+                    query=query,
+                    max_results=5,
+                )
+                for hit in result["results"]:
+                    path = str(hit["path"])
+                    if path not in existing_paths and path not in selected:
+                        selected[path] = int(hit["line"])
+                        break
+            requests = [{"path": path, "start_line": max(1, line - 40), "limit": 81} for path, line in selected.items()]
+            sources = (
+                context.tool(
+                    "repository.read_files",
+                    repository=request.repository,
+                    requests=requests,
+                    ref=request.source_ref,
+                )["files"]
+                if requests
+                else []
+            )
+            evidence.append(
+                {
+                    "operation_id": operation["id"],
+                    "queries": queries,
+                    "sources": sources,
+                }
+            )
+        return evidence
 
     def _repair(
         self,
@@ -458,42 +635,65 @@ class CodingAgent:
         candidate: CandidatePatch,
         errors: list[str],
         guidance: AgentGuidance | None,
-    ) -> CandidatePatch:
-        value = self.reasoner.complete_structured(
-            system=context.system_prompt,
-            prompt=_PROMPTS.render(
-                "agents.coding_repair",
-                description=request.description,
-                files=json.dumps(candidate.files, ensure_ascii=False),
-                # Keep the default json.dumps flags here: the error text is ASCII-safe
-                # by construction and the byte identity of the rendered prompt must not change.
-                errors=json.dumps(errors),
-                guidance=guidance_section(guidance),
-            ),
-            schema=_CANDIDATE_SCHEMA,
-            tool_name="repair_candidate",
+    ) -> CandidatePreparationResult:
+        writable_operations = [
+            {
+                "id": f"change-{index}",
+                "action": "ADD" if path in candidate.added_files else "MODIFY",
+                "path": path,
+                "content": content,
+            }
+            for index, (path, content) in enumerate(candidate.files.items(), start=1)
+        ]
+        repaired: dict[str, str] = {}
+        for operation in writable_operations:
+            content = self.reasoner.complete_text(
+                system=context.system_prompt,
+                prompt=_PROMPTS.render(
+                    "agents.coding_repair",
+                    description=request.description,
+                    operation=json.dumps(
+                        {key: operation[key] for key in ("id", "action", "path")},
+                        ensure_ascii=False,
+                    ),
+                    current_content=operation["content"],
+                    errors=json.dumps(errors, ensure_ascii=False),
+                    guidance=guidance_section(guidance),
+                ),
+            )
+            if not content:
+                return CandidatePreparationResult(
+                    None,
+                    message=(
+                        f"模型没有为 `{operation['path']}` 返回修复后的文件内容，本次未生成审批，"
+                        "也没有写入仓库。请补充文件要求后重试。"
+                    ),
+                )
+            repaired[operation["path"]] = content
+        existing_paths = [*candidate.modified_files, *candidate.deleted_files]
+        fetched = (
+            context.tool(
+                "repository.read_files",
+                repository=request.repository,
+                requests=[{"path": path, "limit": 400} for path in existing_paths],
+                ref=request.source_ref,
+            )["files"]
+            if existing_paths
+            else []
         )
-        repaired = {str(path): str(content) for path, content in value.get("files", {}).items()}
-        if set(repaired) != set(candidate.files):
-            raise ValidationError("repair changed the candidate file scope")
-        fetched = context.tool(
-            "repository.read_files",
-            repository=request.repository,
-            requests=[{"path": path, "limit": 400} for path in candidate.changed_files],
-            ref=request.source_ref,
-        )["files"]
         if any(item.get("truncated") for item in fetched):
             raise WorkflowError("a target file exceeds the safe fetch bound; refusing a truncated repair")
         originals = {item["path"]: item["content"] for item in fetched}
-        return self._candidate(
-            originals,
-            repaired,
-            summary=str(value.get("summary", candidate.summary)),
-            root_cause=str(value.get("root_cause", candidate.root_cause)),
-            risks=[str(item) for item in value.get("risks", candidate.risks)],
-            verification_required=[
-                str(item) for item in value.get("verification_required", candidate.verification_required)
-            ],
+        return CandidatePreparationResult(
+            self._candidate(
+                originals,
+                repaired,
+                deleted_files=candidate.deleted_files,
+                summary=candidate.summary,
+                root_cause=candidate.root_cause,
+                risks=candidate.risks,
+                verification_required=candidate.verification_required,
+            )
         )
 
     @staticmethod
@@ -501,48 +701,59 @@ class CodingAgent:
         originals: dict[str, str],
         proposed: dict[str, str],
         *,
+        deleted_files: list[str],
         summary: str,
         root_cause: str,
         risks: list[str],
         verification_required: list[str],
     ) -> CandidatePatch:
-        changed = sorted(path for path, content in proposed.items() if originals.get(path, "") != content)
-        if not changed:
+        deleted = sorted(set(deleted_files))
+        missing_deletions = set(deleted) - set(originals)
+        if missing_deletions:
+            raise WorkflowError(f"deletion target was not fetched: {', '.join(sorted(missing_deletions))}")
+        overlap = set(proposed) & set(deleted)
+        if overlap:
+            raise ValidationError(f"candidate cannot write and delete the same file: {', '.join(sorted(overlap))}")
+        added = sorted(path for path in proposed if path not in originals)
+        modified = sorted(
+            path for path, content in proposed.items() if path in originals and originals[path] != content
+        )
+        unchanged = sorted(path for path in proposed if path in originals and originals[path] == proposed[path])
+        if unchanged:
+            raise WorkflowError(f"candidate does not modify the requested file(s): {', '.join(unchanged)}")
+        if not (added or modified or deleted):
             raise WorkflowError("candidate patch does not change any file")
         chunks = []
-        for path in changed:
+        for path in [*added, *modified]:
             chunks.extend(
                 difflib.unified_diff(
                     originals.get(path, "").splitlines(keepends=True),
                     proposed[path].splitlines(keepends=True),
-                    fromfile=f"a/{path}",
+                    fromfile="/dev/null" if path in added else f"a/{path}",
                     tofile=f"b/{path}",
+                )
+            )
+        for path in deleted:
+            chunks.extend(
+                difflib.unified_diff(
+                    originals[path].splitlines(keepends=True),
+                    [],
+                    fromfile=f"a/{path}",
+                    tofile="/dev/null",
                 )
             )
         return CandidatePatch(
             summary=summary,
             root_cause=root_cause,
-            changed_files=changed,
+            added_files=added,
+            modified_files=modified,
+            deleted_files=deleted,
             patch="".join(chunks),
-            files={path: proposed[path] for path in changed},
+            files={path: proposed[path] for path in [*added, *modified]},
             static_checks=[],
             risks=risks,
             verification_required=verification_required,
         )
-
-    def _search_term(self, description: str) -> str:
-        if self.reasoner is None:
-            raise WorkflowError("coding requires target_files when no reasoner is configured")
-        try:
-            query = self.reasoner.complete_text(
-                system="Return one concise repository search term for the requested code change. Return only the term.",
-                prompt=description,
-            ).strip()
-        except LLMProviderError as exc:
-            raise LLMProviderError(f"目标文件搜索词生成阶段失败：{exc}") from exc
-        if not query:
-            raise WorkflowError("coding could not determine a repository search term")
-        return query[:120]
 
     @staticmethod
     def _is_test_path(path: str) -> bool:
@@ -561,25 +772,31 @@ def prepare_verified_candidate(
     session_id: str,
     guidance: AgentGuidance | None = None,
     max_repair_attempts: int = 1,
-) -> tuple[CandidatePatch, VerificationReport]:
+) -> CandidatePreparationResult:
     """Generate a candidate synchronously and gate it behind static verification.
 
     Read-only throughout: no GitHub mutation is proposed unless every static
     check passes.  One repair attempt is allowed, matching the previous
     workflow's ``MAX_REPAIR_ATTEMPTS``.
     """
-    candidate = coding.create_candidate(request, session_id=session_id, guidance=guidance)
+    prepared = coding.create_candidate(request, session_id=session_id, guidance=guidance)
+    if prepared.candidate is None:
+        return prepared
+    candidate = prepared.candidate
     for attempt in range(1, max_repair_attempts + 2):
         report = verifier.verify(candidate, session_id=session_id, attempts=attempt)
         if report.passed:
-            return candidate, report
+            return CandidatePreparationResult(candidate, report)
         if attempt <= max_repair_attempts:
             failures = [check.details for check in report.checks if check.status == "FAIL"]
-            candidate = coding.repair_candidate(
+            prepared = coding.repair_candidate(
                 request,
                 candidate,
                 failures,
                 session_id=session_id,
                 guidance=guidance,
             )
-    return candidate, report
+            if prepared.candidate is None:
+                return prepared
+            candidate = prepared.candidate
+    return CandidatePreparationResult(candidate, report)

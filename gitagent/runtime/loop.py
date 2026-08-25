@@ -18,15 +18,18 @@ from ..core.models import (
 from ..core.trace import TraceCategory, TraceStatus
 from .harness import AgentContext, AgentHarness, debug_context_snapshot, debug_error_details, debug_value
 from .mutation import (
-    code_change_approval_summary,
-    code_change_mutation_plan,
     code_change_review_package,
+    issue_fix_approval_summary,
+    issue_fix_mutation_plan,
+    repository_change_approval_summary,
+    repository_change_mutation_plan,
 )
 
 
 class AgentActionKind(str, Enum):
     TOOL = "tool"
-    APPLY_CODE_CHANGE = "apply_code_change"
+    APPLY_ISSUE_FIX = "apply_issue_fix"
+    APPLY_REPOSITORY_CHANGE = "apply_repository_change"
     ASK = "ask"
     FINISH = "finish"
 
@@ -56,6 +59,7 @@ class AgentLoopAgent(Protocol):
     def decide(self, context: AgentContext) -> AgentAction: ...
 
     def build_result(self, context: AgentContext) -> Any: ...
+
 
 class AgentLoop:
     def __init__(self, harness: AgentHarness, *, max_steps: int = 20) -> None:
@@ -162,8 +166,10 @@ class AgentLoop:
         try:
             if action.kind == AgentActionKind.TOOL:
                 return self._handle_tool(context, agent, action)
-            if action.kind == AgentActionKind.APPLY_CODE_CHANGE:
-                return self._handle_apply(context, action)
+            if action.kind == AgentActionKind.APPLY_ISSUE_FIX:
+                return self._handle_issue_fix(context)
+            if action.kind == AgentActionKind.APPLY_REPOSITORY_CHANGE:
+                return self._handle_repository_apply(context)
             if action.kind == AgentActionKind.ASK:
                 context.question = action.question or action.summary
                 self._emit(context, TraceStatus.WAITING, message=context.question)
@@ -226,14 +232,35 @@ class AgentLoop:
         self._observe(context, "tool", payload)
         return True
 
-    def _handle_apply(self, context: AgentContext, action: AgentAction) -> bool:
+    def _handle_issue_fix(self, context: AgentContext) -> bool:
         if context.code_candidate is None or context.change_request is None:
-            raise WorkflowError("apply_code_change requires a verified candidate and change request")
+            raise WorkflowError("apply_issue_fix requires a verified candidate and change request")
         if context.verification is not None and not context.verification.passed:
             raise WorkflowError("static verification failed; GitHub mutation is forbidden")
         review = code_change_review_package(context.change_request, context.code_candidate, context.verification)
-        calls = code_change_mutation_plan(context.session_id, context.change_request, context.code_candidate, review)
-        summary = code_change_approval_summary(context.change_request, review)
+        calls = issue_fix_mutation_plan(context.session_id, context.change_request, context.code_candidate, review)
+        summary = issue_fix_approval_summary(context.change_request, review)
+        approval = self.harness.approvals.create(
+            session_id=context.session_id,
+            repository=context.repository,
+            summary=summary,
+            calls=calls,
+        )
+        context.pending = PendingAction(approval.approval_id, approval.summary, calls)
+        self._emit(context, TraceStatus.WAITING, message=approval.summary)
+        return False
+
+    def _handle_repository_apply(self, context: AgentContext) -> bool:
+        if context.code_candidate is None or context.change_request is None:
+            raise WorkflowError("apply_repository_change requires a verified candidate and change request")
+        if context.verification is None or not context.verification.passed:
+            raise WorkflowError("static verification failed; default-branch mutation is forbidden")
+        calls = repository_change_mutation_plan(context.change_request, context.code_candidate)
+        summary = repository_change_approval_summary(
+            context.change_request,
+            context.code_candidate,
+            context.verification,
+        )
         approval = self.harness.approvals.create(
             session_id=context.session_id,
             repository=context.repository,

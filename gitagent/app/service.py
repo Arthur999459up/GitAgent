@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..agents import CodingAgent, IssueAgent, MainAgent, PullRequestAgent, RepositoryAgent
-from ..agents.code_change_controller import CodeChangeController
 from ..core.errors import RoutingError
 from ..core.models import (
     AgentGuidance,
@@ -67,11 +66,10 @@ class GitAgentService:
         register_github_mutator(self.harness)
         self.coding = CodingAgent(self.harness, agent_reasoner)
         self.verifier = StaticVerifier(self.harness)
-        self.code_change_controller = CodeChangeController(self.coding, self.verifier)
         self.repository_agent = RepositoryAgent(
             self.harness,
             self.coding,
-            self.code_change_controller,
+            self.verifier,
             agent_reasoner,
         )
         self.pull_request_agent = PullRequestAgent(self.harness, self.coding, self.verifier, agent_reasoner)
@@ -341,13 +339,6 @@ class GitAgentService:
             revised.change_request = ChangeRequest(
                 repository=request.repository,
                 description=f"{request.description}\n\nUser revision: {instruction}",
-                base_branch=request.base_branch,
-                target_files=list(request.target_files),
-                replacements=list(request.replacements),
-                proposed_files=dict(request.proposed_files),
-                issue_number=request.issue_number,
-                suggested_title=request.suggested_title,
-                source_ref=request.source_ref,
             )
             self.loop.start(revised, self.repository_agent)
             return self._after_loop(revised)
@@ -545,6 +536,10 @@ class GitAgentService:
                 PlannedToolCall(str(item["tool"]), dict(item.get("arguments") or {}))
                 for item in pending.get("calls", [])
             ]
+            if agent == "repository" and (
+                len(calls) != 1 or calls[0].tool != "github.commit_to_default_branch"
+            ):
+                raise RoutingError("stored RepositoryAgent proposal uses an obsolete mutation strategy")
             if any(
                 "repository" in call.arguments and str(call.arguments["repository"]) != repository
                 for call in calls
@@ -564,7 +559,9 @@ class GitAgentService:
         return CandidatePatch(
             summary=str(raw.get("summary") or ""),
             root_cause=str(raw.get("root_cause") or ""),
-            changed_files=[str(item) for item in raw.get("changed_files", [])],
+            added_files=[str(item) for item in raw.get("added_files", [])],
+            modified_files=[str(item) for item in raw.get("modified_files", [])],
+            deleted_files=[str(item) for item in raw.get("deleted_files", [])],
             patch=str(raw.get("patch") or ""),
             files={str(key): str(value) for key, value in dict(raw.get("files") or {}).items()},
             static_checks=[str(item) for item in raw.get("static_checks", [])],
@@ -587,6 +584,7 @@ class GitAgentService:
                 if isinstance(item, dict)
             ],
             proposed_files={str(key): str(value) for key, value in dict(raw.get("proposed_files") or {}).items()},
+            deleted_files=[str(item) for item in raw.get("deleted_files", [])],
             issue_number=int(raw["issue_number"]) if raw.get("issue_number") is not None else None,
             suggested_title=str(raw.get("suggested_title")) if raw.get("suggested_title") is not None else None,
             source_ref=str(raw.get("source_ref")) if raw.get("source_ref") is not None else None,
@@ -644,14 +642,17 @@ class GitAgentService:
     def _proposal_description(context: AgentContext) -> str:
         if context.pending is None:
             return "当前没有待确认的提案。"
-        return json.dumps(
-            {
-                "summary": context.pending.summary,
-                "calls": [{"tool": call.tool, "arguments": call.arguments} for call in context.pending.calls],
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+        if context.reply_draft is not None:
+            return context.reply_draft
+        candidate = context.code_candidate
+        if candidate is None:
+            return context.pending.summary
+        sections = [context.pending.summary]
+        sections.extend(f"### `{path}`\n````\n{content}\n````" for path, content in candidate.files.items())
+        if candidate.deleted_files:
+            sections.append("删除文件：" + ", ".join(candidate.deleted_files))
+        sections.append(f"### Diff\n```diff\n{candidate.patch}\n```")
+        return "\n\n".join(sections)
 
     def _agent_for(self, name: str) -> Any:
         agents = {

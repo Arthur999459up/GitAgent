@@ -397,6 +397,7 @@ class AgentHarness:
         safe_keys = {
             "base",
             "branch",
+            "deleted_files",
             "depth",
             "draft",
             "head",

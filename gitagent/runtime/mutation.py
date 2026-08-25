@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..core.errors import WorkflowError
 from ..core.models import (
     AgentSpec,
     CandidatePatch,
@@ -28,6 +29,7 @@ GITHUB_MUTATOR_SPEC = AgentSpec(
             "github.update_pr",
             "github.create_branch",
             "github.commit",
+            "github.commit_to_default_branch",
             "github.push",
             "github.create_draft_pr",
             "github.post_review",
@@ -43,7 +45,7 @@ def register_github_mutator(harness: AgentHarness) -> None:
     harness.register(GITHUB_MUTATOR_SPEC)
 
 
-def code_change_mutation_plan(
+def issue_fix_mutation_plan(
     session_id: str,
     request: ChangeRequest,
     candidate: CandidatePatch,
@@ -63,6 +65,7 @@ def code_change_mutation_plan(
                 "repository": request.repository,
                 "branch": branch,
                 "files": candidate.files,
+                "deleted_files": candidate.deleted_files,
                 "message": candidate.summary,
             },
         ),
@@ -79,6 +82,45 @@ def code_change_mutation_plan(
             },
         ),
     ]
+
+
+def repository_change_mutation_plan(
+    request: ChangeRequest,
+    candidate: CandidatePatch,
+) -> list[PlannedToolCall]:
+    """Build one atomic default-branch commit for a RepositoryAgent change."""
+    if not request.source_ref:
+        raise WorkflowError("repository change requires the reviewed default-branch head SHA")
+    return [
+        PlannedToolCall(
+            "github.commit_to_default_branch",
+            {
+                "repository": request.repository,
+                "expected_head_sha": request.source_ref,
+                "files": candidate.files,
+                "deleted_files": candidate.deleted_files,
+                "message": candidate.summary,
+            },
+        )
+    ]
+
+
+def repository_change_approval_summary(
+    request: ChangeRequest,
+    candidate: CandidatePatch,
+    report: VerificationReport,
+) -> str:
+    checks = ", ".join(f"{check.name}={check.status}" for check in report.checks) or "None"
+    return (
+        f"What will happen: create one commit directly on the default branch `{request.base_branch}`.\n"
+        f"Affected repository: {request.repository}\n"
+        f"Added files: {', '.join(candidate.added_files) or 'None'}\n"
+        f"Modified files: {', '.join(candidate.modified_files) or 'None'}\n"
+        f"Deleted files: {', '.join(candidate.deleted_files) or 'None'}\n"
+        f"Commit message: {candidate.summary}\n"
+        f"Verification result: {checks}\n"
+        f"Risk: {'; '.join(candidate.risks) or 'No specific static risk identified.'}"
+    )
 
 
 def code_change_review_package(
@@ -121,7 +163,7 @@ def code_change_review_package(
     )
 
 
-def code_change_approval_summary(request: ChangeRequest, review: HumanReviewPackage) -> str:
+def issue_fix_approval_summary(request: ChangeRequest, review: HumanReviewPackage) -> str:
     checks = ", ".join(f"{check.name}={check.status}" for check in review.static_verification.checks)
     return (
         "What will happen: create a branch, commit the reviewed candidate, push it, and create a Draft PR.\n"

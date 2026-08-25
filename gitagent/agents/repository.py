@@ -18,9 +18,15 @@ from ..core.models import (
 )
 from ..prompts import get_prompt_library
 from ..reasoning import Reasoner
-from ..runtime import AgentAction, AgentActionKind, AgentContext, AgentHarness
-from .code_change_controller import CodeChangeController
-from .coding import CodingAgent
+from ..runtime import (
+    AgentAction,
+    AgentActionKind,
+    AgentContext,
+    AgentHarness,
+    rejection_feedback,
+)
+from ..verification import StaticVerifier
+from .coding import CodingAgent, prepare_verified_candidate
 from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
@@ -115,12 +121,12 @@ class RepositoryAgent:
         self,
         harness: AgentHarness,
         coding: CodingAgent,
-        controller: CodeChangeController,
+        verifier: StaticVerifier,
         reasoner: Reasoner | None = None,
     ) -> None:
         self.harness = harness
         self.coding = coding
-        self.controller = controller
+        self.verifier = verifier
         self.reasoner = reasoner
         harness.register(REPOSITORY_SPEC)
 
@@ -164,7 +170,7 @@ class RepositoryAgent:
             raise WorkflowError("Repository Agent requires a valid operation") from exc
         if operation == RepositoryOperation.MODIFY:
             self.prepare(context, operation)
-            return self.controller.decide(context)
+            return self._decide_modify(context)
         return self._decide_read(context, operation)
 
     def build_result(self, context: AgentContext) -> RepositoryResult:
@@ -273,9 +279,67 @@ class RepositoryAgent:
             )
         return AgentAction(AgentActionKind.FINISH, summary="有界仓库检索已完成")
 
+    def _decide_modify(self, context: AgentContext) -> AgentAction:
+        if context.change_request is None:
+            raise WorkflowError("repository modification requires a change request")
+        applied = self._last_tool_data(context, "github.commit_to_default_branch")
+        if applied is not None:
+            return AgentAction(
+                AgentActionKind.FINISH,
+                summary="仓库变更已提交",
+                message=(
+                    f"已直接提交到默认分支 `{applied.get('branch', context.change_request.base_branch)}`，"
+                    f"Commit `{applied.get('commit', '')}`。"
+                ),
+            )
+        feedback = rejection_feedback(context)
+        if feedback is not None and not feedback:
+            return AgentAction(
+                AgentActionKind.FINISH,
+                summary="已放弃",
+                message="已按你的要求放弃，未执行任何仓库写入。",
+            )
+        if context.code_candidate is None:
+            prepared = prepare_verified_candidate(
+                self.coding,
+                self.verifier,
+                context.change_request,
+                session_id=context.session_id,
+                guidance=context.guidance,
+            )
+            if prepared.candidate is None:
+                return AgentAction(
+                    AgentActionKind.FINISH,
+                    summary="模型未生成文件内容",
+                    message=prepared.message,
+                )
+            candidate = prepared.candidate
+            report = prepared.verification
+            context.code_candidate = candidate
+            context.verification = report
+            context.observations.append(
+                {
+                    "kind": "agent",
+                    "payload": {
+                        "agent": "coding",
+                        "summary": candidate.summary,
+                        "added_files": list(candidate.added_files),
+                        "modified_files": list(candidate.modified_files),
+                        "deleted_files": list(candidate.deleted_files),
+                        "verification_passed": bool(report and report.passed),
+                    },
+                }
+            )
+            if report is None or not report.passed:
+                raise WorkflowError("静态验证失败；拒绝生成默认分支写入提案")
+        return AgentAction(
+            AgentActionKind.APPLY_REPOSITORY_CHANGE,
+            summary="将已验证的多文件变更直接提交到默认分支",
+        )
+
     def _build_modify_result(self, context: AgentContext) -> RepositoryResult:
-        internal = self.controller.build_result(context)
-        answer = context.final_message or str(internal.get("summary") or "代码变更流程已完成。")
+        summary = context.change_request.description if context.change_request is not None else "代码变更流程已完成。"
+        answer = context.final_message or summary
         files = list(context.code_candidate.changed_files) if context.code_candidate is not None else []
         return RepositoryResult(
             action=DomainAction.ANSWER,
@@ -644,7 +708,28 @@ class RepositoryAgent:
     @staticmethod
     def _fallback_operation(request: str) -> RepositoryOperation:
         text = request.casefold()
-        if any(word in text for word in ("修改", "修复", "实现", "增加", "删除", "重构", "change", "fix", "implement")):
+        if any(
+            word in text
+            for word in (
+                "修改",
+                "修复",
+                "实现",
+                "增加",
+                "新增",
+                "添加",
+                "创建文件",
+                "删除",
+                "移除",
+                "重构",
+                "change",
+                "fix",
+                "implement",
+                "add",
+                "create file",
+                "delete",
+                "remove",
+            )
+        ):
             return RepositoryOperation.MODIFY
         if any(word in text for word in ("历史", "提交", "history", "commit")):
             return RepositoryOperation.HISTORY

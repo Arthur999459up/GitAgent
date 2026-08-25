@@ -173,10 +173,7 @@ class LLMReasoner:
             ],
             tools=None,
         )
-        content = response.content.strip()
-        if not content:
-            raise ValidationError("text reasoning output cannot be empty")
-        return content
+        return response.content.strip()
 
 
 def _first_json_object(content: str) -> Any:
