@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from ..core.models import AgentGuidance, to_plain
-from ..prompts import get_prompt_library
+from gitagent.domain.models import AgentGuidance, to_plain
+from gitagent.prompts import get_prompt_library
 
 _PROMPTS = get_prompt_library()
 

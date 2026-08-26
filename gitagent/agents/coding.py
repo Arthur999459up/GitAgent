@@ -7,8 +7,8 @@ import json
 import re
 from typing import Any
 
-from ..core.errors import LLMProviderError, ValidationError, WorkflowError
-from ..core.models import (
+from gitagent.domain.errors import LLMProviderError, ValidationError, WorkflowError
+from gitagent.domain.models import (
     AgentGuidance,
     AgentSpec,
     CandidatePatch,
@@ -19,10 +19,11 @@ from ..core.models import (
     CodeReviewResult,
     Recommendation,
 )
-from ..mcp.base import safe_repository_path
-from ..prompts import get_prompt_library
-from ..reasoning import Reasoner
-from ..runtime import AgentContext, AgentHarness
+from gitagent.harness.context.state import AgentContext
+from gitagent.harness.execution import AgentHarness
+from gitagent.harness.tools.file_access import safe_repository_path
+from gitagent.model import Reasoner
+from gitagent.prompts import get_prompt_library
 from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()

@@ -6,8 +6,9 @@ import json
 import re
 from typing import Any
 
-from ..core.errors import LLMProviderError, ValidationError, WorkflowError
-from ..core.models import (
+from gitagent.agent_loop import AgentAction, AgentActionKind, rejection_feedback
+from gitagent.domain.errors import LLMProviderError, ValidationError, WorkflowError
+from gitagent.domain.models import (
     AgentSpec,
     CandidatePatch,
     ChangeRequest,
@@ -23,19 +24,14 @@ from ..core.models import (
     VerificationReport,
     to_plain,
 )
-from ..core.reviews import canonical_review_event, effective_review_events
-from ..core.trace import TraceCategory, TraceStatus
-from ..prompts import get_prompt_library
-from ..reasoning import Reasoner
-from ..runtime import (
-    AgentAction,
-    AgentActionKind,
-    AgentContext,
-    AgentHarness,
-    rejection_feedback,
-)
-from ..runtime.mutation import code_change_review_package
-from ..verification import StaticVerifier
+from gitagent.domain.reviews import canonical_review_event, effective_review_events
+from gitagent.harness.context.state import AgentContext
+from gitagent.harness.execution import AgentHarness
+from gitagent.harness.recovery.github_mutations import code_change_review_package
+from gitagent.harness.validation.static import StaticVerifier
+from gitagent.infra.observability.trace import TraceCategory, TraceStatus
+from gitagent.model import Reasoner
+from gitagent.prompts import get_prompt_library
 from .coding import CodingAgent, prepare_verified_candidate
 from .guidance import guidance_section
 

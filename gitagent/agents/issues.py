@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..core.errors import LLMProviderError, ValidationError, WorkflowError
-from ..core.models import (
+from gitagent.agent_loop import AgentAction, AgentActionKind, rejection_feedback
+from gitagent.harness.context import render_context_observations
+from gitagent.domain.errors import LLMProviderError, ValidationError, WorkflowError
+from gitagent.domain.models import (
     AgentSpec,
     ChangeRequest,
     DomainAction,
@@ -16,19 +18,13 @@ from ..core.models import (
     Replacement,
     Route,
 )
-from ..core.trace import TraceCategory, TraceStatus
-from ..prompts import get_prompt_library
-from ..reasoning import Reasoner
-from ..runtime import (
-    AgentAction,
-    AgentActionKind,
-    AgentContext,
-    AgentHarness,
-    code_change_review_package,
-    rejection_feedback,
-    render_observations,
-)
-from ..verification import StaticVerifier
+from gitagent.harness.context.state import AgentContext
+from gitagent.harness.execution import AgentHarness
+from gitagent.harness.recovery.github_mutations import code_change_review_package
+from gitagent.harness.validation.static import StaticVerifier
+from gitagent.infra.observability.trace import TraceCategory, TraceStatus
+from gitagent.model import Reasoner
+from gitagent.prompts import get_prompt_library
 from .coding import CodingAgent, prepare_verified_candidate
 from .decide import AGENT_ACTION_SCHEMA, parse_action
 from .guidance import guidance_section
@@ -293,7 +289,7 @@ class IssueAgent:
                 goal=context.goal,
                 repository=context.repository,
                 entity=f"Issue #{context.entity_id}" if context.entity_id else "no specific Issue selected",
-                observations=render_observations(context),
+                observations=render_context_observations(context),
                 budget=str(max(0, context.max_steps - context.steps)),
                 guidance=guidance_section(context.guidance),
             ),
@@ -423,7 +419,7 @@ class IssueAgent:
                 prompt=_PROMPTS.render(
                     "agents.issue_fix_guide",
                     issue=json.dumps(self._bounded_issue(issue), ensure_ascii=False),
-                    observations=render_observations(context),
+                    observations=render_context_observations(context),
                     guidance=guidance_section(context.guidance),
                 ),
                 schema={
@@ -494,7 +490,7 @@ class IssueAgent:
             prompt=_PROMPTS.render(
                 "agents.issue_reply_draft",
                 request=context.goal,
-                evidence=render_observations(context),
+                evidence=render_context_observations(context),
                 guidance=guidance_section(context.guidance),
             ),
         ).strip()

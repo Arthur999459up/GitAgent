@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitagent"
+version = "0.1.0"
+description = "安全、可审计的个人 GitHub 仓库维护助手。"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0,<3",
+    "prompt-toolkit>=3.0,<4",
+    "rich>=13,<16",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+litellm = [
+    "litellm>=1.0",
+]
+dev = [
+    "pytest>=8,<10",
+]
+
+[project.scripts]
+gitagent = "gitagent.application.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gitagent*"]
+
+[tool.setuptools.package-data]
+gitagent = [
+    "prompts/*.md",
+    "prompts/*/*.md",
+]

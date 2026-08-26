@@ -6,8 +6,9 @@ import json
 import re
 from typing import Any
 
-from ..core.errors import LLMProviderError, ValidationError, WorkflowError
-from ..core.models import (
+from gitagent.agent_loop import AgentAction, AgentActionKind, rejection_feedback
+from gitagent.domain.errors import LLMProviderError, ValidationError, WorkflowError
+from gitagent.domain.models import (
     AgentSpec,
     ChangeRequest,
     DomainAction,
@@ -16,16 +17,11 @@ from ..core.models import (
     Route,
     to_plain,
 )
-from ..prompts import get_prompt_library
-from ..reasoning import Reasoner
-from ..runtime import (
-    AgentAction,
-    AgentActionKind,
-    AgentContext,
-    AgentHarness,
-    rejection_feedback,
-)
-from ..verification import StaticVerifier
+from gitagent.harness.context.state import AgentContext
+from gitagent.harness.execution import AgentHarness
+from gitagent.harness.validation.static import StaticVerifier
+from gitagent.model import Reasoner
+from gitagent.prompts import get_prompt_library
 from .coding import CodingAgent, prepare_verified_candidate
 from .guidance import guidance_section
 

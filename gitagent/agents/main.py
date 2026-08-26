@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..core.errors import RoutingError, ValidationError
-from ..core.models import AgentSpec, MainDecision, Route, RoutingContext, to_plain
-from ..reasoning import Reasoner, structured_request_payload
-from ..runtime import AgentContext, AgentHarness
+from gitagent.domain.errors import RoutingError, ValidationError
+from gitagent.domain.models import AgentSpec, MainDecision, Route, RoutingContext, to_plain
+from gitagent.harness.context.state import AgentContext
+from gitagent.harness.execution import AgentHarness
+from gitagent.model import Reasoner, structured_request_payload
 
 _DOMAIN_AGENTS = {"issues", "pull_requests", "repository"}
 _MAIN_SCHEMA = {

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.errors import ValidationError
-from ..runtime import AgentAction, AgentActionKind
+from gitagent.agent_loop import AgentAction, AgentActionKind
+from gitagent.domain.errors import ValidationError
 
 AGENT_ACTION_SCHEMA = {
     "type": "object",

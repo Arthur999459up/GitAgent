@@ -1,8 +1,7 @@
-"""GitAgent stable public API."""
+"""GitAgent public API."""
 
-from .app import CLIConfig, GitAgentService
-from .core import ApprovalRequest, ApprovalStore
-from .core.models import (
+from gitagent.application import CLIConfig, GitAgentService
+from gitagent.domain.models import (
     AccessLevel,
     ApprovalIntent,
     CandidatePatch,
@@ -24,10 +23,12 @@ from .core.models import (
     RoutingContext,
     WorkflowTurnDecision,
 )
-from .core.trace import TraceBus, TraceCategory, TraceEvent, TraceStatus
-from .mcp import GitHubMCPServer, MCPClient, MCPServer, ToolRegistry, ToolSpec
-from .reasoning import ChatResponse, LiteLLMChatClient, LLMReasoner, OpenAIChatClient
-from .runtime import AgentHarness
+from gitagent.harness import AgentHarness
+from gitagent.harness.constraints import ApprovalRequest, ApprovalStore
+from gitagent.harness.tools import MCPClient, ToolRegistry, ToolSpec
+from gitagent.infra.observability import TraceBus, TraceCategory, TraceEvent, TraceStatus
+from gitagent.infra.tool_hosts import GitHubMCPServer, MCPServer
+from gitagent.model import ChatResponse, LiteLLMChatClient, LLMReasoner, OpenAIChatClient
 
 __version__ = "0.1.0"
 
