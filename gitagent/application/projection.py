@@ -17,6 +17,7 @@ from gitagent.domain.models import (
     RepositoryResult,
 )
 from gitagent.harness.context.state import AgentContext
+
 from .service import ServiceResult
 
 T = TypeVar("T")
@@ -181,7 +182,7 @@ def _project_context(
         parts.append(f"提案：{context.pending.summary}")
         for call in context.pending.calls:
             arguments = json.dumps(call.arguments, ensure_ascii=False, indent=2, sort_keys=True)
-            parts.append(f"待执行 `{call.tool}`：\n{arguments}")
+            parts.append(f"待执行 `{call.capability_id}`：\n{arguments}")
         parts.append("待人工批准后执行。")
     mutation = _last_write_like_observation(context)
     if mutation is not None:
@@ -204,11 +205,11 @@ def _project_context(
 
 def _last_write_like_observation(context: AgentContext) -> Any | None:
     for observation in reversed(context.observations):
-        if observation.get("kind") != "tool":
+        if observation.get("kind") != "capability":
             continue
         payload = observation.get("payload") or {}
-        tool = str(payload.get("tool") or "")
-        if tool.startswith("github.") and tool not in {
+        capability_id = str(payload.get("capability_id") or "")
+        if capability_id.startswith("github.") and capability_id not in {
             "github.list_issues",
             "github.get_issue",
             "github.get_issue_comments",

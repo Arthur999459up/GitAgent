@@ -23,12 +23,6 @@ class ApprovalIntent(str, Enum):
     AMBIGUOUS = "AMBIGUOUS"
 
 
-class AccessLevel(str, Enum):
-    READ = "READ"
-    WRITE = "WRITE"
-    DESTRUCTIVE = "DESTRUCTIVE"
-
-
 class Recommendation(str, Enum):
     APPROVE = "APPROVE"
     REQUEST_CHANGES = "REQUEST_CHANGES"
@@ -133,16 +127,15 @@ class AgentSpec:
     name: str
     role: str
     system_prompt: str
-    allowed_tools: frozenset[str]
     output_schema: tuple[str, ...]
-    capabilities: frozenset[Route | str]
+    routes: frozenset[Route | str]
     required_context: tuple[str, ...] = ()
     routing_examples: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
-class PlannedToolCall:
-    tool: str
+class PlannedCapabilityCall:
+    capability_id: str
     arguments: dict[str, Any]
 
 
@@ -206,6 +199,7 @@ class CandidatePreparationResult:
     candidate: CandidatePatch | None
     verification: VerificationReport | None = None
     message: str = ""
+    capability_error: dict[str, Any] | None = None
 
 
 @dataclass

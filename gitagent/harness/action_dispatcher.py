@@ -4,9 +4,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from gitagent.agent_loop.actions import AgentAction, AgentActionKind, AgentLoopAgent, PendingAction
-from gitagent.domain.errors import PermissionDenied, ToolExecutionError, ValidationError, WorkflowError
-from gitagent.domain.models import AccessLevel, ApprovalIntent, MutationRejectedResult, PlannedToolCall, WorkflowTurnDecision
+from gitagent.agent_loop.actions import (
+    AgentAction,
+    AgentActionKind,
+    AgentLoopAgent,
+    PendingAction,
+)
+from gitagent.domain.errors import ValidationError, WorkflowError
+from gitagent.domain.models import (
+    ApprovalIntent,
+    PlannedCapabilityCall,
+    WorkflowTurnDecision,
+)
 from gitagent.harness.recovery.github_mutations import (
     code_change_review_package,
     issue_fix_approval_summary,
@@ -23,7 +32,7 @@ class HarnessActionDispatcher:
     def __init__(self, harness: Any) -> None:
         self.harness = harness
 
-    def restore_pending(self, context: Any, *, summary: str, calls: list[PlannedToolCall]) -> None:
+    def restore_pending(self, context: Any, *, summary: str, calls: list[PlannedCapabilityCall]) -> None:
         approval = self.harness.approvals.create(
             session_id=context.session_id,
             repository=context.repository,
@@ -46,14 +55,7 @@ class HarnessActionDispatcher:
         if decision.action == ApprovalIntent.APPROVE:
             self.harness.approvals.decide(pending.approval_id, "Approve")
             context.pending = None
-            try:
-                self._execute_pending(context, pending)
-            except ToolExecutionError as exc:
-                context.result = MutationRejectedResult(
-                    summary=pending.summary or "GitHub 操作",
-                    reason=exc.user_message,
-                )
-                context.finished = True
+            self._execute_pending(context, pending)
             return
 
         self.harness.approvals.decide(pending.approval_id, "Reject")
@@ -61,12 +63,14 @@ class HarnessActionDispatcher:
         context.pending = None
 
     def handle(self, context: Any, agent: AgentLoopAgent, action: AgentAction) -> bool:
-        if action.kind == AgentActionKind.TOOL:
-            return self._handle_tool(context, agent, action)
+        if action.kind == AgentActionKind.CAPABILITY:
+            return self._handle_capability(context, agent, action)
         if action.kind == AgentActionKind.APPLY_ISSUE_FIX:
             return self._handle_issue_fix(context)
         if action.kind == AgentActionKind.APPLY_REPOSITORY_CHANGE:
             return self._handle_repository_change(context)
+        if action.kind == AgentActionKind.CONTINUE:
+            return True
         if action.kind == AgentActionKind.ASK:
             context.question = action.question or action.summary
             return False
@@ -78,51 +82,50 @@ class HarnessActionDispatcher:
             return False
         raise ValidationError(f"unknown action kind: {action.kind}")
 
-    def _handle_tool(self, context: Any, agent: AgentLoopAgent, action: AgentAction) -> bool:
-        if not action.tool:
-            raise ValidationError("tool action requires a tool name")
-        spec = self.harness.spec(context.agent)
-        if action.tool not in spec.allowed_tools:
-            raise PermissionDenied(f"agent {context.agent} is not allowed to use {action.tool}")
-
+    def _handle_capability(self, context: Any, agent: AgentLoopAgent, action: AgentAction) -> bool:
+        if not action.capability_id:
+            raise ValidationError("capability action requires a capability ID")
         arguments = dict(action.arguments)
-        if "repository" not in arguments and (
-            action.tool.startswith("github.") or action.tool.startswith("repository.")
-        ):
-            arguments["repository"] = context.repository
 
-        tool = self.harness.server.get_tool(action.tool)
-        if tool.access in {AccessLevel.WRITE, AccessLevel.DESTRUCTIVE}:
-            if context.read_only:
-                self.observe(
-                    context,
-                    "policy",
-                    {"tool": action.tool, "blocked": "read_only context forbids mutation proposals"},
-                )
-                context.final_message = "只读取证阶段已完成；未生成或执行写操作。"
-                context.result = agent.build_result(context)
-                context.finished = True
-                return False
-            call = PlannedToolCall(action.tool, arguments)
+        context.invoke(action.capability_id, **arguments)
+        call = context.last_capability_call
+        if call is None:
+            raise WorkflowError("capability invocation did not record its result")
+        if call.result.status == "approval_required":
+            call = PlannedCapabilityCall(action.capability_id, arguments)
             approval = self.harness.approvals.create(
                 session_id=context.session_id,
                 repository=context.repository,
-                summary=action.summary or f"执行 {action.tool}",
+                summary=action.summary or f"执行 {action.capability_id}",
                 calls=[call],
             )
             context.pending = PendingAction(approval.approval_id, approval.summary, [call])
             return False
-
-        context.tool(action.tool, **arguments)
-        call = context.last_tool_call
-        if call is None:
-            raise WorkflowError("tool execution did not record its result")
-        payload = {"tool": action.tool, "arguments": call.arguments, "data": call.observation_data}
+        if call.result.status == "failed":
+            error = call.result.error
+            self.observe(
+                context,
+                "capability_error",
+                {
+                    "capability_id": call.result.capability_id,
+                    "arguments": dict(arguments),
+                    "error": error.type.value,
+                    "message": error.message,
+                    "details": error.details,
+                    "attempts": call.result.attempts,
+                },
+            )
+            return True
+        payload = {
+            "capability_id": action.capability_id,
+            "arguments": dict(arguments),
+            "data": call.observation_data,
+        }
         if call.cached:
             payload["cached"] = True
         if call.covered:
             payload["covered"] = True
-        self.observe(context, "tool", payload)
+        self.observe(context, "capability", payload)
         return True
 
     def _handle_issue_fix(self, context: Any) -> bool:
@@ -150,7 +153,7 @@ class HarnessActionDispatcher:
         self._queue(context, summary, calls)
         return False
 
-    def _queue(self, context: Any, summary: str, calls: list[PlannedToolCall]) -> None:
+    def _queue(self, context: Any, summary: str, calls: list[PlannedCapabilityCall]) -> None:
         approval = self.harness.approvals.create(
             session_id=context.session_id,
             repository=context.repository,
@@ -167,8 +170,42 @@ class HarnessActionDispatcher:
             goal=context.goal,
         )
         for call in pending.calls:
-            result = mutator.tool(call.tool, approval_id=pending.approval_id, **call.arguments)
-            self.observe(context, "tool", {"tool": call.tool, "arguments": dict(call.arguments), "data": result})
+            executor = mutator if call.capability_id.startswith("github.") else context
+            result = executor.invoke(
+                call.capability_id,
+                approval_id=pending.approval_id,
+                **call.arguments,
+            )
+            invocation = executor.last_capability_call
+            if invocation is None:
+                raise WorkflowError("approved capability invocation did not record its result")
+            if invocation.result.status != "success":
+                error = invocation.result.error
+                if error is None:
+                    raise WorkflowError("approved capability failed without a structured error")
+                self.harness.approvals.invalidate(pending.approval_id)
+                self.observe(
+                    context,
+                    "capability_error",
+                    {
+                        "capability_id": invocation.result.capability_id,
+                        "arguments": dict(call.arguments),
+                        "error": error.type.value,
+                        "message": error.message,
+                        "details": error.details,
+                        "attempts": invocation.result.attempts,
+                    },
+                )
+                return
+            self.observe(
+                context,
+                "capability",
+                {
+                    "capability_id": call.capability_id,
+                    "arguments": dict(call.arguments),
+                    "data": result,
+                },
+            )
         if not self.harness.approvals.complete(pending.approval_id):
             raise WorkflowError("approved mutation plan was not fully consumed")
 

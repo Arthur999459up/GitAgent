@@ -2,22 +2,22 @@
 
 from .errors import (
     ApprovalRequired,
+    ExternalExecutionError,
     GitAgentError,
     PermissionDenied,
     RoutingError,
     StateError,
-    ToolExecutionError,
     ValidationError,
     WorkflowError,
 )
 
 __all__ = [
     "ApprovalRequired",
+    "ExternalExecutionError",
     "GitAgentError",
     "PermissionDenied",
     "RoutingError",
     "StateError",
-    "ToolExecutionError",
     "ValidationError",
     "WorkflowError",
 ]

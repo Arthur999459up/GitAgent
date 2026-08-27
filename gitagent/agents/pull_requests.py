@@ -25,6 +25,11 @@ from gitagent.domain.models import (
     to_plain,
 )
 from gitagent.domain.reviews import canonical_review_event, effective_review_events
+from gitagent.harness.context import (
+    capability_attempted,
+    capability_failure_observed,
+    render_context_observations,
+)
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.recovery.github_mutations import code_change_review_package
@@ -32,7 +37,13 @@ from gitagent.harness.validation.static import StaticVerifier
 from gitagent.infra.observability.trace import TraceCategory, TraceStatus
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
-from .coding import CodingAgent, prepare_verified_candidate
+
+from .coding import (
+    CodingAgent,
+    prepare_verified_candidate,
+    record_candidate_capability_error,
+)
+from .decide import AGENT_ACTION_SCHEMA, parse_action
 from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
@@ -90,23 +101,6 @@ PULL_REQUEST_AGENT_SPEC = AgentSpec(
         "targeted code improvement, review publication, merge readiness, and merge orchestration."
     ),
     system_prompt=_PROMPTS.text("system.pull_requests"),
-    allowed_tools=frozenset(
-        {
-            "github.list_pull_requests",
-            "github.get_pr",
-            "github.get_pr_comments",
-            "github.get_pr_reviews",
-            "github.get_workflow_runs",
-            "github.get_job_logs",
-            "github.post_review",
-            "github.commit",
-            "github.merge",
-            "repository.get_repo_tree",
-            "repository.read_files",
-            "repository.get_pr_diff",
-            "repository.get_changed_files",
-        }
-    ),
     output_schema=(
         "action",
         "operation",
@@ -126,7 +120,7 @@ PULL_REQUEST_AGENT_SPEC = AgentSpec(
         "execution_result",
         "question",
     ),
-    capabilities=frozenset({Route.PULL_REQUEST}),
+    routes=frozenset({Route.PULL_REQUEST}),
     required_context=("repository",),
     routing_examples=(
         "看看有哪些开放的 PR",
@@ -177,16 +171,8 @@ class PullRequestAgent:
                 summary="已取消待确认操作",
                 message="已按你的要求取消，未执行 Pull Request 写操作。",
             )
-        if self._pr_not_found(context):
-            pr_number = self._require_pr_number(context)
-            return AgentAction(
-                AgentActionKind.FINISH,
-                summary="Pull Request 不存在",
-                message=(
-                    f"在仓库 `{context.repository}` 中未找到 PR #{pr_number}。"
-                    "请确认编号是否正确，或确认当前账号有权访问该 Pull Request。"
-                ),
-            )
+        if self.reasoner is not None and capability_failure_observed(context):
+            return self._llm_decide_after_failure(context)
 
         operation = PullRequestOperation(context.operation)
         if operation in {PullRequestOperation.LIST, PullRequestOperation.SEARCH, PullRequestOperation.SUMMARIZE}:
@@ -215,8 +201,8 @@ class PullRequestAgent:
 
     def build_result(self, context: AgentContext) -> PullRequestAgentResult:
         operation = PullRequestOperation(context.operation) if context.operation else None
-        pull_request = self._last_tool(context, "github.get_pr")
-        raw_list = self._last_tool(context, "github.list_pull_requests")
+        pull_request = self._last_capability(context, "github.get_pr")
+        raw_list = self._last_capability(context, "github.list_pull_requests")
         changed_files = self._changed_files(context)
         pull_requests: list[PullRequestSummary] = []
         if raw_list is not None:
@@ -235,8 +221,8 @@ class PullRequestAgent:
         if not answer and operation in {PullRequestOperation.LIST, PullRequestOperation.SEARCH, PullRequestOperation.SUMMARIZE}:
             answer = self._list_answer(context, (raw_list or {}).get("pull_requests", []), pull_requests)
         if not answer and pull_request is not None:
-            comments = (self._last_tool(context, "github.get_pr_comments") or {}).get("comments", [])
-            diff = (self._last_tool(context, "repository.get_pr_diff") or {}).get("diff", "")
+            comments = (self._last_capability(context, "github.get_pr_comments") or {}).get("comments", [])
+            diff = (self._last_capability(context, "repository.get_pr_diff") or {}).get("diff", "")
             answer = self._detail_answer(context, pull_request, comments, changed_files, diff)
         if not answer:
             answer = "Pull Request 请求已处理。"
@@ -307,9 +293,39 @@ class PullRequestAgent:
         context.operation = operation.value
         context.requested_outcome = review_event
 
+    def _llm_decide_after_failure(self, context: AgentContext) -> AgentAction:
+        if self.reasoner is None:
+            raise WorkflowError("capability failure recovery requires a reasoner")
+        value = self.reasoner.complete_structured(
+            system=context.system_prompt,
+            prompt=_PROMPTS.render(
+                "agents.pull_request_recovery_decide",
+                goal=context.goal,
+                repository=context.repository,
+                entity=(
+                    f"Pull Request #{context.entity_id}"
+                    if context.entity_id
+                    else "no concrete Pull Request selected"
+                ),
+                operation=context.operation or "",
+                budget=str(max(0, context.max_steps - context.steps)),
+                guidance=guidance_section(context.guidance),
+                observations=render_context_observations(context),
+            ),
+            schema=AGENT_ACTION_SCHEMA,
+            tool_name="decide_action",
+            tools=self.harness.llm_tools(context),
+        )
+        if value.get("kind") == "capability":
+            value["capability_id"] = self.harness.resolve_llm_name(
+                str(value.get("capability_id", "")),
+                context,
+            )
+        return parse_action(value, requires_candidate=False)
+
     def _list_step(self, context: AgentContext) -> AgentAction:
-        if self._last_tool(context, "github.list_pull_requests") is None:
-            return self._tool("github.list_pull_requests", {"state": "open", "limit": 20}, "列出 Pull Requests")
+        if self._last_capability(context, "github.list_pull_requests") is None:
+            return self._capability("github.list_pull_requests", {"state": "open", "limit": 20}, "列出 Pull Requests")
         return AgentAction(AgentActionKind.FINISH, summary="Pull Requests 已列出")
 
     def _get_step(self, context: AgentContext) -> AgentAction:
@@ -386,22 +402,24 @@ class PullRequestAgent:
             required = self._pr_code_evidence_step(context)
             if required is not None:
                 return required
-        pull_request = self._last_tool(context, "github.get_pr")
+        pull_request = self._last_capability(context, "github.get_pr")
         if pull_request is None:
             return AgentAction(AgentActionKind.ASK, question="请指定需要完善的 Pull Request 编号。")
-        applied = self._last_tool(context, "github.commit")
+        applied = self._last_capability(context, "github.commit")
         if applied is not None:
             return AgentAction(
                 AgentActionKind.FINISH,
                 summary="候选改动已应用",
                 message=f"候选改动已写入 PR 分支 `{applied.get('branch', '')}`，涉及：{', '.join(applied.get('files', []))}。",
             )
-        message = self._ensure_candidate(context, pull_request)
-        if message:
+        preparation = self._ensure_candidate(context, pull_request)
+        if isinstance(preparation, AgentAction):
+            return preparation
+        if preparation:
             return AgentAction(
                 AgentActionKind.FINISH,
                 summary="模型未生成文件内容",
-                message=message,
+                message=preparation,
             )
         if self._is_fork(context.repository, pull_request):
             candidate = context.code_candidate
@@ -419,7 +437,7 @@ class PullRequestAgent:
         branch = self._branch(pull_request.get("head"))
         if not branch:
             raise WorkflowError("Pull Request head branch is missing")
-        return self._tool(
+        return self._capability(
             "github.commit",
             {
                 "branch": branch,
@@ -434,7 +452,7 @@ class PullRequestAgent:
         required = self._pr_code_evidence_step(context, comments=True, reviews=True)
         if required is not None:
             return required
-        published = self._last_tool(context, "github.post_review")
+        published = self._last_capability(context, "github.post_review")
         if published is not None:
             return AgentAction(
                 AgentActionKind.FINISH,
@@ -444,7 +462,7 @@ class PullRequestAgent:
         review = self._ensure_review(context, context.goal)
         event = context.requested_outcome or "COMMENT"
         context.requested_outcome = event
-        return self._tool(
+        return self._capability(
             "github.post_review",
             {
                 "pr_number": self._require_pr_number(context),
@@ -469,7 +487,7 @@ class PullRequestAgent:
                 summary="合并准备度已评估",
                 message=self._format_readiness(readiness),
             )
-        merged = self._last_tool(context, "github.merge")
+        merged = self._last_capability(context, "github.merge")
         if merged is not None:
             return AgentAction(
                 AgentActionKind.FINISH,
@@ -482,7 +500,7 @@ class PullRequestAgent:
                 summary="Pull Request 尚未满足合并条件",
                 message=self._format_readiness(readiness),
             )
-        pull_request = self._last_tool(context, "github.get_pr") or {}
+        pull_request = self._last_capability(context, "github.get_pr") or {}
         head = pull_request.get("head") or {}
         expected_sha = str(head.get("sha") or "") if isinstance(head, dict) else ""
         if not expected_sha:
@@ -491,7 +509,7 @@ class PullRequestAgent:
                 summary="缺少可确认的 PR head SHA",
                 message="当前证据缺少 PR head SHA，不能形成合并提案。",
             )
-        return self._tool(
+        return self._capability(
             "github.merge",
             {"pr_number": self._require_pr_number(context), "expected_head_sha": expected_sha},
             f"合并 PR #{self._require_pr_number(context)}（head {expected_sha}）",
@@ -501,8 +519,9 @@ class PullRequestAgent:
         pr_number = self._pr_number(context)
         if pr_number is None:
             return AgentAction(AgentActionKind.ASK, question="请指定 Pull Request 编号。")
-        if self._last_tool(context, "github.get_pr") is None:
-            return self._tool("github.get_pr", {"pr_number": pr_number}, "读取 Pull Request")
+        arguments = {"pr_number": pr_number}
+        if not capability_attempted(context, "github.get_pr", arguments=arguments):
+            return self._capability("github.get_pr", arguments, "读取 Pull Request")
         return None
 
     def _pr_code_evidence_step(
@@ -517,48 +536,82 @@ class PullRequestAgent:
         if required is not None:
             return required
         pr_number = self._require_pr_number(context)
-        if self._last_tool(context, "repository.get_changed_files") is None:
-            return self._tool(
-                "repository.get_changed_files", {"pr_number": pr_number}, "读取 Pull Request 变更文件"
+        changed_files_arguments = {"pr_number": pr_number}
+        if not capability_attempted(
+            context,
+            "repository.get_changed_files",
+            arguments=changed_files_arguments,
+        ):
+            return self._capability(
+                "repository.get_changed_files",
+                changed_files_arguments,
+                "读取 Pull Request 变更文件",
             )
-        if self._last_tool(context, "repository.get_pr_diff") is None:
-            return self._tool("repository.get_pr_diff", {"pr_number": pr_number}, "读取 Pull Request Diff")
-        if self._last_tool(context, "repository.get_repo_tree") is None:
-            return self._tool(
+        diff_arguments = {"pr_number": pr_number}
+        if not capability_attempted(context, "repository.get_pr_diff", arguments=diff_arguments):
+            return self._capability("repository.get_pr_diff", diff_arguments, "读取 Pull Request Diff")
+        tree_arguments = {
+            "depth": 4,
+            "ref": self._head_ref(self._last_capability(context, "github.get_pr") or {}),
+        }
+        if not capability_attempted(context, "repository.get_repo_tree", arguments=tree_arguments):
+            return self._capability(
                 "repository.get_repo_tree",
-                {"depth": 4, "ref": self._head_ref(self._last_tool(context, "github.get_pr") or {})},
+                tree_arguments,
                 "读取 PR head 代码树",
             )
         readable = self._readable_changed_files(context)
-        if readable and self._last_tool(context, "repository.read_files") is None:
-            return self._tool(
+        read_arguments = {
+            "requests": [{"path": path, "limit": 180} for path in readable[:12]],
+            "ref": self._head_ref(self._last_capability(context, "github.get_pr") or {}),
+        }
+        if readable and not capability_attempted(context, "repository.read_files", arguments=read_arguments):
+            return self._capability(
                 "repository.read_files",
-                {
-                    "requests": [{"path": path, "limit": 180} for path in readable[:12]],
-                    "ref": self._head_ref(self._last_tool(context, "github.get_pr") or {}),
-                },
+                read_arguments,
                 "读取与本次变更相关的代码",
             )
-        if comments and self._last_tool(context, "github.get_pr_comments") is None:
-            return self._tool("github.get_pr_comments", {"pr_number": pr_number}, "读取 Pull Request 评论")
-        if reviews and self._last_tool(context, "github.get_pr_reviews") is None:
-            return self._tool("github.get_pr_reviews", {"pr_number": pr_number}, "读取 Pull Request Reviews")
-        if ci and self._last_tool(context, "github.get_workflow_runs") is None:
-            return self._tool("github.get_workflow_runs", {"pr_number": pr_number}, "读取 Pull Request CI 状态")
+        comments_arguments = {"pr_number": pr_number}
+        if comments and not capability_attempted(
+            context,
+            "github.get_pr_comments",
+            arguments=comments_arguments,
+        ):
+            return self._capability("github.get_pr_comments", comments_arguments, "读取 Pull Request 评论")
+        reviews_arguments = {"pr_number": pr_number}
+        if reviews and not capability_attempted(
+            context,
+            "github.get_pr_reviews",
+            arguments=reviews_arguments,
+        ):
+            return self._capability("github.get_pr_reviews", reviews_arguments, "读取 Pull Request Reviews")
+        ci_arguments = {"pr_number": pr_number}
+        if ci and not capability_attempted(
+            context,
+            "github.get_workflow_runs",
+            arguments=ci_arguments,
+        ):
+            return self._capability("github.get_workflow_runs", ci_arguments, "读取 Pull Request CI 状态")
         return None
 
     def _ci_evidence_step(self, context: AgentContext) -> AgentAction | None:
-        runs_result = self._last_tool(context, "github.get_workflow_runs")
+        run_arguments: dict[str, Any] = {}
+        if self._workflow_run_id(context) is not None:
+            run_arguments["workflow_run_id"] = self._workflow_run_id(context)
+        elif self._entity_number(context) is not None:
+            run_arguments["pr_number"] = self._entity_number(context)
+        if not capability_attempted(context, "github.get_workflow_runs", arguments=run_arguments):
+            return self._capability("github.get_workflow_runs", run_arguments, "读取 CI workflow runs")
+        runs_result = self._last_capability(context, "github.get_workflow_runs")
         if runs_result is None:
-            arguments: dict[str, Any] = {}
-            if self._workflow_run_id(context) is not None:
-                arguments["workflow_run_id"] = self._workflow_run_id(context)
-            elif self._entity_number(context) is not None:
-                arguments["pr_number"] = self._entity_number(context)
-            return self._tool("github.get_workflow_runs", arguments, "读取 CI workflow runs")
+            return None
         for run in self._current_workflow_runs(runs_result.get("runs", [])):
-            if self._failed(run) and not self._has_tool_arguments(context, "github.get_job_logs", run_id=int(run["id"])):
-                return self._tool(
+            if self._failed(run) and not self._has_capability_arguments(
+                context,
+                "github.get_job_logs",
+                run_id=int(run["id"]),
+            ):
+                return self._capability(
                     "github.get_job_logs",
                     {"run_id": int(run["id"])},
                     f"读取失败 workflow run #{run.get('id')} 的 job 日志",
@@ -566,14 +619,17 @@ class PullRequestAgent:
         pr_number = self._pr_number(context)
         if pr_number is None:
             return None
-        if self._last_tool(context, "github.get_pr") is None:
-            return self._tool("github.get_pr", {"pr_number": pr_number}, "读取 CI 对应的 Pull Request")
-        if self._last_tool(context, "repository.get_changed_files") is None:
-            return self._tool(
-                "repository.get_changed_files", {"pr_number": pr_number}, "读取 CI 对应的变更文件"
+        pr_arguments = {"pr_number": pr_number}
+        if not capability_attempted(context, "github.get_pr", arguments=pr_arguments):
+            return self._capability("github.get_pr", pr_arguments, "读取 CI 对应的 Pull Request")
+        if not capability_attempted(context, "repository.get_changed_files", arguments=pr_arguments):
+            return self._capability(
+                "repository.get_changed_files",
+                pr_arguments,
+                "读取 CI 对应的变更文件",
             )
-        if self._last_tool(context, "repository.get_pr_diff") is None:
-            return self._tool("repository.get_pr_diff", {"pr_number": pr_number}, "读取 CI 对应的 Diff")
+        if not capability_attempted(context, "repository.get_pr_diff", arguments=pr_arguments):
+            return self._capability("repository.get_pr_diff", pr_arguments, "读取 CI 对应的 Diff")
         return self._pr_code_evidence_step(context)
 
     def _ensure_explanation(self, context: AgentContext) -> CodeExplanationResult:
@@ -622,7 +678,7 @@ class PullRequestAgent:
         self._record_coding(context, "plan", result)
         return result
 
-    def _ensure_candidate(self, context: AgentContext, pull_request: dict[str, Any]) -> str:
+    def _ensure_candidate(self, context: AgentContext, pull_request: dict[str, Any]) -> str | AgentAction:
         if context.code_candidate is not None:
             return ""
         plan = self._ensure_plan(context)
@@ -643,6 +699,11 @@ class PullRequestAgent:
             session_id=context.session_id,
             guidance=context.guidance,
         )
+        if record_candidate_capability_error(context, prepared):
+            return AgentAction(
+                AgentActionKind.CONTINUE,
+                summary="Coding capability 失败，重新评估下一步",
+            )
         if prepared.candidate is None:
             return prepared.message
         candidate = prepared.candidate
@@ -659,8 +720,8 @@ class PullRequestAgent:
         return ""
 
     def _build_review_dialogue(self, context: AgentContext) -> dict[str, list[str] | str]:
-        reviews = (self._last_tool(context, "github.get_pr_reviews") or {}).get("reviews", [])
-        comments = (self._last_tool(context, "github.get_pr_comments") or {}).get("comments", [])
+        reviews = (self._last_capability(context, "github.get_pr_reviews") or {}).get("reviews", [])
+        comments = (self._last_capability(context, "github.get_pr_comments") or {}).get("comments", [])
         evidence = {"reviews": reviews, "comments": comments, **self._code_evidence(context)}
         if self.reasoner is not None:
             value = self.reasoner.complete_structured(
@@ -743,11 +804,11 @@ class PullRequestAgent:
         }
 
     def _assess_merge_readiness(self, context: AgentContext, review: CodeReviewResult) -> dict[str, Any]:
-        pull_request = self._last_tool(context, "github.get_pr") or {}
-        reviews = (self._last_tool(context, "github.get_pr_reviews") or {}).get("reviews", [])
+        pull_request = self._last_capability(context, "github.get_pr") or {}
+        reviews = (self._last_capability(context, "github.get_pr_reviews") or {}).get("reviews", [])
         review_events = effective_review_events(reviews)
         runs = self._current_workflow_runs(
-            (self._last_tool(context, "github.get_workflow_runs") or {}).get("runs", [])
+            (self._last_capability(context, "github.get_workflow_runs") or {}).get("runs", [])
         )
         satisfied: list[str] = []
         blockers: list[str] = []
@@ -790,23 +851,23 @@ class PullRequestAgent:
         return {"status": status, "satisfied": satisfied, "blockers": blockers, "remaining": remaining}
 
     def _code_evidence(self, context: AgentContext) -> dict[str, Any]:
-        pull_request = self._last_tool(context, "github.get_pr") or {}
+        pull_request = self._last_capability(context, "github.get_pr") or {}
         return {
             "change_goal": {
                 "title": str(pull_request.get("title") or "")[:500],
                 "body": str(pull_request.get("body") or "")[:4000],
             },
             "changed_files": self._changed_files(context)[:300],
-            "diff": str((self._last_tool(context, "repository.get_pr_diff") or {}).get("diff", ""))[:160_000],
-            "files": list((self._last_tool(context, "repository.read_files") or {}).get("files", [])),
+            "diff": str((self._last_capability(context, "repository.get_pr_diff") or {}).get("diff", ""))[:160_000],
+            "files": list((self._last_capability(context, "repository.read_files") or {}).get("files", [])),
         }
 
     def _ci_evidence(self, context: AgentContext) -> dict[str, Any]:
         return {
             "workflow_runs": self._current_workflow_runs(
-                (self._last_tool(context, "github.get_workflow_runs") or {}).get("runs", [])
+                (self._last_capability(context, "github.get_workflow_runs") or {}).get("runs", [])
             ),
-            "job_logs": self._tool_results(context, "github.get_job_logs"),
+            "job_logs": self._capability_results(context, "github.get_job_logs"),
             **self._code_evidence(context),
         }
 
@@ -1019,8 +1080,13 @@ class PullRequestAgent:
         return "\n".join(f"- {item}" for item in items) or "- 无"
 
     @staticmethod
-    def _tool(tool: str, arguments: dict[str, Any], summary: str) -> AgentAction:
-        return AgentAction(AgentActionKind.TOOL, tool=tool, arguments=arguments, summary=summary)
+    def _capability(capability_id: str, arguments: dict[str, Any], summary: str) -> AgentAction:
+        return AgentAction(
+            AgentActionKind.CAPABILITY,
+            capability_id=capability_id,
+            arguments=arguments,
+            summary=summary,
+        )
 
     @staticmethod
     def _failed(run: dict[str, Any]) -> bool:
@@ -1070,7 +1136,7 @@ class PullRequestAgent:
         direct = self._entity_number(context)
         if direct is not None:
             return direct
-        runs = (self._last_tool(context, "github.get_workflow_runs") or {}).get("runs", [])
+        runs = (self._last_capability(context, "github.get_workflow_runs") or {}).get("runs", [])
         if not runs:
             return None
         run = runs[0]
@@ -1087,46 +1153,46 @@ class PullRequestAgent:
             raise WorkflowError("Pull Request operation requires a PR number")
         return number
 
-    def _pr_not_found(self, context: AgentContext) -> bool:
-        number = self._pr_number(context)
-        return (
-            number is not None
-            and self._has_tool_arguments(context, "github.get_pr", pr_number=number)
-            and self._last_tool(context, "github.get_pr") is None
-        )
-
     def _changed_files(self, context: AgentContext) -> list[str]:
-        return [str(path) for path in (self._last_tool(context, "repository.get_changed_files") or {}).get("files", [])]
+        return [str(path) for path in (self._last_capability(context, "repository.get_changed_files") or {}).get("files", [])]
 
     def _readable_changed_files(self, context: AgentContext) -> list[str]:
-        entries = {str(path) for path in (self._last_tool(context, "repository.get_repo_tree") or {}).get("entries", [])}
+        entries = {str(path) for path in (self._last_capability(context, "repository.get_repo_tree") or {}).get("entries", [])}
         return [path for path in self._changed_files(context) if path in entries]
 
     @staticmethod
-    def _last_tool(context: AgentContext, tool: str) -> Any:
+    def _last_capability(context: AgentContext, capability_id: str) -> Any:
         for observation in reversed(context.observations):
-            if observation.get("kind") == "tool" and (observation.get("payload") or {}).get("tool") == tool:
+            if (
+                observation.get("kind") == "capability"
+                and (observation.get("payload") or {}).get("capability_id") == capability_id
+            ):
                 return (observation.get("payload") or {}).get("data")
         return None
 
     @staticmethod
-    def _tool_results(context: AgentContext, tool: str) -> list[dict[str, Any]]:
+    def _capability_results(context: AgentContext, capability_id: str) -> list[dict[str, Any]]:
         return [
             dict((observation.get("payload") or {}).get("data") or {})
             for observation in context.observations
-            if observation.get("kind") == "tool" and (observation.get("payload") or {}).get("tool") == tool
+            if observation.get("kind") == "capability"
+            and (observation.get("payload") or {}).get("capability_id") == capability_id
         ]
 
     @staticmethod
-    def _has_tool_arguments(context: AgentContext, tool: str, **arguments: Any) -> bool:
+    def _has_capability_arguments(
+        context: AgentContext,
+        capability_id: str,
+        **arguments: Any,
+    ) -> bool:
         for observation in context.observations:
-            if observation.get("kind") != "tool":
+            if observation.get("kind") not in {"capability", "capability_error"}:
                 continue
             payload = observation.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
             observed = payload.get("arguments") or {}
-            if payload.get("tool") == tool and all(
+            if payload.get("capability_id") == capability_id and all(
                 observed.get(key) == value for key, value in arguments.items()
             ):
                 return True
@@ -1134,8 +1200,8 @@ class PullRequestAgent:
 
     @staticmethod
     def _last_write(context: AgentContext) -> dict[str, Any] | None:
-        for tool in ("github.merge", "github.commit", "github.post_review"):
-            result = PullRequestAgent._last_tool(context, tool)
+        for capability_id in ("github.merge", "github.commit", "github.post_review"):
+            result = PullRequestAgent._last_capability(context, capability_id)
             if result is not None:
                 return dict(result)
         return None

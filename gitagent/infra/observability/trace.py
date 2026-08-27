@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from threading import Lock
 from typing import Any
@@ -12,7 +12,7 @@ from typing import Any
 
 class TraceCategory(str, Enum):
     AGENT = "agent"
-    TOOL_USE = "tool_use"
+    CAPABILITY = "capability"
     WORKFLOW = "workflow"
 
 
@@ -66,7 +66,7 @@ class TraceBus:
         duration_ms: float | None = None,
     ) -> TraceEvent:
         event = TraceEvent(
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=datetime.now(UTC).isoformat(),
             session_id=session_id,
             category=category,
             name=name,
@@ -100,7 +100,7 @@ class TraceBus:
             event
             for event in events
             if (event.category == TraceCategory.AGENT and event.name == agent)
-            or (event.category == TraceCategory.TOOL_USE and event.details.get("agent") == agent)
+            or (event.category == TraceCategory.CAPABILITY and event.details.get("agent") == agent)
             or (event.category == TraceCategory.WORKFLOW and event.details.get("agent") == agent)
         ]
 

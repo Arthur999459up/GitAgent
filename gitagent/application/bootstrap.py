@@ -11,6 +11,7 @@ from typing import Any
 from gitagent.domain.errors import StateError, ValidationError
 from gitagent.domain.models import SessionScope
 from gitagent.harness.context import CompactResult, ContextBuilder
+from gitagent.infra.github import GitHubClient
 from gitagent.infra.observability import TraceBus
 from gitagent.infra.persistence import (
     MemoryRecord,
@@ -21,9 +22,10 @@ from gitagent.infra.persistence import (
     build_repository_key,
     merge_working_state,
 )
-from gitagent.infra.tool_hosts import GitHubMCPServer
 from gitagent.model import ChatClient, LiteLLMChatClient, LLMReasoner, OpenAIChatClient
 from gitagent.prompts import get_prompt_library
+
+from .capabilities import build_capability_layer
 from .config import CLIConfig
 from .projection import project_output, project_service_result
 from .service import GitAgentService
@@ -33,7 +35,7 @@ Renderer = Callable[[Any], None]
 @dataclass
 class LiveApplication:
     config: CLIConfig
-    github: GitHubMCPServer
+    github: GitHubClient
     llm: ChatClient
     reasoner: LLMReasoner
     trace: TraceBus
@@ -279,7 +281,7 @@ class LiveApplication:
         if self._service_factory is not None:
             return self._service_factory(scope)
         return GitAgentService(
-            self.github,
+            build_capability_layer(self.github, trace=self.trace, reasoner=self.reasoner),
             main_reasoner=self.reasoner,
             agent_reasoner=self.reasoner,
             session_manager=self.sessions,
@@ -360,7 +362,7 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
     )
     reasoner = LLMReasoner(llm)
     trace = TraceBus()
-    server = GitHubMCPServer(
+    github = GitHubClient(
         token=config.github_token,
         api_url=config.github_api_url,
         timeout=config.effective_github_timeout,
@@ -374,7 +376,7 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         safety_tokens=config.context_safety_tokens,
     )
     stateless_service = GitAgentService(
-        server,
+        build_capability_layer(github, trace=trace, reasoner=reasoner),
         main_reasoner=reasoner,
         agent_reasoner=reasoner,
         session_manager=sessions,
@@ -383,7 +385,7 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
     )
     return LiveApplication(
         config=config,
-        github=server,
+        github=github,
         llm=llm,
         reasoner=reasoner,
         trace=trace,

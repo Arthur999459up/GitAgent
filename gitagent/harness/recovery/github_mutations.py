@@ -8,7 +8,7 @@ from gitagent.domain.models import (
     CandidatePatch,
     ChangeRequest,
     HumanReviewPackage,
-    PlannedToolCall,
+    PlannedCapabilityCall,
     VerificationReport,
 )
 from gitagent.harness.execution import AgentHarness
@@ -20,24 +20,8 @@ GITHUB_MUTATOR_SPEC = AgentSpec(
     name="github_mutator",
     role="Execute only an exact, already-approved GitHub mutation plan.",
     system_prompt=_PROMPTS.text("system.github_mutator"),
-    allowed_tools=frozenset(
-        {
-            "github.post_comment",
-            "github.create_issue",
-            "github.update_issue",
-            "github.set_issue_lock",
-            "github.update_pr",
-            "github.create_branch",
-            "github.commit",
-            "github.commit_to_default_branch",
-            "github.push",
-            "github.create_draft_pr",
-            "github.post_review",
-            "github.merge",
-        }
-    ),
     output_schema=(),
-    capabilities=frozenset({"github_mutation"}),
+    routes=frozenset({"github_mutation"}),
 )
 
 
@@ -50,30 +34,28 @@ def issue_fix_mutation_plan(
     request: ChangeRequest,
     candidate: CandidatePatch,
     review: HumanReviewPackage,
-) -> list[PlannedToolCall]:
+) -> list[PlannedCapabilityCall]:
     """Build the fixed mutation plan for applying a verified code change."""
     suffix = session_id.removeprefix("session-")[:32]
     branch = f"gitagent/{suffix}"
     return [
-        PlannedToolCall(
+        PlannedCapabilityCall(
             "github.create_branch",
-            {"repository": request.repository, "base": request.base_branch, "branch": branch},
+            {"base": request.base_branch, "branch": branch},
         ),
-        PlannedToolCall(
+        PlannedCapabilityCall(
             "github.commit",
             {
-                "repository": request.repository,
                 "branch": branch,
                 "files": candidate.files,
                 "deleted_files": candidate.deleted_files,
                 "message": candidate.summary,
             },
         ),
-        PlannedToolCall("github.push", {"repository": request.repository, "branch": branch}),
-        PlannedToolCall(
+        PlannedCapabilityCall("github.push", {"branch": branch}),
+        PlannedCapabilityCall(
             "github.create_draft_pr",
             {
-                "repository": request.repository,
                 "title": review.suggested_pr_title,
                 "body": review.suggested_pr_description,
                 "base": request.base_branch,
@@ -87,15 +69,14 @@ def issue_fix_mutation_plan(
 def repository_change_mutation_plan(
     request: ChangeRequest,
     candidate: CandidatePatch,
-) -> list[PlannedToolCall]:
+) -> list[PlannedCapabilityCall]:
     """Build one atomic default-branch commit for a RepositoryAgent change."""
     if not request.source_ref:
         raise WorkflowError("repository change requires the reviewed default-branch head SHA")
     return [
-        PlannedToolCall(
+        PlannedCapabilityCall(
             "github.commit_to_default_branch",
             {
-                "repository": request.repository,
                 "expected_head_sha": request.source_ref,
                 "files": candidate.files,
                 "deleted_files": candidate.deleted_files,

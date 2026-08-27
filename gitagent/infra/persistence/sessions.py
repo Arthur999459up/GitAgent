@@ -7,12 +7,13 @@ import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from gitagent.domain.errors import StateError, ValidationError
 from gitagent.domain.models import SessionScope
+
 from .store import StateStore
 
 USER_MEMORY_LIMIT = 16
@@ -965,10 +966,10 @@ def _require_positive_integer(value: Any, label: str) -> int:
 def _require_utc_timestamp(value: Any, label: str) -> str:
     timestamp = _require_string(value, label, allow_empty=False)
     try:
-        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))  # noqa: FURB162
     except ValueError as exc:
         raise ValidationError(f"{label} must be an ISO-8601 UTC timestamp") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
         raise ValidationError(f"{label} must be an ISO-8601 UTC timestamp")
     return timestamp
 
@@ -1015,7 +1016,7 @@ def _normalize_whitespace(value: str) -> str:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _default_title() -> str:

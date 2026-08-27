@@ -7,7 +7,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from gitagent.agent_loop import AgentLoop
-from gitagent.agents import CodingAgent, IssueAgent, MainAgent, PullRequestAgent, RepositoryAgent
+from gitagent.agents import (
+    CodingAgent,
+    IssueAgent,
+    MainAgent,
+    PullRequestAgent,
+    RepositoryAgent,
+)
+from gitagent.capability import CapabilityLayer
 from gitagent.domain.errors import RoutingError
 from gitagent.domain.models import (
     AgentGuidance,
@@ -17,7 +24,7 @@ from gitagent.domain.models import (
     ContextMemory,
     DraftResult,
     MainDecision,
-    PlannedToolCall,
+    PlannedCapabilityCall,
     PullRequestOperation,
     Replacement,
     RepositoryOperation,
@@ -32,13 +39,13 @@ from gitagent.domain.models import (
 )
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
+from gitagent.harness.file_reads import FileReadLedger
 from gitagent.harness.recovery import register_github_mutator
-from gitagent.harness.tools import FileReadLedger
 from gitagent.harness.validation.static import StaticVerifier
 from gitagent.infra.observability import TraceBus
 from gitagent.infra.persistence import SessionManager
-from gitagent.infra.tool_hosts import MCPServer
 from gitagent.model import Reasoner
+
 from .approval_intent import ApprovalIntentClassifier
 
 
@@ -57,7 +64,7 @@ class GitAgentService:
 
     def __init__(
         self,
-        server: MCPServer,
+        capabilities: CapabilityLayer,
         *,
         main_reasoner: Reasoner,
         agent_reasoner: Reasoner | None = None,
@@ -66,7 +73,7 @@ class GitAgentService:
         session_scope: SessionScope | None = None,
         input_budget_tokens: int = 26_112,
     ) -> None:
-        self.harness = AgentHarness(server, trace=trace, context_budget=input_budget_tokens)
+        self.harness = AgentHarness(capabilities, trace=trace, context_budget=input_budget_tokens)
         register_github_mutator(self.harness)
         self.coding = CodingAgent(self.harness, agent_reasoner)
         self.verifier = StaticVerifier(self.harness)
@@ -366,7 +373,7 @@ class GitAgentService:
             pending is None
             or context.operation != PullRequestOperation.POST_REVIEW.value
             or len(pending.calls) != 1
-            or pending.calls[0].tool != "github.post_review"
+            or pending.calls[0].capability_id != "github.post_review"
         ):
             raise RoutingError("当前 Pull Request 提案不是可修改的 Review 正文")
         call = pending.calls[0]
@@ -382,7 +389,7 @@ class GitAgentService:
         self.loop.restore_pending(
             context,
             summary=pending.summary,
-            calls=[PlannedToolCall(call.tool, arguments)],
+            calls=[PlannedCapabilityCall(call.capability_id, arguments)],
         )
         self._save_context(context)
         return context
@@ -471,7 +478,13 @@ class GitAgentService:
         if context.pending is not None:
             pending = {
                 "summary": context.pending.summary,
-                "calls": [{"tool": call.tool, "arguments": to_plain(call.arguments)} for call in context.pending.calls],
+                "calls": [
+                    {
+                        "capability_id": call.capability_id,
+                        "arguments": to_plain(call.arguments),
+                    }
+                    for call in context.pending.calls
+                ],
             }
         return {
             "agent": context.agent,
@@ -537,11 +550,15 @@ class GitAgentService:
             if context.finished or context.error:
                 raise RoutingError("stored Session agent context cannot be terminal and pending")
             calls = [
-                PlannedToolCall(str(item["tool"]), dict(item.get("arguments") or {}))
+                PlannedCapabilityCall(
+                    str(item["capability_id"]),
+                    dict(item.get("arguments") or {}),
+                )
                 for item in pending.get("calls", [])
             ]
             if agent == "repository" and (
-                len(calls) != 1 or calls[0].tool != "github.commit_to_default_branch"
+                len(calls) != 1
+                or calls[0].capability_id != "github.commit_to_default_branch"
             ):
                 raise RoutingError("stored RepositoryAgent proposal uses an obsolete mutation strategy")
             if any(
@@ -637,7 +654,7 @@ class GitAgentService:
             "state": "awaiting_approval" if context.pending is not None else "active",
             "proposal_summary": context.pending.summary if context.pending is not None else "",
             "mutation_plan": [
-                {"tool": call.tool, "arguments": call.arguments}
+                {"capability_id": call.capability_id, "arguments": call.arguments}
                 for call in (context.pending.calls if context.pending is not None else [])
             ],
         }

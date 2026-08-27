@@ -12,11 +12,14 @@ AGENT_ACTION_SCHEMA = {
     "properties": {
         "kind": {
             "type": "string",
-            "enum": ["tool", "apply_issue_fix", "ask", "finish"],
+            "enum": ["capability", "apply_issue_fix", "ask", "finish"],
         },
         "summary": {"type": "string", "description": "One-line user-facing explanation of the next action."},
-        "tool": {"type": "string", "description": "The registered tool name when kind is tool."},
-        "arguments": {"type": "object", "description": "Tool arguments when kind is tool."},
+        "capability_id": {
+            "type": "string",
+            "description": "The discovered capability ID when kind is capability.",
+        },
+        "arguments": {"type": "object", "description": "Capability arguments when kind is capability."},
         "question": {"type": "string", "description": "The question to ask the user when kind is ask."},
         "message": {"type": "string", "description": "One-line result message when kind is finish."},
     },
@@ -33,13 +36,13 @@ def parse_action(value: Any, *, requires_candidate: bool) -> AgentAction:
     except ValueError as exc:
         raise ValidationError("agent decide returned an invalid action kind") from exc
     action = AgentAction(kind=kind, summary=str(value.get("summary", ""))[:500])
-    if kind == AgentActionKind.TOOL:
-        action.tool = str(value.get("tool", "")).strip()
-        if not action.tool:
-            raise ValidationError("tool action requires a tool name")
+    if kind == AgentActionKind.CAPABILITY:
+        action.capability_id = str(value.get("capability_id", "")).strip()
+        if not action.capability_id:
+            raise ValidationError("capability action requires a capability ID")
         arguments = value.get("arguments")
         if arguments is not None and not isinstance(arguments, dict):
-            raise ValidationError("tool arguments must be an object")
+            raise ValidationError("capability arguments must be an object")
         action.arguments = dict(arguments or {})
     elif kind == AgentActionKind.ASK:
         action.question = str(value.get("question", "")).strip()
@@ -49,5 +52,5 @@ def parse_action(value: Any, *, requires_candidate: bool) -> AgentAction:
         if not requires_candidate:
             raise ValidationError("apply_issue_fix is not allowed for this agent")
     elif kind == AgentActionKind.FINISH:
-        action.message = str(value.get("message", "")).strip()
+        action.message = str(value.get("message") or action.summary).strip()
     return action

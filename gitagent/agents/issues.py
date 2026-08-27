@@ -6,7 +6,6 @@ import json
 from typing import Any
 
 from gitagent.agent_loop import AgentAction, AgentActionKind, rejection_feedback
-from gitagent.harness.context import render_context_observations
 from gitagent.domain.errors import LLMProviderError, ValidationError, WorkflowError
 from gitagent.domain.models import (
     AgentSpec,
@@ -18,6 +17,11 @@ from gitagent.domain.models import (
     Replacement,
     Route,
 )
+from gitagent.harness.context import (
+    capability_attempted,
+    capability_failure_observed,
+    render_context_observations,
+)
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.recovery.github_mutations import code_change_review_package
@@ -25,7 +29,12 @@ from gitagent.harness.validation.static import StaticVerifier
 from gitagent.infra.observability.trace import TraceCategory, TraceStatus
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
-from .coding import CodingAgent, prepare_verified_candidate
+
+from .coding import (
+    CodingAgent,
+    prepare_verified_candidate,
+    record_candidate_capability_error,
+)
 from .decide import AGENT_ACTION_SCHEMA, parse_action
 from .guidance import guidance_section
 
@@ -52,26 +61,8 @@ ISSUE_AGENT_SPEC = AgentSpec(
         "Every GitHub write is proposed to the loop and requires explicit user approval before execution."
     ),
     system_prompt=_PROMPTS.text("system.issues"),
-    allowed_tools=frozenset(
-        {
-            "github.list_issues",
-            "github.get_issue",
-            "github.get_issue_comments",
-            "github.list_milestones",
-            "github.post_comment",
-            "github.create_issue",
-            "github.update_issue",
-            "github.set_issue_lock",
-            "repository.get_repo_tree",
-            "repository.search_code",
-            "repository.read_file",
-            "repository.read_files",
-            "repository.find_symbol",
-            "repository.find_references",
-        }
-    ),
     output_schema=("action", "operation", "answer", "issues", "issue_number", "question"),
-    capabilities=frozenset({Route.ISSUE}),
+    routes=frozenset({Route.ISSUE}),
     required_context=("repository",),
     routing_examples=(
         "看看有哪些 Issues",
@@ -103,9 +94,11 @@ class IssueAgent:
         harness.register(ISSUE_AGENT_SPEC)
 
     def decide(self, context: AgentContext) -> AgentAction:
+        if self.reasoner is not None and capability_failure_observed(context):
+            return self._llm_decide(context)
         if context.reply_draft is not None:
             return self._publish_draft_decide(context)
-        draft_pr = self._last_tool(context, "github.create_draft_pr")
+        draft_pr = self._last_capability(context, "github.create_draft_pr")
         if draft_pr is not None:
             issue_number = self._entity_number(context)
             if issue_number is not None and context.code_candidate is not None and context.verification is not None:
@@ -140,7 +133,7 @@ class IssueAgent:
         return self._fallback_decide(context)
 
     def build_result(self, context: AgentContext) -> IssueAgentResult:
-        draft_pr = self._last_tool(context, "github.create_draft_pr")
+        draft_pr = self._last_capability(context, "github.create_draft_pr")
         issue_number = self._entity_number(context)
         if draft_pr is not None:
             return IssueAgentResult(
@@ -150,16 +143,16 @@ class IssueAgent:
                 issues=[],
                 issue_number=issue_number,
             )
-        latest_mutation = self._last_tool_name(
+        latest_mutation = self._last_capability_id(
             context,
             {"github.create_issue", "github.update_issue", "github.set_issue_lock"},
         )
         if latest_mutation is not None:
             return self._mutation_result(context, latest_mutation, issue_number)
-        posted = self._last_tool(context, "github.post_comment")
-        raw_issues = self._last_tool(context, "github.list_issues")
-        issue = self._last_tool(context, "github.get_issue")
-        latest_view = self._last_tool_name(
+        posted = self._last_capability(context, "github.post_comment")
+        raw_issues = self._last_capability(context, "github.list_issues")
+        issue = self._last_capability(context, "github.get_issue")
+        latest_view = self._last_capability_id(
             context,
             {"github.post_comment", "github.list_issues", "github.get_issue", "github.get_issue_comments"},
         )
@@ -173,7 +166,7 @@ class IssueAgent:
                 issue_number=issue_number,
             )
         if latest_view in {"github.get_issue", "github.get_issue_comments"} and issue is not None:
-            comments = (self._last_tool(context, "github.get_issue_comments") or {}).get("comments", [])
+            comments = (self._last_capability(context, "github.get_issue_comments") or {}).get("comments", [])
             return IssueAgentResult(
                 action=DomainAction.ANSWER,
                 operation=IssueOperation.GET,
@@ -190,7 +183,7 @@ class IssueAgent:
                 issues=issues,
             )
         if issue is not None:
-            comments = (self._last_tool(context, "github.get_issue_comments") or {}).get("comments", [])
+            comments = (self._last_capability(context, "github.get_issue_comments") or {}).get("comments", [])
             return IssueAgentResult(
                 action=DomainAction.ANSWER,
                 operation=IssueOperation.GET,
@@ -207,7 +200,7 @@ class IssueAgent:
         )
 
     def draft_reply(self, context: AgentContext, reasoner: Reasoner) -> str:
-        if self._last_tool(context, "github.get_issue") is None:
+        if self._last_capability(context, "github.get_issue") is None:
             raise WorkflowError("reply drafting requires Issue evidence")
         return self._draft_reply(context, reasoner)
 
@@ -215,8 +208,8 @@ class IssueAgent:
         issue_number = self._entity_number(context)
         if issue_number is None:
             return AgentAction(AgentActionKind.ASK, question="发布回复前需要明确的 Issue 编号。")
-        if self._last_tool(context, "github.post_comment") is not None:
-            draft_pr = self._last_tool(context, "github.create_draft_pr")
+        if self._last_capability(context, "github.post_comment") is not None:
+            draft_pr = self._last_capability(context, "github.create_draft_pr")
             if draft_pr is not None:
                 return AgentAction(
                     AgentActionKind.FINISH,
@@ -231,15 +224,15 @@ class IssueAgent:
                 summary="Issue 回复已发布",
                 message=f"已发布回复到 Issue #{issue_number}。",
             )
-        draft_pr = self._last_tool(context, "github.create_draft_pr")
+        draft_pr = self._last_capability(context, "github.create_draft_pr")
         summary = (
             f"在 Issue #{issue_number} 发布 Draft PR 修改报告"
             if draft_pr is not None
             else f"在 Issue #{issue_number} 发布已确认的回复草稿"
         )
         return AgentAction(
-            AgentActionKind.TOOL,
-            tool="github.post_comment",
+            AgentActionKind.CAPABILITY,
+            capability_id="github.post_comment",
             arguments={"issue_number": issue_number, "body": context.reply_draft},
             summary=summary,
         )
@@ -281,7 +274,6 @@ class IssueAgent:
         )
 
     def _llm_decide(self, context: AgentContext) -> AgentAction:
-        allowed_tools = self.harness.spec("issues").allowed_tools
         value = self.reasoner.complete_structured(
             system=context.system_prompt,
             prompt=_PROMPTS.render(
@@ -295,10 +287,13 @@ class IssueAgent:
             ),
             schema=_ISSUE_ACTION_SCHEMA,
             tool_name="decide_action",
-            tools=self.harness.client.llm_tools(allowed_tools),
+            tools=self.harness.llm_tools(context),
         )
-        if value.get("kind") == "tool":
-            value["tool"] = self.harness.client.resolve_llm_tool_name(str(value.get("tool", "")), allowed_tools)
+        if value.get("kind") == "capability":
+            value["capability_id"] = self.harness.resolve_llm_name(
+                str(value.get("capability_id", "")),
+                context,
+            )
         if bool(value.get("awaiting_user_confirmation")):
             question = str(value.get("question") or value.get("message") or "").strip()
             if not question:
@@ -317,14 +312,16 @@ class IssueAgent:
         if value.get("kind") == AgentActionKind.APPLY_ISSUE_FIX.value:
             if context.code_candidate is None:
                 try:
-                    message = self._prepare_code_change(context)
+                    preparation = self._prepare_code_change(context)
                 except (LLMProviderError, ValidationError) as exc:
                     raise WorkflowError(f"code candidate preparation failed: {exc}") from exc
-                if message:
+                if isinstance(preparation, AgentAction):
+                    return preparation
+                if preparation:
                     return AgentAction(
                         AgentActionKind.FINISH,
                         summary="模型未生成文件内容",
-                        message=message,
+                        message=preparation,
                     )
             return AgentAction(
                 AgentActionKind.APPLY_ISSUE_FIX,
@@ -335,11 +332,16 @@ class IssueAgent:
 
     def _required_entity_evidence(self, context: AgentContext) -> AgentAction | None:
         issue_number = self._entity_number(context)
-        if issue_number is not None and self._last_tool(context, "github.get_issue") is None:
+        arguments = {"issue_number": issue_number} if issue_number is not None else None
+        if issue_number is not None and not capability_attempted(
+            context,
+            "github.get_issue",
+            arguments=arguments,
+        ):
             return AgentAction(
-                AgentActionKind.TOOL,
-                tool="github.get_issue",
-                arguments={"issue_number": issue_number},
+                AgentActionKind.CAPABILITY,
+                capability_id="github.get_issue",
+                arguments=arguments,
                 summary="读取 Issue",
             )
         return None
@@ -347,18 +349,18 @@ class IssueAgent:
     def _fallback_decide(self, context: AgentContext) -> AgentAction:
         issue_number = self._entity_number(context)
         if issue_number is not None:
-            if self._last_tool(context, "github.get_issue") is None:
+            if self._last_capability(context, "github.get_issue") is None:
                 return AgentAction(
-                    AgentActionKind.TOOL,
-                    tool="github.get_issue",
+                    AgentActionKind.CAPABILITY,
+                    capability_id="github.get_issue",
                     arguments={"issue_number": issue_number},
                     summary="读取 Issue",
                 )
             return AgentAction(AgentActionKind.FINISH, summary="Issue 已读取", message="")
-        if self._last_tool(context, "github.list_issues") is None:
+        if self._last_capability(context, "github.list_issues") is None:
             return AgentAction(
-                AgentActionKind.TOOL,
-                tool="github.list_issues",
+                AgentActionKind.CAPABILITY,
+                capability_id="github.list_issues",
                 arguments={"state": "open", "labels": [], "limit": 20},
                 summary="列出 Issues",
             )
@@ -390,8 +392,10 @@ class IssueAgent:
             repository_evidence = [
                 observation["payload"]
                 for observation in context.observations
-                if observation.get("kind") == "tool"
-                and str((observation.get("payload") or {}).get("tool") or "").startswith("repository.")
+                if observation.get("kind") == "capability"
+                and str((observation.get("payload") or {}).get("capability_id") or "").startswith(
+                    "repository."
+                )
             ][-12:]
             evidence = {
                 "issue": self._bounded_issue(issue),
@@ -450,8 +454,8 @@ class IssueAgent:
             suggested_title=raw.get("suggested_title"),
         )
 
-    def _prepare_code_change(self, context: AgentContext) -> str:
-        issue = self._last_tool(context, "github.get_issue")
+    def _prepare_code_change(self, context: AgentContext) -> str | AgentAction:
+        issue = self._last_capability(context, "github.get_issue")
         if issue is None:
             raise WorkflowError("code repair requires Issue evidence")
         request = self._change_request(context, issue)
@@ -462,6 +466,11 @@ class IssueAgent:
             session_id=context.session_id,
             guidance=context.guidance,
         )
+        if record_candidate_capability_error(context, prepared):
+            return AgentAction(
+                AgentActionKind.CONTINUE,
+                summary="Coding capability 失败，重新评估下一步",
+            )
         if prepared.candidate is None:
             return prepared.message
         candidate = prepared.candidate
@@ -502,33 +511,40 @@ class IssueAgent:
         return int(context.entity_id)
 
     @staticmethod
-    def _last_tool(context: AgentContext, tool: str) -> Any:
+    def _last_capability(context: AgentContext, capability_id: str) -> Any:
         for observation in reversed(context.observations):
-            if observation["kind"] == "tool" and observation["payload"].get("tool") == tool:
+            if (
+                observation["kind"] == "capability"
+                and observation["payload"].get("capability_id") == capability_id
+            ):
                 return observation["payload"].get("data")
         return None
 
     @staticmethod
-    def _last_tool_name(context: AgentContext, tools: set[str]) -> str | None:
+    def _last_capability_id(context: AgentContext, capability_ids: set[str]) -> str | None:
         for observation in reversed(context.observations):
-            if observation["kind"] != "tool":
+            if observation["kind"] != "capability":
                 continue
-            tool = str(observation["payload"].get("tool") or "")
-            if tool in tools:
-                return tool
+            capability_id = str(observation["payload"].get("capability_id") or "")
+            if capability_id in capability_ids:
+                return capability_id
         return None
 
     def _mutation_result(
         self,
         context: AgentContext,
-        tool: str,
+        capability_id: str,
         fallback_number: int | None,
     ) -> IssueAgentResult:
-        data = self._last_tool(context, tool) or {}
+        data = self._last_capability(context, capability_id) or {}
         issue = data
-        operation = IssueOperation.CREATE if tool == "github.create_issue" else IssueOperation.UPDATE
-        if tool == "github.set_issue_lock":
-            issue = {**(self._last_tool(context, "github.get_issue") or {}), **data}
+        operation = (
+            IssueOperation.CREATE
+            if capability_id == "github.create_issue"
+            else IssueOperation.UPDATE
+        )
+        if capability_id == "github.set_issue_lock":
+            issue = {**(self._last_capability(context, "github.get_issue") or {}), **data}
             verb = "锁定" if data.get("locked") else "解锁"
             fallback_answer = f"Issue 讨论已{verb}。"
         else:
@@ -539,7 +555,7 @@ class IssueAgent:
         if issue_number is not None:
             fallback_answer = (
                 f"已{verb} Issue #{issue_number} 的讨论。"
-                if tool == "github.set_issue_lock"
+                if capability_id == "github.set_issue_lock"
                 else f"已{verb} Issue #{issue_number}。"
             )
         return IssueAgentResult(

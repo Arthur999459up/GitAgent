@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from gitagent.infra.persistence import TurnRecord
+
 from .budget import estimate_tokens
 
 SUMMARY_TOKEN_LIMIT = 1500

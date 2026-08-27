@@ -31,7 +31,7 @@ _PANEL_STYLES = {
 
 _TRACE_LABELS = {
     TraceCategory.AGENT: ("Agent", "cyan"),
-    TraceCategory.TOOL_USE: ("Tool", "magenta"),
+    TraceCategory.CAPABILITY: ("Capability", "magenta"),
     TraceCategory.WORKFLOW: ("Flow", "yellow"),
 }
 
@@ -126,12 +126,16 @@ class TerminalUI:
             return
         if event.status == TraceStatus.PROGRESS and not event.message:
             return
+        if event.category == TraceCategory.CAPABILITY:
+            capability_event = str(event.details.get("event") or "")
+            if capability_event and capability_event not in {"call.started", "call.failed"}:
+                return
 
         symbol, status_style = _STATUS_STYLES[event.status]
         if event.status == TraceStatus.STARTED:
             symbol = {
                 TraceCategory.AGENT: "◇",
-                TraceCategory.TOOL_USE: "↳",
+                TraceCategory.CAPABILITY: "↳",
                 TraceCategory.WORKFLOW: "◆",
             }[event.category]
         line = Text("  ")
@@ -140,7 +144,7 @@ class TerminalUI:
 
         if event.status == TraceStatus.STARTED:
             arguments = event.details.get("arguments")
-            if event.category == TraceCategory.TOOL_USE and isinstance(arguments, dict):
+            if event.category == TraceCategory.CAPABILITY and isinstance(arguments, dict):
                 summary = _compact_arguments(arguments)
                 if summary:
                     line.append(f"  {summary}", style="dim")
@@ -240,7 +244,7 @@ def _debug_payload(event: TraceEvent) -> dict[str, Any]:
             if key in details:
                 payload[key] = details[key]
         return payload
-    if event.category == TraceCategory.TOOL_USE:
+    if event.category == TraceCategory.CAPABILITY:
         payload["agent"] = details.get("agent")
         payload["arguments"] = details.get("debug_arguments", details.get("arguments", {}))
         for key in ("classification", "result", "error"):

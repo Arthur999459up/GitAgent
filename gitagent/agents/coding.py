@@ -1,4 +1,4 @@
-"""Candidate-patch agent. It has no GitHub mutation tools or test runner."""
+"""Candidate-patch agent. It has no GitHub mutation capabilities or test runner."""
 
 from __future__ import annotations
 
@@ -21,9 +21,10 @@ from gitagent.domain.models import (
 )
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
-from gitagent.harness.tools.file_access import safe_repository_path
+from gitagent.harness.file_access import safe_repository_path
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
+
 from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
@@ -110,24 +111,18 @@ _PLAN_SCHEMA = {
     "additionalProperties": False,
 }
 
+class _CodingCapabilityFailure(Exception):
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(str(payload.get("message") or payload.get("error") or "capability failed"))
+        self.payload = payload
+
+
 CODING_SPEC = AgentSpec(
     name="coding",
     role="Explain, review, plan, or prepare a minimal candidate patch from targeted repository evidence.",
     system_prompt=_PROMPTS.text("system.coding"),
-    allowed_tools=frozenset(
-        {
-            "repository.get_default_branch",
-            "repository.get_file_status",
-            "repository.get_repo_tree",
-            "repository.search_code",
-            "repository.read_file",
-            "repository.read_files",
-            "repository.find_symbol",
-            "repository.find_references",
-        }
-    ),
     output_schema=(),
-    capabilities=frozenset({"coding"}),
+    routes=frozenset({"coding"}),
     required_context=("repository",),
     routing_examples=(
         "修复登录接口的空指针问题",
@@ -203,10 +198,16 @@ class CodingAgent:
         session_id: str,
         guidance: AgentGuidance | None = None,
     ) -> CandidatePreparationResult:
+        def operation(context: AgentContext) -> CandidatePreparationResult:
+            try:
+                return self._create(context, request, guidance)
+            except _CodingCapabilityFailure as failure:
+                return CandidatePreparationResult(None, capability_error=failure.payload)
+
         return self.harness.run(
             "coding",
             session_id=session_id,
-            operation=lambda context: self._create(context, request, guidance),
+            operation=operation,
             repository=request.repository,
             goal=request.description,
             entity_type="issue" if request.issue_number is not None else None,
@@ -225,10 +226,17 @@ class CodingAgent:
     ) -> CandidatePreparationResult:
         if not self.reasoner:
             return CandidatePreparationResult(candidate)
+
+        def operation(context: AgentContext) -> CandidatePreparationResult:
+            try:
+                return self._repair(context, request, candidate, errors, guidance)
+            except _CodingCapabilityFailure as failure:
+                return CandidatePreparationResult(None, capability_error=failure.payload)
+
         return self.harness.run(
             "coding",
             session_id=session_id,
-            operation=lambda context: self._repair(context, request, candidate, errors, guidance),
+            operation=operation,
             repository=request.repository,
             goal=f"Repair candidate: {request.description}",
             entity_type="issue" if request.issue_number is not None else None,
@@ -354,6 +362,30 @@ class CodingAgent:
             tests=[str(item) for item in value.get("tests", [])],
         )
 
+    @staticmethod
+    def _invoke_capability(context: AgentContext, capability_id: str, **arguments: Any) -> Any:
+        content = context.invoke(capability_id, **arguments)
+        call = context.last_capability_call
+        if call is None:
+            raise WorkflowError("Coding capability invocation did not record its result")
+        if call.result.status == "failed":
+            error = call.result.error
+            if error is None:
+                raise WorkflowError("Coding capability failed without a structured error")
+            raise _CodingCapabilityFailure(
+                {
+                    "capability_id": call.result.capability_id,
+                    "arguments": dict(arguments),
+                    "error": error.type.value,
+                    "message": error.message,
+                    "details": error.details,
+                    "attempts": call.result.attempts,
+                }
+            )
+        if call.result.status != "success":
+            raise WorkflowError(f"Coding capability returned unsupported status: {call.result.status}")
+        return content
+
     def _create(
         self,
         context: AgentContext,
@@ -362,12 +394,12 @@ class CodingAgent:
     ) -> CandidatePreparationResult:
         context.phase = "discovering_targets"
         if request.source_ref is None:
-            default = context.tool("repository.get_default_branch", repository=request.repository)
+            default = self._invoke_capability(context, "repository.get_default_branch")
             request.base_branch = str(default["branch"])
             request.source_ref = str(default["commit_sha"])
-        tree = context.tool(
+        tree = self._invoke_capability(
+            context,
             "repository.get_repo_tree",
-            repository=request.repository,
             depth=8,
             max_entries=500,
             ref=request.source_ref,
@@ -399,9 +431,9 @@ class CodingAgent:
         existing_paths = [change["path"] for change in planned_changes if change["action"] != "ADD"]
         context.phase = "reading_targets"
         fetched = (
-            context.tool(
+            self._invoke_capability(
+                context,
                 "repository.read_files",
-                repository=request.repository,
                 requests=[{"path": path, "limit": 400} for path in existing_paths],
                 ref=request.source_ref,
             )["files"]
@@ -566,9 +598,9 @@ class CodingAgent:
         request: ChangeRequest,
         paths: list[str],
     ) -> set[str]:
-        status = context.tool(
+        status = CodingAgent._invoke_capability(
+            context,
             "repository.get_file_status",
-            repository=request.repository,
             paths=paths,
             ref=request.source_ref,
         )
@@ -598,9 +630,9 @@ class CodingAgent:
             selected: dict[str, int] = {}
             queries = [str(query) for query in operation["evidence_queries"]]
             for query in queries:
-                result = context.tool(
+                result = CodingAgent._invoke_capability(
+                    context,
                     "repository.search_code",
-                    repository=request.repository,
                     query=query,
                     max_results=5,
                 )
@@ -611,9 +643,9 @@ class CodingAgent:
                         break
             requests = [{"path": path, "start_line": max(1, line - 40), "limit": 81} for path, line in selected.items()]
             sources = (
-                context.tool(
+                CodingAgent._invoke_capability(
+                    context,
                     "repository.read_files",
-                    repository=request.repository,
                     requests=requests,
                     ref=request.source_ref,
                 )["files"]
@@ -673,9 +705,9 @@ class CodingAgent:
             repaired[operation["path"]] = content
         existing_paths = [*candidate.modified_files, *candidate.deleted_files]
         fetched = (
-            context.tool(
+            self._invoke_capability(
+                context,
                 "repository.read_files",
-                repository=request.repository,
                 requests=[{"path": path, "limit": 400} for path in existing_paths],
                 ref=request.source_ref,
             )["files"]
@@ -763,6 +795,14 @@ class CodingAgent:
         return any(segment in {"test", "tests", "spec", "specs"} for segment in segments[:-1]) or any(
             marker in segments[-1] for marker in ("_test.", ".test.", ".spec.")
         )
+
+
+def record_candidate_capability_error(context: AgentContext, prepared: CandidatePreparationResult) -> bool:
+    payload = prepared.capability_error
+    if payload is None:
+        return False
+    context.observations.append({"kind": "capability_error", "payload": dict(payload)})
+    return True
 
 
 def prepare_verified_candidate(

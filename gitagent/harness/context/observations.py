@@ -7,9 +7,14 @@ from collections import Counter
 from collections.abc import Sequence
 from typing import Any
 
-from .budget import EMERGENCY_THRESHOLD, LIGHT_THRESHOLD, SUMMARY_THRESHOLD, estimate_tokens
+from .budget import (
+    EMERGENCY_THRESHOLD,
+    LIGHT_THRESHOLD,
+    SUMMARY_THRESHOLD,
+    estimate_tokens,
+)
 
-TOOL_TEXT_PROJECTION_CHARACTERS = 6_000
+CAPABILITY_TEXT_PROJECTION_CHARACTERS = 6_000
 SUMMARY_TAIL_OBSERVATIONS = 6
 EMERGENCY_TAIL_OBSERVATIONS = 2
 
@@ -60,9 +65,9 @@ def render_agent_observations(
 def _entry(observation: dict[str, Any]) -> dict[str, Any]:
     kind = str(observation.get("kind") or "")
     payload = observation.get("payload")
-    if kind == "tool" and isinstance(payload, dict):
+    if kind == "capability" and isinstance(payload, dict):
         entry = {
-            "tool": payload.get("tool", ""),
+            "capability_id": payload.get("capability_id", ""),
             "arguments": payload.get("arguments", {}),
             "data": payload.get("data"),
         }
@@ -76,17 +81,17 @@ def _light_value(value: Any) -> Any:
     if isinstance(value, dict):
         projected: dict[str, Any] = {}
         for key, item in value.items():
-            if isinstance(item, str) and len(item) > TOOL_TEXT_PROJECTION_CHARACTERS:
-                half = TOOL_TEXT_PROJECTION_CHARACTERS // 2
+            if isinstance(item, str) and len(item) > CAPABILITY_TEXT_PROJECTION_CHARACTERS:
+                half = CAPABILITY_TEXT_PROJECTION_CHARACTERS // 2
                 projected[key] = (
                     item[:half]
-                    + f"\n... ({len(item) - TOOL_TEXT_PROJECTION_CHARACTERS} characters projected) ...\n"
+                    + f"\n... ({len(item) - CAPABILITY_TEXT_PROJECTION_CHARACTERS} characters projected) ...\n"
                     + item[-half:]
                 )
                 projected[f"__{key}_projection__"] = {
                     "projected": True,
                     "original_chars": len(item),
-                    "retained_chars": TOOL_TEXT_PROJECTION_CHARACTERS,
+                    "retained_chars": CAPABILITY_TEXT_PROJECTION_CHARACTERS,
                 }
             else:
                 projected[key] = _light_value(item)
@@ -122,13 +127,15 @@ def _summary_projection(entries: Sequence[dict[str, Any]]) -> list[dict[str, Any
 
 
 def _emergency_projection(entries: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    tools = Counter(str(entry.get("tool") or "") for entry in entries if entry.get("tool"))
+    capabilities = Counter(
+        str(entry.get("capability_id") or "") for entry in entries if entry.get("capability_id")
+    )
     tail = [_bounded_value(entry, string_limit=1_000, item_limit=5) for entry in entries[-EMERGENCY_TAIL_OBSERVATIONS:]]
     return [
         {
             "observation_summary": {
                 "total": len(entries),
-                "tool_counts": dict(sorted(tools.items())),
+                "capability_counts": dict(sorted(capabilities.items())),
             }
         },
         *tail,
@@ -136,15 +143,15 @@ def _emergency_projection(entries: Sequence[dict[str, Any]]) -> list[dict[str, A
 
 
 def _summary_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    if "tool" not in entry:
+    if "capability_id" not in entry:
         return _bounded_value(entry, string_limit=1_000, item_limit=8)
     data = entry.get("data")
-    if str(entry.get("tool") or "") in {"repository.read_file", "repository.read_files"}:
+    if str(entry.get("capability_id") or "") in {"repository.read_file", "repository.read_files"}:
         data = _file_result_metadata(data)
     else:
         data = _bounded_value(data, string_limit=1_000, item_limit=8)
     return {
-        "tool": entry.get("tool", ""),
+        "capability_id": entry.get("capability_id", ""),
         "arguments": _bounded_value(entry.get("arguments", {}), string_limit=500, item_limit=12),
         "data": data,
         **({"cached": True} if entry.get("cached") else {}),

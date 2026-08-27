@@ -11,7 +11,7 @@ Prompt wording lives in this directory so behavior text can be tuned without cha
 
 Keys are derived from paths relative to `prompts/`, without `.md`, replacing `/` with `.`. Static templates use `PromptLibrary.text(key)`; dynamic templates use `PromptLibrary.render(key, ...)`, which rejects missing, extra, or malformed placeholders.
 
-Tool names, descriptions, input schemas, output schemas, and access levels do not live in prompts. Tool-enabled Agents receive their allowed MCP function definitions from the Tool Registry; pure-LLM calls receive only supplied evidence.
+Capability IDs, descriptions, schemas, access levels, discovery, and invocation permissions do not live in prompts. Agents receive only the Capability Layer definitions discoverable under their current policy; pure-LLM calls receive only supplied evidence.
 
 `GITAGENT_PROMPTS_DIR` may replace the prompt root when set before process startup. The override is captured before dotenv loading so a repository-controlled `.env` cannot redirect prompt loading.
 

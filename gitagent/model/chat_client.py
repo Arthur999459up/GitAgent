@@ -11,7 +11,11 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from gitagent.domain.errors import LLMProviderError, StructuredOutputError, ValidationError
+from gitagent.domain.errors import (
+    LLMProviderError,
+    StructuredOutputError,
+    ValidationError,
+)
 
 
 @dataclass(frozen=True)

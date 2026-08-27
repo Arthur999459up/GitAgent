@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 from typing import Any, Protocol
 
+from gitagent.capability import validate_schema
 from gitagent.domain.errors import StructuredOutputError, ValidationError
-from gitagent.harness.tools.registry import validate_schema
 from gitagent.prompts import get_prompt_library
+
 from .chat_client import ChatClient, ChatResponse
 
 _PROMPTS = get_prompt_library()
@@ -145,9 +146,9 @@ class LLMReasoner:
                         f"model called {call.name or '<unnamed>'} instead of required function {tool_name}"
                     )
                 return {
-                    "kind": "tool",
+                    "kind": "capability",
                     "summary": f"Call {call.name}",
-                    "tool": call.name,
+                    "capability_id": call.name,
                     "arguments": arguments,
                 }
         value = _first_json_object(response.content)

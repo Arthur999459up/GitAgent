@@ -1,11 +1,11 @@
-"""MCP 基础公共工具。"""
+"""Repository file-range validation shared by Harness and API adapters."""
 
 from __future__ import annotations
 
 from pathlib import PurePosixPath
 from typing import Any
 
-from gitagent.domain.errors import ToolExecutionError, ValidationError
+from gitagent.domain.errors import ExternalExecutionError, ValidationError
 
 
 def safe_repository_path(path: str) -> str:
@@ -61,7 +61,9 @@ def select_file_lines(
     characters = 0
     for line in lines[start_line - 1 : start_line - 1 + limit]:
         if len(line) > max_characters:
-            raise ToolExecutionError(f"line {start_line + len(selected_lines)} exceeds the maximum readable line size")
+            raise ExternalExecutionError(
+                f"line {start_line + len(selected_lines)} exceeds the maximum readable line size"
+            )
         if selected_lines and characters + len(line) > max_characters:
             break
         selected_lines.append(line)

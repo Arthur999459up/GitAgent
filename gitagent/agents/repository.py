@@ -17,12 +17,23 @@ from gitagent.domain.models import (
     Route,
     to_plain,
 )
+from gitagent.harness.context import (
+    capability_attempted,
+    capability_failure_observed,
+    render_context_observations,
+)
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.validation.static import StaticVerifier
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
-from .coding import CodingAgent, prepare_verified_candidate
+
+from .coding import (
+    CodingAgent,
+    prepare_verified_candidate,
+    record_candidate_capability_error,
+)
+from .decide import AGENT_ACTION_SCHEMA, parse_action
 from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
@@ -82,23 +93,12 @@ _QUERY_STOPWORDS = frozenset(
     }
 )
 
-REPOSITORY_TOOLS = frozenset(
-    {
-        "repository.get_repo_tree",
-        "repository.search_code",
-        "repository.read_files",
-        "repository.find_symbol",
-        "repository.get_file_history",
-    }
-)
-
 REPOSITORY_SPEC = AgentSpec(
     name="repository",
     role="Explore, search, explain, analyze, plan, inspect history, and coordinate repository modifications.",
     system_prompt=_PROMPTS.text("system.repository"),
-    allowed_tools=REPOSITORY_TOOLS,
     output_schema=("action", "operation", "answer", "files", "symbols", "reasoning"),
-    capabilities=frozenset({Route.REPOSITORY}),
+    routes=frozenset({Route.REPOSITORY}),
     required_context=("repository",),
     routing_examples=(
         "解释认证模块的调用链",
@@ -164,6 +164,8 @@ class RepositoryAgent:
             operation = RepositoryOperation(context.operation)
         except ValueError as exc:
             raise WorkflowError("Repository Agent requires a valid operation") from exc
+        if self.reasoner is not None and capability_failure_observed(context):
+            return self._llm_decide_after_failure(context, operation)
         if operation == RepositoryOperation.MODIFY:
             self.prepare(context, operation)
             return self._decide_modify(context)
@@ -178,13 +180,43 @@ class RepositoryAgent:
             return self._build_modify_result(context)
         return self._build_read_result(context, operation)
 
+    def _llm_decide_after_failure(
+        self,
+        context: AgentContext,
+        operation: RepositoryOperation,
+    ) -> AgentAction:
+        if self.reasoner is None:
+            raise WorkflowError("capability failure recovery requires a reasoner")
+        value = self.reasoner.complete_structured(
+            system=context.system_prompt,
+            prompt=_PROMPTS.render(
+                "agents.repository_recovery_decide",
+                goal=context.goal,
+                repository=context.repository,
+                operation=operation.value,
+                budget=str(max(0, context.max_steps - context.steps)),
+                guidance=guidance_section(context.guidance),
+                observations=render_context_observations(context),
+            ),
+            schema=AGENT_ACTION_SCHEMA,
+            tool_name="decide_action",
+            tools=self.harness.llm_tools(context),
+        )
+        if value.get("kind") == "capability":
+            value["capability_id"] = self.harness.resolve_llm_name(
+                str(value.get("capability_id", "")),
+                context,
+            )
+        return parse_action(value, requires_candidate=False)
+
     def _decide_read(self, context: AgentContext, operation: RepositoryOperation) -> AgentAction:
         if operation == RepositoryOperation.EXPLORE:
-            if not self._tool_calls(context, "repository.get_repo_tree"):
+            arguments = {"depth": 4, "max_entries": 300}
+            if not capability_attempted(context, "repository.get_repo_tree", arguments=arguments):
                 return AgentAction(
-                    AgentActionKind.TOOL,
-                    tool="repository.get_repo_tree",
-                    arguments={"depth": 4, "max_entries": 300},
+                    AgentActionKind.CAPABILITY,
+                    capability_id="repository.get_repo_tree",
+                    arguments=arguments,
                     summary="读取有界仓库结构",
                 )
             return AgentAction(AgentActionKind.FINISH, summary="仓库结构证据已收集")
@@ -192,84 +224,88 @@ class RepositoryAgent:
         explicit_history_path = self._explicit_path(context.goal) if operation == RepositoryOperation.HISTORY else ""
         if explicit_history_path:
             context.repository_history_path = explicit_history_path
-            if not self._tool_calls(context, "repository.get_file_history"):
+            arguments = {"path": explicit_history_path, "limit": 20}
+            if not capability_attempted(context, "repository.get_file_history", arguments=arguments):
                 return AgentAction(
-                    AgentActionKind.TOOL,
-                    tool="repository.get_file_history",
-                    arguments={"path": explicit_history_path, "limit": 20},
+                    AgentActionKind.CAPABILITY,
+                    capability_id="repository.get_file_history",
+                    arguments=arguments,
                     summary=f"读取 {explicit_history_path} 的文件历史",
                 )
             return AgentAction(AgentActionKind.FINISH, summary="文件历史证据已收集")
 
         plan = self._search_plan(context, operation)
-        searched = {
-            str(call["arguments"].get("query") or "").casefold()
-            for call in self._tool_calls(context, "repository.search_code")
-        }
         for query in plan["queries"]:
-            if query.casefold() not in searched:
+            arguments = {"query": query, "max_results": 30}
+            if not capability_attempted(context, "repository.search_code", arguments=arguments):
                 return AgentAction(
-                    AgentActionKind.TOOL,
-                    tool="repository.search_code",
-                    arguments={"query": query, "max_results": 30},
+                    AgentActionKind.CAPABILITY,
+                    capability_id="repository.search_code",
+                    arguments=arguments,
                     summary=f"检索仓库：{query}",
                 )
 
-        searches = self._tool_calls(context, "repository.search_code")
+        searches = self._capability_calls(context, "repository.search_code")
         no_search_hits = not any((call["data"] or {}).get("results") for call in searches)
         incomplete_search = any(not bool((call["data"] or {}).get("complete", False)) for call in searches)
         needs_tree = bool(plan["path_terms"]) or (no_search_hits and incomplete_search)
-        if needs_tree and not self._tool_calls(context, "repository.get_repo_tree"):
-            tree_arguments: dict[str, Any] = {"depth": 8, "max_entries": 500}
-            search_refs = list(
-                dict.fromkeys(
-                    str((call["data"] or {}).get("ref"))
-                    for call in searches
-                    if (call["data"] or {}).get("ref")
-                )
+        tree_arguments: dict[str, Any] = {"depth": 8, "max_entries": 500}
+        search_refs = list(
+            dict.fromkeys(
+                str((call["data"] or {}).get("ref"))
+                for call in searches
+                if (call["data"] or {}).get("ref")
             )
-            if len(search_refs) == 1:
-                tree_arguments["ref"] = search_refs[0]
+        )
+        if len(search_refs) == 1:
+            tree_arguments["ref"] = search_refs[0]
+        if needs_tree and not capability_attempted(
+            context,
+            "repository.get_repo_tree",
+            arguments=tree_arguments,
+        ):
             return AgentAction(
-                AgentActionKind.TOOL,
-                tool="repository.get_repo_tree",
+                AgentActionKind.CAPABILITY,
+                capability_id="repository.get_repo_tree",
                 arguments=tree_arguments,
                 summary="检查文件路径并补充不完整搜索",
             )
 
-        found_symbols = {
-            str(call["arguments"].get("symbol") or "")
-            for call in self._tool_calls(context, "repository.find_symbol")
-        }
         for symbol in plan["symbols"]:
-            if symbol not in found_symbols:
+            arguments = {"symbol": symbol, "max_results": 30}
+            if not capability_attempted(context, "repository.find_symbol", arguments=arguments):
                 return AgentAction(
-                    AgentActionKind.TOOL,
-                    tool="repository.find_symbol",
-                    arguments={"symbol": symbol, "max_results": 30},
+                    AgentActionKind.CAPABILITY,
+                    capability_id="repository.find_symbol",
+                    arguments=arguments,
                     summary=f"定位符号定义：{symbol}",
                 )
 
         evidence, paths, _ = self._repository_evidence(context)
         if operation == RepositoryOperation.HISTORY:
             context.repository_history_path = self._choose_history_path(context, paths)
-            if context.repository_history_path and not self._tool_calls(context, "repository.get_file_history"):
+            history_arguments = {"path": context.repository_history_path, "limit": 20}
+            if context.repository_history_path and not capability_attempted(
+                context,
+                "repository.get_file_history",
+                arguments=history_arguments,
+            ):
                 return AgentAction(
-                    AgentActionKind.TOOL,
-                    tool="repository.get_file_history",
-                    arguments={"path": context.repository_history_path, "limit": 20},
+                    AgentActionKind.CAPABILITY,
+                    capability_id="repository.get_file_history",
+                    arguments=history_arguments,
                     summary=f"读取 {context.repository_history_path} 的文件历史",
                 )
             return AgentAction(AgentActionKind.FINISH, summary="文件历史检索已完成")
 
-        if paths and not self._tool_calls(context, "repository.read_files"):
-            read_arguments: dict[str, Any] = {"requests": self._read_requests(paths, evidence)}
-            refs = list(evidence["coverage"]["refs"])
-            if len(refs) == 1:
-                read_arguments["ref"] = refs[0]
+        read_arguments: dict[str, Any] = {"requests": self._read_requests(paths, evidence)}
+        refs = list(evidence["coverage"]["refs"])
+        if len(refs) == 1:
+            read_arguments["ref"] = refs[0]
+        if paths and not capability_attempted(context, "repository.read_files", arguments=read_arguments):
             return AgentAction(
-                AgentActionKind.TOOL,
-                tool="repository.read_files",
+                AgentActionKind.CAPABILITY,
+                capability_id="repository.read_files",
                 arguments=read_arguments,
                 summary="读取命中位置附近的源码上下文",
             )
@@ -278,7 +314,7 @@ class RepositoryAgent:
     def _decide_modify(self, context: AgentContext) -> AgentAction:
         if context.change_request is None:
             raise WorkflowError("repository modification requires a change request")
-        applied = self._last_tool_data(context, "github.commit_to_default_branch")
+        applied = self._last_capability_data(context, "github.commit_to_default_branch")
         if applied is not None:
             return AgentAction(
                 AgentActionKind.FINISH,
@@ -303,6 +339,11 @@ class RepositoryAgent:
                 session_id=context.session_id,
                 guidance=context.guidance,
             )
+            if record_candidate_capability_error(context, prepared):
+                return AgentAction(
+                    AgentActionKind.CONTINUE,
+                    summary="Coding capability 失败，重新评估下一步",
+                )
             if prepared.candidate is None:
                 return AgentAction(
                     AgentActionKind.FINISH,
@@ -356,7 +397,7 @@ class RepositoryAgent:
         operation: RepositoryOperation,
     ) -> RepositoryResult:
         if operation == RepositoryOperation.EXPLORE:
-            tree = self._last_tool_data(context, "repository.get_repo_tree") or {}
+            tree = self._last_capability_data(context, "repository.get_repo_tree") or {}
             entries = [str(path) for path in list(tree.get("entries") or [])[:120]]
             evidence = {
                 "tree": entries,
@@ -368,14 +409,14 @@ class RepositoryAgent:
             return RepositoryResult(
                 DomainAction.ANSWER,
                 operation,
-                self._grounded_text(context, evidence),
+                context.final_message or self._grounded_text(context, evidence),
                 files=entries[:40],
                 reasoning="Bounded repository tree evidence was inspected.",
             )
 
         evidence, paths, symbols = self._repository_evidence(context)
         if operation == RepositoryOperation.HISTORY:
-            history = self._last_tool_data(context, "repository.get_file_history") or {}
+            history = self._last_capability_data(context, "repository.get_file_history") or {}
             path = str(history.get("path") or context.repository_history_path)
             if not path:
                 return RepositoryResult(
@@ -390,7 +431,7 @@ class RepositoryAgent:
             return RepositoryResult(
                 DomainAction.ANSWER,
                 operation,
-                self._grounded_text(context, history_evidence),
+                context.final_message or self._grounded_text(context, history_evidence),
                 files=[path],
                 history=commits,
                 reasoning="Bounded search selected one file before its history was inspected.",
@@ -400,7 +441,7 @@ class RepositoryAgent:
             return RepositoryResult(
                 DomainAction.ANSWER,
                 operation,
-                self._grounded_text(context, evidence),
+                context.final_message or self._grounded_text(context, evidence),
                 files=paths,
                 symbols=symbols,
                 reasoning="A bounded multi-query search loop and targeted line-window reads were used.",
@@ -416,7 +457,8 @@ class RepositoryAgent:
             return RepositoryResult(
                 DomainAction.ANSWER,
                 operation,
-                self._grounded_text(context, {**evidence, "interpretation": to_plain(interpretation)}),
+                context.final_message
+                or self._grounded_text(context, {**evidence, "interpretation": to_plain(interpretation)}),
                 files=paths,
                 symbols=list(dict.fromkeys(symbols + interpretation.key_symbols)),
                 interpretation=interpretation,
@@ -433,7 +475,8 @@ class RepositoryAgent:
             return RepositoryResult(
                 DomainAction.ANSWER,
                 operation,
-                self._grounded_text(context, {**evidence, "impact": to_plain(interpretation)}),
+                context.final_message
+                or self._grounded_text(context, {**evidence, "impact": to_plain(interpretation)}),
                 files=paths,
                 symbols=list(dict.fromkeys(symbols + interpretation.key_symbols)),
                 interpretation=interpretation,
@@ -450,7 +493,7 @@ class RepositoryAgent:
             return RepositoryResult(
                 DomainAction.ANSWER,
                 operation,
-                self._grounded_text(context, {**evidence, "plan": to_plain(plan)}),
+                context.final_message or self._grounded_text(context, {**evidence, "plan": to_plain(plan)}),
                 files=list(dict.fromkeys(paths + plan.files)),
                 symbols=symbols,
                 plan=plan,
@@ -484,9 +527,15 @@ class RepositoryAgent:
 
     def _repository_evidence(self, context: AgentContext) -> tuple[dict[str, Any], list[str], list[str]]:
         plan = context.repository_search_plan or self._fallback_search_plan(context.goal)
-        searches = [dict(call["data"] or {}) for call in self._tool_calls(context, "repository.search_code")]
-        symbol_searches = [dict(call["data"] or {}) for call in self._tool_calls(context, "repository.find_symbol")]
-        tree = self._last_tool_data(context, "repository.get_repo_tree") or {}
+        searches = [
+            dict(call["data"] or {})
+            for call in self._capability_calls(context, "repository.search_code")
+        ]
+        symbol_searches = [
+            dict(call["data"] or {})
+            for call in self._capability_calls(context, "repository.find_symbol")
+        ]
+        tree = self._last_capability_data(context, "repository.get_repo_tree") or {}
         path_matches = self._path_matches(list(tree.get("entries") or []), list(plan["path_terms"]))
 
         ordered_hits: list[dict[str, Any]] = []
@@ -502,7 +551,7 @@ class RepositoryAgent:
             )
         )[:_MAX_RESULT_PATHS]
         reads = []
-        for call in self._tool_calls(context, "repository.read_files"):
+        for call in self._capability_calls(context, "repository.read_files"):
             reads.extend(list((call["data"] or {}).get("files") or []))
         symbols = [
             str(result.get("symbol"))
@@ -599,11 +648,14 @@ class RepositoryAgent:
         return requests
 
     @staticmethod
-    def _tool_calls(context: AgentContext, name: str) -> list[dict[str, Any]]:
+    def _capability_calls(context: AgentContext, capability_id: str) -> list[dict[str, Any]]:
         calls = []
         for observation in context.observations:
             payload = observation.get("payload") or {}
-            if observation.get("kind") != "tool" or payload.get("tool") != name:
+            if (
+                observation.get("kind") != "capability"
+                or payload.get("capability_id") != capability_id
+            ):
                 continue
             calls.append(
                 {
@@ -614,8 +666,8 @@ class RepositoryAgent:
         return calls
 
     @classmethod
-    def _last_tool_data(cls, context: AgentContext, name: str) -> dict[str, Any] | None:
-        calls = cls._tool_calls(context, name)
+    def _last_capability_data(cls, context: AgentContext, capability_id: str) -> dict[str, Any] | None:
+        calls = cls._capability_calls(context, capability_id)
         return dict(calls[-1]["data"]) if calls else None
 
     @staticmethod

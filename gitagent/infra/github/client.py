@@ -1,4 +1,4 @@
-"""GitHub REST API 的 MCP 后端：按需读取仓库，并执行已审批写操作。"""
+"""Pure GitHub REST API adapter with no Agent capability metadata."""
 
 from __future__ import annotations
 
@@ -14,27 +14,29 @@ import zipfile
 from copy import deepcopy
 from typing import Any
 
-from gitagent.domain.errors import ResourceNotFoundError, ToolExecutionError, ValidationError
+from gitagent.domain.errors import (
+    ExternalExecutionError,
+    ResourceNotFoundError,
+    ValidationError,
+)
 from gitagent.domain.models import RepositoryRef
 from gitagent.domain.reviews import normalize_review
-from gitagent.harness.tools.file_access import parse_file_read_requests, safe_repository_path, select_file_lines
-from .memory import InMemoryMCPServer
+from gitagent.harness.file_access import (
+    parse_file_read_requests,
+    safe_repository_path,
+    select_file_lines,
+)
 
-_READ_RETRIES = 2
-_RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
-_RETRY_BACKOFF_SECONDS = 0.25
+from .errors import GitHubAPIError, GitHubTransportError
+
 _SEARCH_CACHE_SECONDS = 60.0
 _FALLBACK_FILE_LIMIT = 500
 _FALLBACK_BYTE_LIMIT = 20_000_000
 _FALLBACK_FILE_BYTE_LIMIT = 512_000
 
 
-class GitHubMCPServer(InMemoryMCPServer):
-    """与内存后端暴露相同工具契约的 GitHub REST 实现。
-
-    继承只复用工具注册、静态验证与参数安全检查；repository.* 和
-    github.* 方法全部在本类中走远程 API，不会 clone 仓库。
-    """
+class GitHubClient:
+    """Read and mutate GitHub through the REST API without cloning."""
 
     def __init__(
         self,
@@ -49,7 +51,6 @@ class GitHubMCPServer(InMemoryMCPServer):
         self._default_branches: dict[str, str] = {}
         self._search_cache: dict[tuple[str, str, str, str, int], tuple[float, dict[str, Any]]] = {}
         self._text_cache: dict[tuple[str, str, str], str] = {}
-        super().__init__({})
 
     # Account namespace ----------------------------------------------------
 
@@ -82,7 +83,7 @@ class GitHubMCPServer(InMemoryMCPServer):
             )
             values = self._request("GET", f"/user/repos?{query}")
             if not isinstance(values, list):
-                raise ToolExecutionError("GitHub repository list returned an unexpected response")
+                raise ExternalExecutionError("GitHub repository list returned an unexpected response")
             for value in values:
                 full_name = str(value.get("full_name") or "")
                 if not full_name:
@@ -108,15 +109,15 @@ class GitHubMCPServer(InMemoryMCPServer):
     def _numeric_id(value: dict[str, Any], label: str) -> int:
         raw = value.get("id")
         if isinstance(raw, bool):
-            raise ToolExecutionError(f"GitHub returned no stable numeric ID for {label}")
+            raise ExternalExecutionError(f"GitHub returned no stable numeric ID for {label}")
         if isinstance(raw, int):
             identifier = raw
         elif isinstance(raw, str) and raw.isascii() and raw.isdecimal():
             identifier = int(raw)
         else:
-            raise ToolExecutionError(f"GitHub returned no stable numeric ID for {label}")
+            raise ExternalExecutionError(f"GitHub returned no stable numeric ID for {label}")
         if identifier < 1:
-            raise ToolExecutionError(f"GitHub returned an invalid numeric ID for {label}")
+            raise ExternalExecutionError(f"GitHub returned an invalid numeric ID for {label}")
         return identifier
 
     # Repository namespace -------------------------------------------------
@@ -127,7 +128,7 @@ class GitHubMCPServer(InMemoryMCPServer):
         ref = self._request("GET", f"/repos/{repository}/git/ref/heads/{urllib.parse.quote(branch, safe='')}")
         commit_sha = str((ref.get("object") or {}).get("sha") or "")
         if not re.fullmatch(r"[0-9a-fA-F]{40,64}", commit_sha):
-            raise ToolExecutionError(f"GitHub returned no commit SHA for {repository}:{branch}")
+            raise ExternalExecutionError(f"GitHub returned no commit SHA for {repository}:{branch}")
         return {"repository": repository, "branch": branch, "commit_sha": commit_sha}
 
     def get_file_status(
@@ -154,7 +155,7 @@ class GitHubMCPServer(InMemoryMCPServer):
                 missing.append(path)
                 continue
             if value.get("type") != "file":
-                raise ToolExecutionError(f"repository path is not a file: {path}")
+                raise ExternalExecutionError(f"repository path is not a file: {path}")
             existing.append(path)
         return {"existing_files": sorted(existing), "missing_files": sorted(missing)}
 
@@ -224,7 +225,7 @@ class GitHubMCPServer(InMemoryMCPServer):
             value = self._request("GET", f"/search/code?{encoded}")
         except ResourceNotFoundError:
             raise
-        except ToolExecutionError as exc:
+        except ExternalExecutionError as exc:
             result = self._scan_default_branch(
                 repository,
                 head_sha,
@@ -256,7 +257,7 @@ class GitHubMCPServer(InMemoryMCPServer):
             file_path = str(item.get("path", ""))
             try:
                 content = self._read_text(repository, file_path, head_sha)
-            except ToolExecutionError as exc:
+            except ExternalExecutionError as exc:
                 fetch_errors.append({"path": file_path, "error": str(exc)[:500]})
                 continue
             files_checked += 1
@@ -267,7 +268,7 @@ class GitHubMCPServer(InMemoryMCPServer):
             details = "; ".join(
                 f"{item['path'] or '<unknown>'}: {item['error']}" for item in fetch_errors[:3]
             )
-            raise ToolExecutionError(
+            raise ExternalExecutionError(
                 f"GitHub code search returned {len(items)} candidate file(s), but none could be read"
                 + (f": {details}" if details else "")
             )
@@ -331,7 +332,7 @@ class GitHubMCPServer(InMemoryMCPServer):
                 break
             try:
                 content = self._read_text(repository, file_path, head_sha)
-            except ToolExecutionError as exc:
+            except ExternalExecutionError as exc:
                 if "not UTF-8 text" in str(exc):
                     skipped_binary += 1
                 else:
@@ -399,11 +400,11 @@ class GitHubMCPServer(InMemoryMCPServer):
         query = urllib.parse.urlencode({"ref": ref})
         value = self._request("GET", f"/repos/{repository}/contents/{encoded_path}?{query}")
         if value.get("type") != "file" or value.get("encoding") != "base64":
-            raise ToolExecutionError(f"GitHub did not return base64 file content for {safe}")
+            raise ExternalExecutionError(f"GitHub did not return base64 file content for {safe}")
         try:
             content = base64.b64decode(str(value.get("content", "")), validate=False).decode("utf-8")
         except (ValueError, UnicodeDecodeError) as exc:
-            raise ToolExecutionError(f"file is not UTF-8 text: {safe}") from exc
+            raise ExternalExecutionError(f"file is not UTF-8 text: {safe}") from exc
         if cacheable:
             self._text_cache[cache_key] = content
         return content
@@ -416,7 +417,7 @@ class GitHubMCPServer(InMemoryMCPServer):
         )
         sha = str(value.get("sha") or "")
         if not re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
-            raise ToolExecutionError(f"GitHub returned no commit SHA for {repository}:{branch}")
+            raise ExternalExecutionError(f"GitHub returned no commit SHA for {repository}:{branch}")
         return sha
 
     def read_file(
@@ -453,8 +454,8 @@ class GitHubMCPServer(InMemoryMCPServer):
                         ref=ref,
                     )
                 )
-            except ToolExecutionError as exc:
-                raise ToolExecutionError(f"failed to read {path}: {exc}") from exc
+            except ExternalExecutionError as exc:
+                raise ExternalExecutionError(f"failed to read {path}: {exc}") from exc
         return {"files": files}
 
     def find_symbol(self, repository: str, symbol: str, max_results: int = 20) -> dict[str, Any]:
@@ -571,12 +572,9 @@ class GitHubMCPServer(InMemoryMCPServer):
         values = self._request("GET", f"/repos/{repository}/milestones?{query}")
         return {"milestones": values}
 
-    def get_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
+    def get_pr(self, repository: str, pr_number: int) -> dict[str, Any]:
         repository = self._repository(repository)
-        try:
-            return self._request("GET", f"/repos/{repository}/pulls/{pr_number}")
-        except ResourceNotFoundError:
-            return None
+        return self._request("GET", f"/repos/{repository}/pulls/{pr_number}")
 
     def list_pull_requests(
         self,
@@ -648,7 +646,7 @@ class GitHubMCPServer(InMemoryMCPServer):
                 continue
             try:
                 log = self._request_bytes("GET", f"/repos/{repository}/actions/jobs/{int(job['id'])}/logs")
-            except ToolExecutionError:
+            except ExternalExecutionError:
                 bounded.append({**job, "log": "", "log_truncated": False, "log_unavailable": True})
                 continue
             text = self._decode_log(log)
@@ -840,7 +838,11 @@ class GitHubMCPServer(InMemoryMCPServer):
         ref = self._request("GET", f"/repos/{repository}/git/ref/heads/{encoded_branch}")
         actual_head_sha = str((ref.get("object") or {}).get("sha") or "")
         if not expected_head_sha.strip() or actual_head_sha != expected_head_sha.strip():
-            raise ToolExecutionError("default branch changed after the candidate was prepared")
+            raise GitHubAPIError(
+                "default branch changed after the candidate was prepared",
+                status_code=409,
+                request_sent=False,
+            )
         parent = self._request("GET", f"/repos/{repository}/git/commits/{actual_head_sha}")
         base_tree_sha = str(parent["tree"]["sha"])
         existing_entries = self._tree_entries(repository, base_tree_sha)
@@ -904,7 +906,7 @@ class GitHubMCPServer(InMemoryMCPServer):
             f"/repos/{repository}/git/trees/{urllib.parse.quote(tree_sha, safe='')}?recursive=1",
         )
         if value.get("truncated"):
-            raise ToolExecutionError("repository tree is too large to preserve file modes safely")
+            raise ExternalExecutionError("repository tree is too large to preserve file modes safely")
         return {
             str(item["path"]): dict(item)
             for item in value.get("tree", [])
@@ -984,7 +986,7 @@ class GitHubMCPServer(InMemoryMCPServer):
         try:
             return json.loads(data)
         except json.JSONDecodeError as exc:
-            raise ToolExecutionError(f"GitHub returned invalid JSON for {method} {path}") from exc
+            raise ExternalExecutionError(f"GitHub returned invalid JSON for {method} {path}") from exc
 
     def _request_bytes(
         self,
@@ -1006,32 +1008,29 @@ class GitHubMCPServer(InMemoryMCPServer):
             headers["Content-Type"] = "application/json"
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(f"{self.api_url}{path}", data=data, headers=headers, method=method)
-        max_attempts = _READ_RETRIES + 1 if method.upper() == "GET" else 1
-        for attempt in range(max_attempts):
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    return response.read()
-            except urllib.error.HTTPError as exc:
-                if exc.code in _RETRYABLE_HTTP_STATUSES and attempt + 1 < max_attempts:
-                    exc.close()
-                    time.sleep(_RETRY_BACKOFF_SECONDS * (2**attempt))
-                    continue
-                details = exc.read().decode("utf-8", errors="replace")[:1000]
-                if exc.code == 404:
-                    raise ResourceNotFoundError(f"GitHub resource not found: {method} {path}") from exc
-                reason = _github_error_reason(details)
-                raise ToolExecutionError(
-                    f"GitHub API {method} {path} failed ({exc.code}): {details}",
-                    user_message=f"GitHub 拒绝了该操作（HTTP {exc.code}）：{reason}",
-                ) from exc
-            except (urllib.error.URLError, TimeoutError) as exc:
-                if attempt + 1 < max_attempts:
-                    time.sleep(_RETRY_BACKOFF_SECONDS * (2**attempt))
-                    continue
-                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-                suffix = f" after {max_attempts} attempts" if max_attempts > 1 else ""
-                raise ToolExecutionError(f"GitHub API connection failed{suffix}: {reason}") from exc
-        raise AssertionError("GitHub request retry loop exited unexpectedly")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")[:1000]
+            if exc.code == 404:
+                raise ResourceNotFoundError(f"GitHub resource not found: {method} {path}") from exc
+            retry_header = exc.headers.get("Retry-After") if exc.headers is not None else None
+            retry_after = float(retry_header) if retry_header and retry_header.isdecimal() else None
+            reason = _github_error_reason(details)
+            raise GitHubAPIError(
+                f"GitHub API {method} {path} failed ({exc.code}): {details}",
+                status_code=exc.code,
+                retry_after=retry_after,
+                user_message=f"GitHub 拒绝了该操作（HTTP {exc.code}）：{reason}",
+            ) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            timed_out = isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError)
+            raise GitHubTransportError(
+                f"GitHub API connection failed: {reason}",
+                timed_out=timed_out,
+            ) from exc
 
     @staticmethod
     def _decode_log(data: bytes) -> str:
@@ -1047,11 +1046,20 @@ class GitHubMCPServer(InMemoryMCPServer):
 
     def _require_token(self) -> None:
         if not self.token:
-            raise ToolExecutionError("GitHub write requires GITHUB_TOKEN or GH_TOKEN")
+            raise GitHubAPIError(
+                "GitHub write requires GITHUB_TOKEN or GH_TOKEN",
+                status_code=401,
+                request_sent=False,
+            )
 
     @staticmethod
     def _repository(repository: str) -> str:
         return str(RepositoryRef.parse(repository))
+
+    @staticmethod
+    def _validate_branch(branch: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", branch) or ".." in branch or branch.endswith("/"):
+            raise ValidationError(f"invalid branch name: {branch!r}")
 
 
 def _github_error_reason(details: str) -> str:

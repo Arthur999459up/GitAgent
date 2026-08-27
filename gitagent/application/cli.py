@@ -28,6 +28,7 @@ from gitagent.domain.models import (
 from gitagent.harness.context import CompactResult
 from gitagent.harness.context.state import AgentContext
 from gitagent.infra.persistence import SessionRecord
+
 from .bootstrap import LiveApplication, build_live_application
 from .config import CLIConfig
 from .projection import MAX_VISIBLE_ITEMS, visible_items
@@ -539,9 +540,15 @@ def _render_context(application: LiveApplication, context: AgentContext) -> None
 
 def _render_proposal(application: LiveApplication, context: AgentContext) -> None:
     calls = context.pending.calls
-    if context.reply_draft is not None and any(call.tool == "github.post_comment" for call in calls):
+    if context.reply_draft is not None and any(
+        call.capability_id == "github.post_comment" for call in calls
+    ):
         issue_number = next(
-            (call.arguments.get("issue_number") for call in calls if call.tool == "github.post_comment"),
+            (
+                call.arguments.get("issue_number")
+                for call in calls
+                if call.capability_id == "github.post_comment"
+            ),
             context.entity_id,
         )
         ui.markdown(
@@ -549,13 +556,16 @@ def _render_proposal(application: LiveApplication, context: AgentContext) -> Non
             title=f"Issue #{issue_number} 修改报告 · 待发布",
             kind="agent",
         )
-    elif any(call.tool in {"github.create_draft_pr", "github.commit_to_default_branch"} for call in calls):
+    elif any(
+        call.capability_id in {"github.create_draft_pr", "github.commit_to_default_branch"}
+        for call in calls
+    ):
         _render_code_change_proposal(application, context)
     else:
         details = []
         for call in context.pending.calls:
             arguments = json.dumps(call.arguments, ensure_ascii=False, indent=2, sort_keys=True)
-            details.append(f"### `{call.tool}`\n```json\n{arguments}\n```")
+            details.append(f"### `{call.capability_id}`\n```json\n{arguments}\n```")
         payload = "\n\n".join(details) or "（内部操作，无外部写入参数）"
         ui.markdown(
             f"{context.pending.summary}\n\n{payload}",
@@ -581,7 +591,11 @@ def _render_code_change_proposal(application: LiveApplication, context: AgentCon
         f"### Diff\n```diff\n{candidate.patch}\n```"
     )
     direct_call = next(
-        (call for call in context.pending.calls if call.tool == "github.commit_to_default_branch"),
+        (
+            call
+            for call in context.pending.calls
+            if call.capability_id == "github.commit_to_default_branch"
+        ),
         None,
     )
     if direct_call is not None:
@@ -590,7 +604,11 @@ def _render_code_change_proposal(application: LiveApplication, context: AgentCon
             f"\n\n### Commit message\n{direct_call.arguments.get('message', '')}"
         )
     pr_call = next(
-        (call for call in context.pending.calls if call.tool == "github.create_draft_pr"),
+        (
+            call
+            for call in context.pending.calls
+            if call.capability_id == "github.create_draft_pr"
+        ),
         None,
     )
     if pr_call is not None:

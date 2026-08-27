@@ -1,8 +1,19 @@
 """GitAgent public API."""
 
 from gitagent.application import CLIConfig, GitAgentService
-from gitagent.domain.models import (
+from gitagent.capability import (
     AccessLevel,
+    Capability,
+    CapabilityError,
+    CapabilityErrorType,
+    CapabilityKind,
+    CapabilityLayer,
+    CapabilityResult,
+    CapabilityStatus,
+    InvocationContext,
+    PermissionPolicy,
+)
+from gitagent.domain.models import (
     ApprovalIntent,
     CandidatePatch,
     ChangeRequest,
@@ -25,10 +36,19 @@ from gitagent.domain.models import (
 )
 from gitagent.harness import AgentHarness
 from gitagent.harness.constraints import ApprovalRequest, ApprovalStore
-from gitagent.harness.tools import MCPClient, ToolRegistry, ToolSpec
-from gitagent.infra.observability import TraceBus, TraceCategory, TraceEvent, TraceStatus
-from gitagent.infra.tool_hosts import GitHubMCPServer, MCPServer
-from gitagent.model import ChatResponse, LiteLLMChatClient, LLMReasoner, OpenAIChatClient
+from gitagent.infra.github import GitHubClient, InMemoryGitHubClient
+from gitagent.infra.observability import (
+    TraceBus,
+    TraceCategory,
+    TraceEvent,
+    TraceStatus,
+)
+from gitagent.model import (
+    ChatResponse,
+    LiteLLMChatClient,
+    LLMReasoner,
+    OpenAIChatClient,
+)
 
 __version__ = "0.1.0"
 
@@ -40,6 +60,13 @@ __all__ = [
     "ApprovalStore",
     "CLIConfig",
     "CandidatePatch",
+    "Capability",
+    "CapabilityError",
+    "CapabilityErrorType",
+    "CapabilityKind",
+    "CapabilityLayer",
+    "CapabilityResult",
+    "CapabilityStatus",
     "ChangeRequest",
     "ChatResponse",
     "CodeExplanationResult",
@@ -47,25 +74,24 @@ __all__ = [
     "CodeReviewResult",
     "DomainAction",
     "GitAgentService",
-    "GitHubMCPServer",
+    "GitHubClient",
+    "InMemoryGitHubClient",
+    "InvocationContext",
     "IssueAgentResult",
     "IssueOperation",
     "IssueSummary",
     "LLMReasoner",
     "LiteLLMChatClient",
-    "MCPClient",
-    "MCPServer",
     "MainDecision",
     "MutationRejectedResult",
     "OpenAIChatClient",
+    "PermissionPolicy",
     "PullRequestAgentResult",
     "PullRequestOperation",
     "PullRequestSummary",
     "Replacement",
     "Route",
     "RoutingContext",
-    "ToolRegistry",
-    "ToolSpec",
     "TraceBus",
     "TraceCategory",
     "TraceEvent",

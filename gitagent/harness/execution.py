@@ -1,4 +1,4 @@
-"""Harness orchestration for agent execution and tool dispatch."""
+"""Harness orchestration over the public Capability Layer API."""
 
 from __future__ import annotations
 
@@ -6,35 +6,31 @@ from collections.abc import Callable
 from time import perf_counter
 from typing import Any, TypeVar
 
-from gitagent.domain.errors import PermissionDenied, ValidationError
-from gitagent.domain.models import AccessLevel, AgentGuidance, AgentSpec
-from gitagent.harness.constraints import ApprovalStore
+from gitagent.capability import CapabilityLayer, CapabilityResult, InvocationContext
+from gitagent.domain.errors import ValidationError
+from gitagent.domain.models import AgentGuidance, AgentSpec
 from gitagent.harness.context.state import AgentContext
-from gitagent.harness.tools import MCPClient
 from gitagent.harness.validation.output import validate_agent_output
 from gitagent.infra.observability import AuditLog, TraceBus, TraceCategory, TraceStatus
-from gitagent.infra.tool_hosts import MCPServer
 
 T = TypeVar("T")
 
 
 class AgentHarness:
-    """Compose context, tools, constraints, validation, recovery, and observability."""
+    """Own agent state, approval workflow, observations, and capability access."""
 
     def __init__(
         self,
-        server: MCPServer,
+        capabilities: CapabilityLayer,
         *,
-        approvals: ApprovalStore | None = None,
         audit: AuditLog | None = None,
         trace: TraceBus | None = None,
         context_budget: int = 26_112,
     ) -> None:
         if not isinstance(context_budget, int) or isinstance(context_budget, bool) or context_budget < 4096:
             raise ValueError("context_budget must be an integer of at least 4096")
-        self.server = server
-        self.client = MCPClient(server)
-        self.approvals = approvals or ApprovalStore()
+        self._capabilities = capabilities
+        self.approvals = capabilities.policy.approvals
         self.audit = audit or AuditLog()
         self.trace = trace or TraceBus()
         self.context_budget = context_budget
@@ -43,10 +39,6 @@ class AgentHarness:
     def register(self, spec: AgentSpec) -> None:
         if spec.name in self._specs:
             raise ValidationError(f"duplicate agent spec: {spec.name}")
-        available = {tool.name for tool in self.server.tools}
-        unknown_tools = sorted(spec.allowed_tools - available)
-        if unknown_tools:
-            raise ValidationError(f"agent {spec.name} references unknown tools: {', '.join(unknown_tools)}")
         self._specs[spec.name] = spec
 
     def context(
@@ -126,116 +118,83 @@ class AgentHarness:
         )
         return result
 
-    def execute_tool(
+    def invoke(
         self,
         context: AgentContext,
-        name: str,
+        capability_id: str,
         arguments: dict[str, Any],
         *,
-        approval_id: str | None,
-    ) -> Any:
-        tool = self.server.get_tool(name)
-        if name not in context.spec.allowed_tools:
-            self._record_denied(context, tool.access, name, approval_id, "tool is outside agent allowlist")
-            raise PermissionDenied(f"agent {context.agent} is not allowed to use {name}")
-
-        started = perf_counter()
-        details = {
-            "agent": context.agent,
-            "classification": tool.access.value,
-            "argument_keys": sorted(arguments),
-        }
-        self.trace.emit(
-            session_id=context.session_id,
-            category=TraceCategory.TOOL_USE,
-            name=name,
-            status=TraceStatus.STARTED,
-            details=details,
+        approval_id: str | None = None,
+    ) -> CapabilityResult:
+        invocation = self.invocation_context(context, approval_id=approval_id)
+        visible = next((item for item in self.discover(context) if item.id == capability_id), None)
+        result = self._capabilities.invoke(capability_id, arguments, invocation)
+        audit_result = (
+            "OK"
+            if result.status == "success"
+            else "DENIED"
+            if result.status == "approval_required"
+            else "FAILED"
         )
-        try:
-            if tool.access in {AccessLevel.WRITE, AccessLevel.DESTRUCTIVE}:
-                self.approvals.authorize(
-                    approval_id=approval_id,
-                    session_id=context.session_id,
-                    tool=name,
-                    arguments=arguments,
-                )
-            result = self.client.call(name, arguments)
-        except Exception as exc:
-            denied = isinstance(exc, PermissionDenied)
-            self.audit.record(
-                session_id=context.session_id,
-                agent=context.agent,
-                tool=name,
-                action=name,
-                classification=tool.access,
-                approval_id=approval_id,
-                result="DENIED" if denied else "FAILED",
-                details={"error": str(exc), "argument_keys": sorted(arguments)},
-            )
-            self.trace.emit(
-                session_id=context.session_id,
-                category=TraceCategory.TOOL_USE,
-                name=name,
-                status=TraceStatus.DENIED if denied else TraceStatus.FAILED,
-                message=str(exc),
-                details={**details, "error_type": type(exc).__name__},
-                duration_ms=(perf_counter() - started) * 1000,
-            )
-            raise
-
+        details: dict[str, Any] = {"argument_keys": sorted(arguments), "attempts": result.attempts}
+        if result.error is not None:
+            details["error"] = result.error.type.value
         self.audit.record(
             session_id=context.session_id,
             agent=context.agent,
-            tool=name,
-            action=name,
-            classification=tool.access,
+            capability_id=capability_id,
+            action=capability_id,
+            classification=visible.access if visible is not None else None,
             approval_id=approval_id,
-            result="OK",
-            details={"argument_keys": sorted(arguments)},
-        )
-        self.trace.emit(
-            session_id=context.session_id,
-            category=TraceCategory.TOOL_USE,
-            name=name,
-            status=TraceStatus.COMPLETED,
-            details={**details, "result_type": type(result).__name__},
-            duration_ms=(perf_counter() - started) * 1000,
+            result=audit_result,
+            details=details,
         )
         return result
 
-    def specs_for(self, capability: Any) -> tuple[AgentSpec, ...]:
-        return tuple(spec for spec in self._specs.values() if capability in spec.capabilities)
+    def discover(self, context: AgentContext) -> tuple[Any, ...]:
+        return self._capabilities.discover(self.invocation_context(context))
+
+    def llm_tools(self, context: AgentContext) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": self._function_name(capability.id),
+                    "description": capability.description,
+                    "parameters": capability.input_schema,
+                },
+            }
+            for capability in self.discover(context)
+            if capability.input_schema is not None
+        ]
+
+    def resolve_llm_name(self, name: str, context: AgentContext) -> str:
+        for capability in self.discover(context):
+            if self._function_name(capability.id) == name:
+                return capability.id
+        return name
+
+    @staticmethod
+    def _function_name(capability_id: str) -> str:
+        return "capability__" + capability_id.replace(".", "__").replace("-", "_")
+
+    @staticmethod
+    def invocation_context(context: AgentContext, *, approval_id: str | None = None) -> InvocationContext:
+        return InvocationContext(
+            run_id=context.run_id,
+            session_id=context.session_id,
+            agent_id=context.agent,
+            repository=context.repository,
+            read_only=context.read_only,
+            approval_id=approval_id,
+            delegation_depth=context.delegation_depth,
+        )
+
+    def specs_for(self, route: Any) -> tuple[AgentSpec, ...]:
+        return tuple(spec for spec in self._specs.values() if route in spec.routes)
 
     def spec(self, agent_name: str) -> AgentSpec:
         try:
             return self._specs[agent_name]
         except KeyError as exc:
             raise ValidationError(f"unknown agent: {agent_name}") from exc
-
-    def _record_denied(
-        self,
-        context: AgentContext,
-        access: AccessLevel,
-        tool: str,
-        approval_id: str | None,
-        reason: str,
-    ) -> None:
-        self.audit.record(
-            session_id=context.session_id,
-            agent=context.agent,
-            tool=tool,
-            action=tool,
-            classification=access,
-            approval_id=approval_id,
-            result="DENIED",
-            details={"error": reason},
-        )
-        self.trace.emit(
-            session_id=context.session_id,
-            category=TraceCategory.TOOL_USE,
-            name=tool,
-            status=TraceStatus.DENIED,
-            message=reason,
-            details={"agent": context.agent, "classification": access.value},
-        )

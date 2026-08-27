@@ -5,22 +5,22 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from threading import Lock
 from typing import Any, ClassVar
 
 from gitagent.domain.errors import ApprovalRequired, ValidationError
-from gitagent.domain.models import PlannedToolCall
+from gitagent.domain.models import PlannedCapabilityCall
 
 
 def _canonical(arguments: dict[str, Any]) -> str:
     return json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _exact_call(tool: str, arguments: dict[str, Any]) -> str:
-    """Keep an exact canonical tool-and-arguments snapshot for direct comparison."""
+def _exact_call(capability_id: str, arguments: dict[str, Any]) -> str:
+    """Keep an exact canonical capability-and-arguments snapshot for direct comparison."""
 
-    return _canonical({"tool": tool, "arguments": arguments})
+    return _canonical({"capability_id": capability_id, "arguments": arguments})
 
 
 @dataclass
@@ -29,7 +29,7 @@ class ApprovalRequest:
     session_id: str
     repository: str
     summary: str
-    calls: list[PlannedToolCall]
+    calls: list[PlannedCapabilityCall]
     created_at: str
     decision: str | None = None
     decided_at: str | None = None
@@ -51,7 +51,7 @@ class ApprovalStore:
         session_id: str,
         repository: str,
         summary: str,
-        calls: list[PlannedToolCall],
+        calls: list[PlannedCapabilityCall],
     ) -> ApprovalRequest:
         if not calls:
             raise ValidationError("an approval request must describe at least one mutation")
@@ -61,8 +61,8 @@ class ApprovalStore:
             repository=repository,
             summary=summary,
             calls=calls,
-            created_at=datetime.now(timezone.utc).isoformat(),
-            _remaining=[_exact_call(call.tool, call.arguments) for call in calls],
+            created_at=datetime.now(UTC).isoformat(),
+            _remaining=[_exact_call(call.capability_id, call.arguments) for call in calls],
         )
         with self._lock:
             self._requests[request.approval_id] = request
@@ -76,7 +76,7 @@ class ApprovalStore:
             if request.decision is not None:
                 raise ApprovalRequired("approval has already been decided")
             request.decision = decision
-            request.decided_at = datetime.now(timezone.utc).isoformat()
+            request.decided_at = datetime.now(UTC).isoformat()
             return request
 
     def supersede(self, approval_id: str) -> ApprovalRequest:
@@ -85,12 +85,20 @@ class ApprovalStore:
             if request.decision is not None:
                 raise ApprovalRequired("only a pending approval can be superseded")
             request.decision = "Superseded"
-            request.decided_at = datetime.now(timezone.utc).isoformat()
+            request.decided_at = datetime.now(UTC).isoformat()
+            return request
+
+    def invalidate(self, approval_id: str) -> ApprovalRequest:
+        with self._lock:
+            request = self._get(approval_id)
+            request.decision = "Invalidated"
+            request.decided_at = datetime.now(UTC).isoformat()
+            request._remaining.clear()
             return request
 
     def invalidate_all(self) -> int:
         invalidated = 0
-        decided_at = datetime.now(timezone.utc).isoformat()
+        decided_at = datetime.now(UTC).isoformat()
         with self._lock:
             for request in self._requests.values():
                 if request.decision == "Invalidated" and not request._remaining:
@@ -106,18 +114,18 @@ class ApprovalStore:
         *,
         approval_id: str | None,
         session_id: str,
-        tool: str,
+        capability_id: str,
         arguments: dict[str, Any],
     ) -> None:
         if not approval_id:
-            raise ApprovalRequired("GitHub mutation requires explicit approval")
+            raise ApprovalRequired("Capability mutation requires explicit approval")
         with self._lock:
             request = self._get(approval_id)
             if request.session_id != session_id:
                 raise ApprovalRequired("approval belongs to a different Session")
             if request.decision != "Approve":
                 raise ApprovalRequired("only an explicit Approve decision authorizes mutation")
-            actual = _exact_call(tool, arguments)
+            actual = _exact_call(capability_id, arguments)
             if not request._remaining or request._remaining[0] != actual:
                 raise ApprovalRequired("approval scope or mutation order does not match the actual operation")
             request._remaining.pop(0)

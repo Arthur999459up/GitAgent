@@ -1,1 +1,1 @@
-"""Production support for persistence, observability, and tool hosting."""
+"""Production support for persistence, observability, and transport adapters."""

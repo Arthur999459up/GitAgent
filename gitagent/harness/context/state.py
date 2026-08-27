@@ -3,21 +3,31 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
-from gitagent.domain.models import AccessLevel, AgentGuidance, AgentSpec, CandidatePatch, ChangeRequest, VerificationReport
+from gitagent.capability import AccessLevel, CapabilityResult
+from gitagent.domain.errors import ValidationError
+from gitagent.domain.models import (
+    AgentGuidance,
+    AgentSpec,
+    CandidatePatch,
+    ChangeRequest,
+    VerificationReport,
+)
 from gitagent.harness.context import estimate_tokens
-from gitagent.harness.tools.file_reads import FileReadLedger
+from gitagent.harness.file_reads import FileReadLedger
 
 if TYPE_CHECKING:
     from gitagent.harness.execution import AgentHarness
 
 
 @dataclass(frozen=True)
-class ToolCallRecord:
+class CapabilityCallRecord:
     arguments: dict[str, Any]
     observation_data: Any
+    result: CapabilityResult
     cached: bool = False
     covered: bool = False
 
@@ -40,6 +50,7 @@ class AgentContext:
     ) -> None:
         self._harness = harness
         self.spec = spec
+        self.run_id = f"run-{uuid.uuid4().hex}"
         self.session_id = session_id
         self.repository = repository
         self.goal = goal
@@ -51,6 +62,7 @@ class AgentContext:
         self.phase = ""
         self.steps = 0
         self.max_steps = max_steps
+        self.delegation_depth = 0
         self.observations: list[dict[str, Any]] = []
         self.pending: Any = None
         self.question = ""
@@ -66,7 +78,7 @@ class AgentContext:
         self.result_required = True
         self.read_cache: dict[str, Any] = {}
         self.file_reads = FileReadLedger()
-        self.last_tool_call: ToolCallRecord | None = None
+        self.last_capability_call: CapabilityCallRecord | None = None
         self.error: str | None = None
         self.finished = False
 
@@ -86,38 +98,75 @@ class AgentContext:
     def context_budget(self) -> int:
         return self._harness.context_budget
 
-    def tool(self, name: str, *, approval_id: str | None = None, **arguments: Any) -> Any:
-        self.last_tool_call = None
-        prepared = self.file_reads.prepare(name, arguments)
+    def invoke(self, capability_id: str, *, approval_id: str | None = None, **arguments: Any) -> Any:
+        self.last_capability_call = None
+        try:
+            prepared = self.file_reads.prepare(
+                capability_id,
+                arguments,
+                repository=self.repository,
+            )
+        except ValidationError:
+            prepared = None
         actual_arguments = prepared.actual_arguments if prepared is not None else dict(arguments)
         if actual_arguments is None:
-            result, observation_data = self.file_reads.complete(prepared, None)
-            self.last_tool_call = ToolCallRecord(dict(arguments), observation_data, cached=True, covered=True)
-            return result
+            content, observation_data = self.file_reads.complete(prepared, None)
+            result = CapabilityResult(capability_id, "success", "data", content, attempts=0)
+            self.last_capability_call = CapabilityCallRecord(
+                dict(arguments), observation_data, result, cached=True, covered=True
+            )
+            return content
 
-        tool = self._harness.server.get_tool(name)
-        cache_key = json.dumps([name, actual_arguments], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        cacheable = tool.access == AccessLevel.READ and prepared is None
+        capability = next(
+            (item for item in self._harness.discover(self) if item.id == capability_id),
+            None,
+        )
+        cache_key = json.dumps(
+            [capability_id, actual_arguments], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        cacheable = capability is not None and capability.access == AccessLevel.READ and prepared is None
         cached = cacheable and cache_key in self.read_cache
         if cached:
-            raw_result = self.read_cache[cache_key]
+            cached_result = self.read_cache[cache_key]
+            raw_result = cached_result["content"]
+            invocation_result = CapabilityResult(
+                capability_id,
+                "success",
+                str(cached_result["type"]),
+                raw_result,
+                attempts=0,
+            )
         else:
-            raw_result = self._harness.execute_tool(self, name, actual_arguments, approval_id=approval_id)
-            if cacheable:
-                self.read_cache[cache_key] = raw_result
+            invocation_result = self._harness.invoke(
+                self, capability_id, actual_arguments, approval_id=approval_id
+            )
+            raw_result = invocation_result.content
+            if cacheable and invocation_result.status == "success":
+                self.read_cache[cache_key] = {
+                    "type": invocation_result.type,
+                    "content": raw_result,
+                }
 
-        if prepared is not None:
-            result, observation_data = self.file_reads.complete(prepared, raw_result)
+        if invocation_result.status != "success":
+            observation_data = None
+            content: Any = invocation_result
+        elif prepared is not None:
+            content, observation_data = self.file_reads.complete(prepared, raw_result)
         else:
-            result = raw_result
-            observation_data = {"already_observed": True, "tool": name, "arguments": actual_arguments} if cached else raw_result
-        self.last_tool_call = ToolCallRecord(
+            content = raw_result
+            observation_data = (
+                {"already_observed": True, "capability_id": capability_id, "arguments": actual_arguments}
+                if cached
+                else raw_result
+            )
+        self.last_capability_call = CapabilityCallRecord(
             actual_arguments,
             observation_data,
+            invocation_result,
             cached=cached,
             covered=bool(prepared and prepared.covered_indexes),
         )
-        return result
+        return content
 
     def prompt_overhead(self) -> int:
         value = {
@@ -127,6 +176,6 @@ class AgentContext:
             "entity_type": self.entity_type,
             "entity_id": self.entity_id,
             "guidance": asdict(self.guidance) if self.guidance is not None else None,
-            "tools": self._harness.client.llm_tools(self.spec.allowed_tools),
+            "capabilities": self._harness.llm_tools(self),
         }
         return estimate_tokens(json.dumps(value, ensure_ascii=False, default=str)) + 512

@@ -6,7 +6,13 @@ import json
 from typing import Any
 
 from gitagent.domain.errors import RoutingError, ValidationError
-from gitagent.domain.models import AgentSpec, MainDecision, Route, RoutingContext, to_plain
+from gitagent.domain.models import (
+    AgentSpec,
+    MainDecision,
+    Route,
+    RoutingContext,
+    to_plain,
+)
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.model import Reasoner, structured_request_payload
@@ -28,7 +34,7 @@ _MAIN_SCHEMA = {
 
 _MAIN_SYSTEM = """You are GitAgent's Main Agent. One Session is one continuous Main Agent context.
 Understand the user's current request from the Session summary, recent history, working state, and explicit memories.
-Do not invent or manage tasks, runs, workflow lifecycles, approvals, or tool calls.
+Do not invent or manage tasks, runs, workflow lifecycles, approvals, or capability calls.
 If repository work is needed, choose exactly one target_agent: issues, pull_requests, or repository.
 Route every Pull Request request—including Review, CI, PR-scoped code work, approval, readiness, and merge—to pull_requests.
 Route direct repository exploration, search, explanation, impact analysis, planning, history, and arbitrary repository modification to repository.
@@ -43,7 +49,6 @@ _MAIN_SPEC = AgentSpec(
     name="main",
     role="Own Session conversation intent and choose the appropriate domain agent when repository work is needed.",
     system_prompt=_MAIN_SYSTEM,
-    allowed_tools=frozenset(),
     output_schema=(
         "target_agent",
         "entity_type",
@@ -53,7 +58,7 @@ _MAIN_SPEC = AgentSpec(
         "clarify",
         "requested_reply",
     ),
-    capabilities=frozenset({"conversation_orchestration"}),
+    routes=frozenset({"conversation_orchestration"}),
 )
 
 
@@ -112,7 +117,7 @@ class MainAgent:
         payload: dict[str, Any] = {
             "user_input": text,
             "repository": repository,
-            "capabilities": self._capabilities(),
+            "routes": self._routes(),
             "session": {
                 "summary": context.summary,
                 "recent_history": list(context.history_units),
@@ -123,7 +128,7 @@ class MainAgent:
         }
         return (
             "Decide whether to answer directly or choose one domain agent. "
-            "Do not select tools or create lifecycle objects.\n"
+            "Do not select capabilities or create lifecycle objects.\n"
             + json.dumps(payload, ensure_ascii=False)
         )
 
@@ -162,7 +167,7 @@ class MainAgent:
             requested_reply=bool(raw.get("requested_reply", False)),
         )
 
-    def _capabilities(self) -> list[dict[str, Any]]:
+    def _routes(self) -> list[dict[str, Any]]:
         names = {
             Route.ISSUE: "issues",
             Route.PULL_REQUEST: "pull_requests",

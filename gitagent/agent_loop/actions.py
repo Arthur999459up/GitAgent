@@ -6,13 +6,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
-from gitagent.domain.models import PlannedToolCall
+from gitagent.domain.models import PlannedCapabilityCall
 
 
 class AgentActionKind(str, Enum):
-    TOOL = "tool"
+    CAPABILITY = "capability"
     APPLY_ISSUE_FIX = "apply_issue_fix"
     APPLY_REPOSITORY_CHANGE = "apply_repository_change"
+    CONTINUE = "continue"
     ASK = "ask"
     FINISH = "finish"
 
@@ -23,7 +24,7 @@ class AgentAction:
 
     kind: AgentActionKind
     summary: str = ""
-    tool: str | None = None
+    capability_id: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
     question: str = ""
     message: str = ""
@@ -31,11 +32,11 @@ class AgentAction:
 
 @dataclass
 class PendingAction:
-    """An exact set of tool calls waiting for user approval."""
+    """An exact set of capability calls waiting for user approval."""
 
     approval_id: str
     summary: str
-    calls: list[PlannedToolCall]
+    calls: list[PlannedCapabilityCall]
 
 
 class AgentLoopAgent(Protocol):

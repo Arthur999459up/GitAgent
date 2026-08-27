@@ -1,4 +1,4 @@
-"""Harness: context, tools, constraints, validation, and recovery around the Agent Loop."""
+"""Harness: context, capabilities, constraints, validation, and recovery around the Agent Loop."""
 
 from .context.state import AgentContext
 from .execution import AgentHarness

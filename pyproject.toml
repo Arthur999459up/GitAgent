@@ -12,6 +12,7 @@ dependencies = [
     "prompt-toolkit>=3.0,<4",
     "rich>=13,<16",
     "python-dotenv>=1.0,<2",
+    "PyYAML>=6,<7",
 ]
 
 [project.optional-dependencies]
@@ -33,3 +34,8 @@ gitagent = [
     "prompts/*.md",
     "prompts/*/*.md",
 ]
+
+[tool.setuptools.data-files]
+"share/gitagent" = ["capabilities.yaml"]
+"share/gitagent/skills/code-review" = ["skills/code-review/SKILL.md"]
+"share/gitagent/skills/debug" = ["skills/debug/SKILL.md"]

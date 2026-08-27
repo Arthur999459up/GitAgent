@@ -12,6 +12,11 @@ from .builder import (
     ContextBuilder,
     ContextBuildError,
 )
+from .capability_history import (
+    capability_attempted,
+    capability_failure_observed,
+    find_capability_observation,
+)
 from .compact import (
     CompactResult,
     DeterministicCompactor,
@@ -30,8 +35,11 @@ __all__ = [
     "ContextBuildError",
     "ContextBuilder",
     "DeterministicCompactor",
+    "capability_attempted",
+    "capability_failure_observed",
     "context_pressure",
     "estimate_tokens",
+    "find_capability_observation",
     "merge_summary_records",
     "render_agent_observations",
     "render_context_observations",

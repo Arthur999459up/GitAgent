@@ -10,22 +10,22 @@ class RoutingError(GitAgentError):
 
 
 class PermissionDenied(GitAgentError):
-    """An agent attempted a tool or access level outside its specification."""
+    """An operation crossed an explicit permission boundary."""
 
 
 class ApprovalRequired(PermissionDenied):
     """A mutation did not carry a valid, exact approval."""
 
 
-class ToolExecutionError(GitAgentError):
-    """An MCP tool failed."""
+class ExternalExecutionError(GitAgentError):
+    """A pure infrastructure adapter or approved external operation failed."""
 
     def __init__(self, message: str, *, user_message: str | None = None) -> None:
         super().__init__(message)
         self.user_message = user_message or message
 
 
-class ResourceNotFoundError(ToolExecutionError):
+class ResourceNotFoundError(ExternalExecutionError):
     """A remote lookup could not find the requested resource."""
 
 

@@ -8,8 +8,20 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from gitagent.domain.models import ContextMemory, RoutingContext, SessionScope
-from gitagent.infra.persistence import OPEN_QUESTION_CHARACTER_LIMIT, MemoryRecord, SessionManager, TurnRecord
-from .budget import EMERGENCY_THRESHOLD, LIGHT_THRESHOLD, SUMMARY_THRESHOLD, context_pressure, estimate_tokens
+from gitagent.infra.persistence import (
+    OPEN_QUESTION_CHARACTER_LIMIT,
+    MemoryRecord,
+    SessionManager,
+    TurnRecord,
+)
+
+from .budget import (
+    EMERGENCY_THRESHOLD,
+    LIGHT_THRESHOLD,
+    SUMMARY_THRESHOLD,
+    context_pressure,
+    estimate_tokens,
+)
 from .compact import (
     SUMMARY_TAIL_UNITS,
     CompactResult,

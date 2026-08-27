@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from gitagent.domain.errors import ValidationError
-from gitagent.harness.tools.file_access import parse_file_read_requests, safe_repository_path
+from gitagent.harness.file_access import parse_file_read_requests, safe_repository_path
 
 
 @dataclass(frozen=True)
@@ -134,7 +134,9 @@ class FileCoverage:
 
 @dataclass(frozen=True)
 class PreparedFileRead:
-    tool: str
+    capability_id: str
+    repository: str
+    ref: str | None
     requested_arguments: dict[str, Any]
     actual_arguments: dict[str, Any] | None
     requested: tuple[FileReadRequest, ...]
@@ -148,12 +150,17 @@ class FileReadLedger:
     def __init__(self) -> None:
         self._files: dict[tuple[str, str, str | None], FileCoverage] = {}
 
-    def prepare(self, tool: str, arguments: dict[str, Any]) -> PreparedFileRead | None:
-        if tool not in {"repository.read_file", "repository.read_files"}:
+    def prepare(
+        self,
+        capability_id: str,
+        arguments: dict[str, Any],
+        *,
+        repository: str,
+    ) -> PreparedFileRead | None:
+        if capability_id not in {"repository.read_file", "repository.read_files"}:
             return None
-        repository = str(arguments.get("repository") or "")
         ref = str(arguments["ref"]) if arguments.get("ref") is not None else None
-        if tool == "repository.read_file":
+        if capability_id == "repository.read_file":
             requests = (
                 FileReadRequest.parse(
                     {key: arguments[key] for key in ("path", "start_line", "limit") if key in arguments}
@@ -187,20 +194,30 @@ class FileReadLedger:
         actual_arguments: dict[str, Any] | None
         if not actual:
             actual_arguments = None
-        elif tool == "repository.read_file":
+        elif capability_id == "repository.read_file":
             actual_arguments = {
-                "repository": repository,
+                **{
+                    key: value
+                    for key, value in arguments.items()
+                    if key not in {"path", "start_line", "limit", "ref"}
+                },
                 **actual[0].to_arguments(),
                 **({"ref": ref} if ref is not None else {}),
             }
         else:
             actual_arguments = {
-                "repository": repository,
+                **{
+                    key: value
+                    for key, value in arguments.items()
+                    if key not in {"requests", "ref"}
+                },
                 "requests": [request.to_arguments() for request in actual],
                 **({"ref": ref} if ref is not None else {}),
             }
         return PreparedFileRead(
-            tool,
+            capability_id,
+            repository,
+            ref,
             dict(arguments),
             actual_arguments,
             requests,
@@ -213,11 +230,11 @@ class FileReadLedger:
         prepared: PreparedFileRead,
         result: dict[str, Any] | None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        repository = str(prepared.requested_arguments.get("repository") or "")
-        ref = str(prepared.requested_arguments["ref"]) if prepared.requested_arguments.get("ref") is not None else None
+        repository = prepared.repository
+        ref = prepared.ref
         fresh = (
             [result]
-            if prepared.tool == "repository.read_file" and result is not None
+            if prepared.capability_id == "repository.read_file" and result is not None
             else list((result or {}).get("files", []))
         )
         for request, item in zip(prepared.actual, fresh, strict=True):
@@ -237,7 +254,7 @@ class FileReadLedger:
             observation_files.append(item)
             returned.append(item)
 
-        if prepared.tool == "repository.read_file":
+        if prepared.capability_id == "repository.read_file":
             return returned[0], observation_files[0]
         return {"files": returned}, {"files": observation_files}
 

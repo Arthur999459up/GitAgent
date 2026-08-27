@@ -1,40 +1,35 @@
-"""供自动化测试使用的确定性 MCP 测试替身。"""
+"""Deterministic in-memory fake for the pure GitHub API adapter."""
 
 from __future__ import annotations
 
-import ast
-import json
 import re
 from copy import deepcopy
 from pathlib import PurePosixPath
 from threading import Lock
 from typing import Any
 
-import tomllib
+from gitagent.domain.errors import ResourceNotFoundError, ValidationError
+from gitagent.harness.file_access import (
+    parse_file_read_requests,
+    safe_repository_path,
+    select_file_lines,
+)
 
-from gitagent.domain.errors import ResourceNotFoundError, ToolExecutionError, ValidationError
-from gitagent.domain.models import AccessLevel
-from gitagent.harness.tools.file_access import parse_file_read_requests, safe_repository_path, select_file_lines
-from gitagent.harness.tools.registry import tool_spec
-from .server import MCPServer
+from .errors import GitHubAPIError
 
 
-class InMemoryMCPServer(MCPServer):
+class InMemoryGitHubClient:
     """由显式测试数据驱动的远程仓库语义，不执行 clone。"""
 
     def __init__(self, repositories: dict[str, dict[str, Any]] | None = None) -> None:
-        super().__init__()
         self.repositories: dict[str, dict[str, Any]] = deepcopy(repositories or {})
         self._lock = Lock()
-        self._register_repository_tools()
-        self._register_github_tools()
-        self._register_verification_tools()
 
     def _repo(self, repository: str) -> dict[str, Any]:
         try:
             repo = self.repositories[repository]
         except KeyError as exc:
-            raise ToolExecutionError(f"repository not found: {repository}") from exc
+            raise ResourceNotFoundError(f"repository not found: {repository}") from exc
         repo.setdefault("files", {})
         repo.setdefault("issues", {})
         repo.setdefault("milestones", {})
@@ -46,131 +41,6 @@ class InMemoryMCPServer(MCPServer):
         repo.setdefault("draft_prs", [])
         repo.setdefault("history", {})
         return repo
-
-    def _register_repository_tools(self) -> None:
-        read = AccessLevel.READ
-        self.register(
-            tool_spec("repository.get_repo_tree", read, "List a bounded remote repository tree.", self.get_repo_tree)
-        )
-        self.register(
-            tool_spec(
-                "repository.get_default_branch",
-                read,
-                "Fetch the repository default branch and its current commit SHA.",
-                self.get_default_branch,
-            )
-        )
-        self.register(
-            tool_spec(
-                "repository.get_file_status",
-                read,
-                "Check which targeted repository file paths exist at a ref.",
-                self.get_file_status,
-            )
-        )
-        self.register(tool_spec("repository.search_code", read, "Search remote file content.", self.search_code))
-        self.register(tool_spec("repository.read_file", read, "Read a bounded line range from one file.", self.read_file))
-        self.register(
-            tool_spec(
-                "repository.read_files",
-                read,
-                "Read targeted file ranges. Each request contains path and optional start_line/limit.",
-                self.read_files,
-            )
-        )
-        self.register(tool_spec("repository.find_symbol", read, "Find symbol definitions.", self.find_symbol))
-        self.register(
-            tool_spec("repository.find_references", read, "Find textual symbol references.", self.find_references)
-        )
-        self.register(tool_spec("repository.get_pr_diff", read, "Fetch a pull-request diff.", self.get_pr_diff))
-        self.register(
-            tool_spec(
-                "repository.get_changed_files", read, "Fetch changed paths for a pull request.", self.get_changed_files
-            )
-        )
-        self.register(
-            tool_spec("repository.get_file_history", read, "Fetch bounded file history.", self.get_file_history)
-        )
-
-    def _register_github_tools(self) -> None:
-        read = AccessLevel.READ
-        write = AccessLevel.WRITE
-        destructive = AccessLevel.DESTRUCTIVE
-        self.register(tool_spec("github.get_issue", read, "Fetch one issue.", self.get_issue))
-        self.register(tool_spec("github.list_issues", read, "List and filter bounded issue metadata.", self.list_issues))
-        self.register(
-            tool_spec("github.get_issue_comments", read, "Fetch bounded issue comments.", self.get_issue_comments)
-        )
-        self.register(
-            tool_spec("github.list_milestones", read, "List milestones so an Issue can reference one by number.", self.list_milestones)
-        )
-        self.register(tool_spec("github.get_pr", read, "Fetch one pull request.", self.get_pr))
-        self.register(
-            tool_spec("github.list_pull_requests", read, "List and filter pull requests.", self.list_pull_requests)
-        )
-        self.register(tool_spec("github.get_pr_comments", read, "Fetch pull-request comments.", self.get_pr_comments))
-        self.register(tool_spec("github.get_pr_reviews", read, "Fetch pull-request reviews.", self.get_pr_reviews))
-        self.register(tool_spec("github.get_workflow_runs", read, "Fetch workflow-run metadata.", self.get_workflow_runs))
-        self.register(tool_spec("github.get_job_logs", read, "Fetch a bounded failed-job log.", self.get_job_logs))
-        self.register(tool_spec("github.post_comment", write, "Post an issue or PR comment.", self.post_comment))
-        self.register(
-            tool_spec(
-                "github.create_issue",
-                write,
-                "Create an issue, optionally with labels, assignees, and a milestone number.",
-                self.create_issue,
-            )
-        )
-        self.register(
-            tool_spec(
-                "github.update_issue",
-                write,
-                "Update issue fields. Labels and assignees replace their complete current lists.",
-                self.update_issue,
-            )
-        )
-        self.register(
-            tool_spec(
-                "github.set_issue_lock",
-                write,
-                "Lock or unlock an issue discussion, with an optional GitHub lock reason.",
-                self.set_issue_lock,
-            )
-        )
-        self.register(tool_spec("github.update_pr", write, "Update pull-request state.", self.update_pr))
-        self.register(tool_spec("github.create_branch", write, "Create a branch.", self.create_branch))
-        self.register(
-            tool_spec(
-                "github.commit",
-                destructive,
-                "Commit exact file additions, modifications, and deletions.",
-                self.commit,
-            )
-        )
-        self.register(
-            tool_spec(
-                "github.commit_to_default_branch",
-                destructive,
-                "Atomically add, modify, and delete files in one commit on the default branch.",
-                self.commit_to_default_branch,
-            )
-        )
-        self.register(tool_spec("github.push", write, "Publish a prepared branch.", self.push))
-        self.register(tool_spec("github.create_draft_pr", write, "Create a draft pull request.", self.create_draft_pr))
-        self.register(tool_spec("github.post_review", write, "Publish a pull-request review.", self.post_review))
-        self.register(tool_spec("github.merge", destructive, "Merge a pull request.", self.merge))
-
-    def _register_verification_tools(self) -> None:
-        read = AccessLevel.READ
-        self.register(tool_spec("verification.run_lint", read, "Run bounded, non-runtime lint checks.", self.run_lint))
-        self.register(
-            tool_spec(
-                "verification.run_static_check",
-                read,
-                "Parse changed files and run static safety checks.",
-                self.run_static_check,
-            )
-        )
 
     # Repository namespace -------------------------------------------------
 
@@ -284,7 +154,7 @@ class InMemoryMCPServer(MCPServer):
         try:
             content = repo["files"][safe]
         except KeyError as exc:
-            raise ToolExecutionError(f"file not found: {safe}") from exc
+            raise ResourceNotFoundError(f"file not found: {safe}") from exc
         return {"path": safe, **select_file_lines(content, start_line=start_line, limit=limit)}
 
     def read_files(
@@ -400,11 +270,8 @@ class InMemoryMCPServer(MCPServer):
             milestones.append(milestone)
         return {"milestones": deepcopy(milestones[: max(1, min(limit, 100))])}
 
-    def get_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
-        try:
-            return deepcopy(self._get_numbered(self._repo(repository)["prs"], pr_number, "pull request"))
-        except ResourceNotFoundError:
-            return None
+    def get_pr(self, repository: str, pr_number: int) -> dict[str, Any]:
+        return deepcopy(self._get_numbered(self._repo(repository)["prs"], pr_number, "pull request"))
 
     def list_pull_requests(
         self,
@@ -573,7 +440,7 @@ class InMemoryMCPServer(MCPServer):
     def _issue_milestone(repo: dict[str, Any], milestone_number: int | None) -> dict[str, Any] | None:
         if milestone_number is None:
             return None
-        return deepcopy(InMemoryMCPServer._get_numbered(repo["milestones"], milestone_number, "milestone"))
+        return deepcopy(InMemoryGitHubClient._get_numbered(repo["milestones"], milestone_number, "milestone"))
 
     def update_pr(self, repository: str, pr_number: int, state: str | None = None) -> dict[str, Any]:
         with self._lock:
@@ -590,9 +457,9 @@ class InMemoryMCPServer(MCPServer):
         with self._lock:
             repo = self._repo(repository)
             if base not in repo["branches"]:
-                raise ToolExecutionError(f"base branch not found: {base}")
+                raise ResourceNotFoundError(f"base branch not found: {base}")
             if branch in repo["branches"]:
-                raise ToolExecutionError(f"branch already exists: {branch}")
+                raise GitHubAPIError(f"branch already exists: {branch}", status_code=409, request_sent=False)
             repo["branches"][branch] = {"base": base, "commits": [], "pushed": False}
         return {"repository": repository, "branch": branch, "base": base}
 
@@ -613,10 +480,10 @@ class InMemoryMCPServer(MCPServer):
         with self._lock:
             repo = self._repo(repository)
             if branch not in repo["branches"]:
-                raise ToolExecutionError(f"branch not found: {branch}")
+                raise ResourceNotFoundError(f"branch not found: {branch}")
             missing = safe_deletions - set(repo["files"])
             if missing:
-                raise ToolExecutionError(f"cannot delete missing file: {min(missing)}")
+                raise ResourceNotFoundError(f"cannot delete missing file: {min(missing)}")
             commit_id = f"commit-{len(repo['branches'][branch].setdefault('commits', [])) + 1}"
             repo["branches"][branch]["commits"].append(
                 {
@@ -656,10 +523,14 @@ class InMemoryMCPServer(MCPServer):
             state = repo["branches"].setdefault(branch, {"pushed": True, "commits": []})
             actual_head_sha = str(state.get("head_sha") or f"fixture-head-{len(state.get('commits', []))}")
             if expected_head_sha != actual_head_sha:
-                raise ToolExecutionError("default branch changed after the candidate was prepared")
+                raise GitHubAPIError(
+                    "default branch changed after the candidate was prepared",
+                    status_code=409,
+                    request_sent=False,
+                )
             missing = safe_deletions - set(repo["files"])
             if missing:
-                raise ToolExecutionError(f"cannot delete missing file: {min(missing)}")
+                raise ResourceNotFoundError(f"cannot delete missing file: {min(missing)}")
             added_files = sorted(set(safe_files) - set(repo["files"]))
             modified_files = sorted(set(safe_files) & set(repo["files"]))
             commit_id = f"commit-{len(state.setdefault('commits', [])) + 1}"
@@ -689,9 +560,13 @@ class InMemoryMCPServer(MCPServer):
         with self._lock:
             repo = self._repo(repository)
             if branch not in repo["branches"]:
-                raise ToolExecutionError(f"branch not found: {branch}")
+                raise ResourceNotFoundError(f"branch not found: {branch}")
             if not repo["branches"][branch].get("commits"):
-                raise ToolExecutionError("cannot push a branch without a candidate commit")
+                raise GitHubAPIError(
+                    "cannot push a branch without a candidate commit",
+                    status_code=409,
+                    request_sent=False,
+                )
             repo["branches"][branch]["pushed"] = True
         return {"repository": repository, "branch": branch, "pushed": True}
 
@@ -709,7 +584,7 @@ class InMemoryMCPServer(MCPServer):
         with self._lock:
             repo = self._repo(repository)
             if head not in repo["branches"] or not repo["branches"][head].get("pushed"):
-                raise ToolExecutionError("head branch must exist and be pushed")
+                raise GitHubAPIError("head branch must exist and be pushed", status_code=409, request_sent=False)
             number = max([0, *[int(key) for key in repo["prs"]], *[int(pr["number"]) for pr in repo["draft_prs"]]]) + 1
             result = {"number": number, "title": title, "body": body, "base": base, "head": head, "draft": True}
             repo["draft_prs"].append(result)
@@ -728,13 +603,13 @@ class InMemoryMCPServer(MCPServer):
     def merge(self, repository: str, pr_number: int, expected_head_sha: str) -> dict[str, Any]:
         pull_request = self._get_numbered(self._repo(repository)["prs"], pr_number, "pull request")
         if str(pull_request.get("state", "open")).casefold() != "open":
-            raise ToolExecutionError("only an open Pull Request can be merged")
+            raise GitHubAPIError("only an open Pull Request can be merged", status_code=409, request_sent=False)
         if bool(pull_request.get("draft")):
-            raise ToolExecutionError("a draft Pull Request cannot be merged")
+            raise GitHubAPIError("a draft Pull Request cannot be merged", status_code=409, request_sent=False)
         head = pull_request.get("head") or {}
         actual_sha = str(head.get("sha", "")) if isinstance(head, dict) else ""
         if not expected_head_sha or expected_head_sha != actual_sha:
-            raise ToolExecutionError("pull request head changed after review")
+            raise GitHubAPIError("pull request head changed after review", status_code=409, request_sent=False)
         pull_request["state"] = "closed"
         pull_request["merged"] = True
         return {
@@ -743,42 +618,6 @@ class InMemoryMCPServer(MCPServer):
             "head_sha": actual_sha,
             "merged": True,
         }
-
-    # Verification namespace ---------------------------------------------
-
-    def run_lint(self, files: dict[str, str]) -> dict[str, Any]:
-        errors: list[str] = []
-        for path, content in files.items():
-            safe = safe_repository_path(path)
-            for number, line in enumerate(content.splitlines(), 1):
-                if line.rstrip() != line:
-                    errors.append(f"{safe}:{number}: trailing whitespace")
-                if "\t" in line and safe.endswith(".py"):
-                    errors.append(f"{safe}:{number}: tab indentation in Python")
-                if len(line) > 160:
-                    errors.append(f"{safe}:{number}: line exceeds 160 characters")
-        return {"passed": not errors, "errors": errors, "files": sorted(files)}
-
-    def run_static_check(self, files: dict[str, str]) -> dict[str, Any]:
-        errors: list[str] = []
-        skipped: list[str] = []
-        for path, content in files.items():
-            safe = safe_repository_path(path)
-            try:
-                if safe.endswith(".py"):
-                    ast.parse(content, filename=safe)
-                elif safe.endswith(".json"):
-                    json.loads(content)
-                elif safe.endswith(".toml"):
-                    tomllib.loads(content)
-                elif safe.endswith((".yaml", ".yml")):
-                    skipped.append(f"{safe}: YAML parser is not installed")
-            except (SyntaxError, json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
-                errors.append(f"{safe}: {exc}")
-            if re.search(r"^(?:<{7}|={7}|>{7})", content, re.MULTILINE):
-                errors.append(f"{safe}: unresolved merge-conflict marker")
-        skipped.append("type check: no repository-specific type-checker configuration was provided")
-        return {"passed": not errors, "errors": errors, "skipped": skipped, "files": sorted(files)}
 
     # Helpers -------------------------------------------------------------
 

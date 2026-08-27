@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from threading import Lock
 from typing import Any
 
-from gitagent.domain.models import AccessLevel
+from gitagent.capability import AccessLevel
 
 
 @dataclass(frozen=True)
@@ -15,9 +15,9 @@ class AuditEvent:
     timestamp: str
     session_id: str
     agent: str
-    tool: str
+    capability_id: str
     action: str
-    classification: AccessLevel
+    classification: AccessLevel | None
     approval_id: str | None
     result: str
     details: dict[str, Any]
@@ -33,18 +33,18 @@ class AuditLog:
         *,
         session_id: str,
         agent: str,
-        tool: str,
+        capability_id: str,
         action: str,
-        classification: AccessLevel,
+        classification: AccessLevel | None,
         approval_id: str | None,
         result: str,
         details: dict[str, Any] | None = None,
     ) -> AuditEvent:
         event = AuditEvent(
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=datetime.now(UTC).isoformat(),
             session_id=session_id,
             agent=agent,
-            tool=tool,
+            capability_id=capability_id,
             action=action,
             classification=classification,
             approval_id=approval_id,

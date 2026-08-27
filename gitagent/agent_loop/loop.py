@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from gitagent.agent_loop.actions import AgentAction, AgentLoopAgent
+from gitagent.agent_loop.actions import AgentLoopAgent
 from gitagent.domain.errors import WorkflowError
 from gitagent.domain.models import WorkflowTurnDecision
 from gitagent.harness.action_dispatcher import HarnessActionDispatcher
@@ -30,7 +30,7 @@ class AgentLoop:
             raise WorkflowError("agent context is not waiting for user input")
         try:
             self.dispatcher.apply_user_decision(context, decision)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - loop boundary records programming failures
             self._fail(context, f"user decision failed: {exc}")
             return context
         if not context.finished and not context.error and not context.waiting:
@@ -52,7 +52,7 @@ class AgentLoop:
                 action = agent.decide(context)
                 self.dispatcher.emit(context, "progress", action.summary or action.kind.value)
                 should_continue = self.dispatcher.handle(context, agent, action)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - loop boundary records programming failures
                 self._fail(context, f"agent step failed: {exc}")
                 return
             if context.finished:
