@@ -9,12 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from gitagent.domain.errors import StateError, ValidationError
+from gitagent.domain.learning import KnowledgeRecord
 from gitagent.domain.models import SessionScope
 from gitagent.harness.context import CompactResult, ContextBuilder
 from gitagent.infra.github import GitHubClient
 from gitagent.infra.observability import TraceBus
 from gitagent.infra.persistence import (
-    MemoryRecord,
+    DomainEvidenceStore,
+    KnowledgeStore,
     SessionManager,
     SessionRecord,
     StateStore,
@@ -32,6 +34,15 @@ from .service import GitAgentService
 
 Renderer = Callable[[Any], None]
 
+
+@dataclass(frozen=True)
+class IndexedMemory:
+    """One CLI-visible memory with a short repository-scope index."""
+
+    index: int
+    record: KnowledgeRecord
+
+
 @dataclass
 class LiveApplication:
     config: CLIConfig
@@ -42,6 +53,8 @@ class LiveApplication:
     service: GitAgentService
     store: StateStore
     sessions: SessionManager
+    knowledge: KnowledgeStore
+    evidence: DomainEvidenceStore
     context_builder: ContextBuilder
     repository: str | None = None
     scope: SessionScope | None = None
@@ -121,7 +134,11 @@ class LiveApplication:
             )
             try:
                 result = self.service.handle(
-                    text, repository=repository, routing_context=routing_context, session_scope=scope
+                    text,
+                    repository=repository,
+                    routing_context=routing_context,
+                    session_scope=scope,
+                    turn_seq=turn.seq,
                 )
             except BaseException:
                 dispatch_started = self.service.dispatch_started
@@ -140,6 +157,13 @@ class LiveApplication:
                 route_summary=projection.route_summary, entity_manifests=projection.entity_manifests,
                 working_state=next_state,
             )
+            if result.agent is None or result.interaction_id is not None:
+                self.service.reflect_after_turn(
+                    turn_seq=turn.seq,
+                    user_input=text,
+                    assistant_text=projection.assistant_text,
+                    interaction_id=result.interaction_id,
+                )
             return result
         except KeyboardInterrupt as exc:
             self._fail_turn(scope, turn.seq, exc)
@@ -241,23 +265,70 @@ class LiveApplication:
     def compact(self) -> CompactResult:
         return self.context_builder.compact(self._require_scope())
 
-    def remember(self, scope: str, kind: str, content: str) -> tuple[MemoryRecord, bool]:
+    def set_auto_learning(self, enabled: bool) -> bool:
+        if not isinstance(enabled, bool):
+            raise TypeError("auto-learning state must be a boolean")
+        self.config.auto_learning = enabled
+        self.service.auto_learning = enabled
+        if self.service.learning is not None:
+            self.service.learning.enabled = enabled
+        return enabled
+
+    def remember(self, scope: str, kind: str, content: str) -> tuple[IndexedMemory, bool]:
         current = self._require_scope()
-        return self.sessions.remember(
+        record, created = self.knowledge.remember(
             current.account_key,
             current.repository_key,
             scope=scope,
             kind=kind,
             content=content,
         )
+        indexed = next(
+            item for item in self.indexed_memories() if item.record.knowledge_id == record.knowledge_id
+        )
+        return indexed, created
 
-    def list_memories(self, *, scope: str | None = None) -> tuple[MemoryRecord, ...]:
+    def indexed_memories(
+        self,
+        *,
+        scope: str | None = None,
+        kind: str | None = None,
+    ) -> tuple[IndexedMemory, ...]:
         current = self._require_scope()
-        return self.sessions.list_memories(current.account_key, current.repository_key, scope)
+        records = sorted(
+            self.knowledge.list_knowledge(current.account_key, current.repository_key),
+            key=lambda record: (record.created_at, record.knowledge_id),
+        )
+        if scope is None and kind is None:
+            visible_ids = {record.knowledge_id for record in records}
+        else:
+            visible_ids = {
+                record.knowledge_id
+                for record in self.knowledge.list_knowledge(
+                    current.account_key,
+                    current.repository_key,
+                    scope,
+                    kind=kind,
+                )
+            }
+        return tuple(
+            IndexedMemory(index, record)
+            for index, record in enumerate(records, start=1)
+            if record.knowledge_id in visible_ids
+        )
 
-    def forget(self, memory_id: str) -> MemoryRecord:
+    def forget(self, index: int) -> KnowledgeRecord:
+        if not isinstance(index, int) or isinstance(index, bool) or index < 1:
+            raise ValidationError("Memory number must be a positive integer")
         current = self._require_scope()
-        forgotten = self.sessions.forget(current.account_key, current.repository_key, memory_id)
+        indexed = next((item for item in self.indexed_memories() if item.index == index), None)
+        if indexed is None:
+            raise StateError("Memory number not found; run /memory to view current numbers")
+        forgotten = self.knowledge.forget(
+            current.account_key,
+            current.repository_key,
+            indexed.record.knowledge_id,
+        )
         if forgotten is None:
             raise StateError("Memory not found")
         return forgotten
@@ -269,6 +340,20 @@ class LiveApplication:
             project_output(output, text_sanitizer=self.store.text)
             if renderer is not None:
                 renderer(output)
+            interaction_id = self.service.completed_interaction_id
+            if interaction_id:
+                record = self.evidence.get(
+                    self._require_scope().account_key,
+                    self._require_scope().repository_key,
+                    interaction_id,
+                )
+                if record is not None:
+                    self.service.reflect_after_turn(
+                        turn_seq=record.completed_turn_seq,
+                        user_input="",
+                        assistant_text="",
+                        interaction_id=interaction_id,
+                    )
             return output
         except BaseException as exc:
             rebuild_error = self._rebuild_current_service()
@@ -285,9 +370,12 @@ class LiveApplication:
             main_reasoner=self.reasoner,
             agent_reasoner=self.reasoner,
             session_manager=self.sessions,
+            knowledge_store=self.knowledge,
+            evidence_store=self.evidence,
             trace=self.trace,
             session_scope=scope,
             input_budget_tokens=self.config.effective_input_budget,
+            auto_learning=self.config.auto_learning,
         )
 
     def _swap_service(self, service: GitAgentService) -> None:
@@ -369,8 +457,11 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
     )
     store = StateStore(config.state_path, secret_values=(config.github_token, config.api_key))
     sessions = SessionManager(store)
+    knowledge = KnowledgeStore(store)
+    evidence = DomainEvidenceStore(store)
     context_builder = ContextBuilder(
         sessions,
+        knowledge,
         context_window_tokens=config.context_window_tokens,
         max_output_tokens=config.max_tokens,
         safety_tokens=config.context_safety_tokens,
@@ -380,8 +471,11 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         main_reasoner=reasoner,
         agent_reasoner=reasoner,
         session_manager=sessions,
+        knowledge_store=knowledge,
+        evidence_store=evidence,
         trace=trace,
         input_budget_tokens=config.effective_input_budget,
+        auto_learning=config.auto_learning,
     )
     return LiveApplication(
         config=config,
@@ -392,6 +486,8 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         service=stateless_service,
         store=store,
         sessions=sessions,
+        knowledge=knowledge,
+        evidence=evidence,
         context_builder=context_builder,
     )
 

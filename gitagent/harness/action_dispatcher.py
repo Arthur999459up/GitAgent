@@ -42,6 +42,15 @@ class HarnessActionDispatcher:
         context.pending = PendingAction(approval.approval_id, summary, calls)
 
     def apply_user_decision(self, context: Any, decision: WorkflowTurnDecision) -> None:
+        self.observe(
+            context,
+            "user_decision",
+            {
+                "action": decision.action.value,
+                "instruction": decision.instruction,
+                "message": decision.message,
+            },
+        )
         if context.question:
             self.observe(context, "assistant", context.question)
             self.observe(context, "user", decision.instruction or decision.message or "")

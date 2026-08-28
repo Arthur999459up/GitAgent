@@ -48,12 +48,15 @@ class ResolvedReference:
 
 @dataclass(frozen=True)
 class ContextMemory:
-    """A bounded Memory item selected for one agent invocation."""
+    """A bounded, non-authoritative Knowledge item selected for one invocation."""
 
     memory_id: str
     scope: str
     kind: str
     content: str
+    topic: str = "general"
+    conditions: str = ""
+    source: str = "explicit_user"
 
 
 @dataclass(frozen=True)

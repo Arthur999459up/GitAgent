@@ -1,4 +1,4 @@
-"""Scoped Session, Turn, Working State, and explicit Memory lifecycle."""
+"""Scoped Session, Turn, and Working State lifecycle."""
 
 from __future__ import annotations
 
@@ -16,16 +16,11 @@ from gitagent.domain.models import SessionScope
 
 from .store import StateStore
 
-USER_MEMORY_LIMIT = 16
-USER_MEMORY_TOKEN_LIMIT = 1000
-REPOSITORY_MEMORY_LIMIT = 24
-REPOSITORY_MEMORY_TOKEN_LIMIT = 1600
 OPEN_QUESTION_CHARACTER_LIMIT = 50_000
 
 _ACCOUNT_KEY = re.compile(r"^(?P<api>.+)#user:(?P<id>[1-9][0-9]*)$")
 _REPOSITORY_KEY = re.compile(r"^(?P<api>.+)#repo:(?P<id>[1-9][0-9]*)$")
 _SESSION_ID = re.compile(r"^session-[0-9a-f]{32}$")
-_MEMORY_ID = re.compile(r"^mem-[0-9a-f]{16}$")
 
 
 @dataclass(frozen=True)
@@ -60,18 +55,6 @@ class TurnRecord:
     entity_manifests: list[dict[str, Any]]
     created_at: str
     completed_at: str | None
-
-
-@dataclass(frozen=True)
-class MemoryRecord:
-    memory_id: str
-    account_key: str
-    repository_key: str | None
-    scope: str
-    kind: str
-    content: str
-    created_at: str
-    updated_at: str
 
 
 def default_working_state() -> dict[str, Any]:
@@ -112,7 +95,7 @@ def build_repository_key(api_url: str, repository_id: int) -> str:
 
 
 class SessionManager:
-    """The only application component allowed to write Session or Memory state."""
+    """The application boundary for Session and Turn state."""
 
     def __init__(self, store: StateStore, *, token_counter: Any = None) -> None:
         self.store = store
@@ -474,109 +457,6 @@ class SessionManager:
             )
             return _session(self._session_row_tx(connection, account_key, repository_key, session_id))
 
-    def remember(
-        self,
-        account_key: str,
-        repository_key: str,
-        *,
-        scope: str,
-        kind: str,
-        content: str,
-    ) -> tuple[MemoryRecord, bool]:
-        _validate_scope_keys(account_key, repository_key)
-        _validate_memory_type(scope, kind)
-        raw_content = _require_string(content, "Memory content", maximum=500, allow_empty=False)
-        safe_content = self.store.text(
-            raw_content.strip(),
-            max_characters=500,
-            reject_secrets=True,
-        )
-        if not safe_content:
-            raise ValidationError("Memory content cannot be empty")
-        actual_repository = None if scope == "user" else repository_key
-        normalized = _normalize_whitespace(safe_content)
-        with self.store.transaction() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM memories WHERE account_key=? AND scope=?
-                    AND ((? IS NULL AND repository_key IS NULL) OR repository_key=?)
-                ORDER BY updated_at DESC, memory_id ASC
-                """,
-                (account_key, scope, actual_repository, actual_repository),
-            ).fetchall()
-            for row in rows:
-                record = _memory(row)
-                if _normalize_whitespace(record.content) == normalized:
-                    return record, False
-            count_limit = USER_MEMORY_LIMIT if scope == "user" else REPOSITORY_MEMORY_LIMIT
-            token_limit = USER_MEMORY_TOKEN_LIMIT if scope == "user" else REPOSITORY_MEMORY_TOKEN_LIMIT
-            existing_tokens = sum(self.token_counter(_memory(row).content) for row in rows)
-            if len(rows) >= count_limit or existing_tokens + self.token_counter(safe_content) > token_limit:
-                raise StateError("Memory capacity reached; use /memory and /forget before adding another item")
-            now = _utc_now()
-            memory_id = f"mem-{uuid.uuid4().hex[:16]}"
-            connection.execute(
-                """
-                INSERT INTO memories(memory_id,account_key,repository_key,scope,kind,content,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?)
-                """,
-                (memory_id, account_key, actual_repository, scope, kind, safe_content, now, now),
-            )
-            row = connection.execute("SELECT * FROM memories WHERE memory_id=?", (memory_id,)).fetchone()
-            return _memory(row), True
-
-    def list_memories(
-        self,
-        account_key: str,
-        repository_key: str,
-        scope: str | None = None,
-    ) -> tuple[MemoryRecord, ...]:
-        _validate_scope_keys(account_key, repository_key)
-        if scope not in {None, "user", "repository"}:
-            raise ValidationError("Memory scope must be user or repository")
-        connection = self.store.read()
-        try:
-            groups: list[MemoryRecord] = []
-            requested = (scope,) if scope else ("user", "repository")
-            for item_scope in requested:
-                if item_scope == "user":
-                    rows = connection.execute(
-                        """
-                        SELECT * FROM memories WHERE account_key=? AND scope='user' AND repository_key IS NULL
-                        ORDER BY updated_at DESC, memory_id ASC
-                        """,
-                        (account_key,),
-                    ).fetchall()
-                else:
-                    rows = connection.execute(
-                        """
-                        SELECT * FROM memories WHERE account_key=? AND scope='repository' AND repository_key=?
-                        ORDER BY updated_at DESC, memory_id ASC
-                        """,
-                        (account_key, repository_key),
-                    ).fetchall()
-                groups.extend(_memory(row) for row in rows)
-            return tuple(groups)
-        finally:
-            connection.close()
-
-    def forget(self, account_key: str, repository_key: str, memory_id: str) -> MemoryRecord | None:
-        _validate_scope_keys(account_key, repository_key)
-        _validate_memory_id(memory_id)
-        with self.store.transaction() as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM memories WHERE memory_id=? AND account_key=?
-                    AND (scope='user' OR (scope='repository' AND repository_key=?))
-                """,
-                (memory_id, account_key, repository_key),
-            ).fetchone()
-            if row is None:
-                return None
-            record = _memory(row)
-            connection.execute("DELETE FROM memories WHERE memory_id=?", (memory_id,))
-            return record
-
     def _insert_session_tx(
         self,
         connection: Any,
@@ -850,45 +730,6 @@ def _turn(row: Any) -> TurnRecord:
     )
 
 
-def _memory(row: Any) -> MemoryRecord:
-    try:
-        memory_id = _validate_memory_id(row["memory_id"])
-        account_key, account_api = _validate_account_key(row["account_key"])
-        scope = _require_string(row["scope"], "Memory scope", allow_empty=False)
-        kind = _require_string(row["kind"], "Memory kind", allow_empty=False)
-        _validate_memory_type(scope, kind)
-        repository_key = None
-        if row["repository_key"] is not None:
-            repository_key, repository_api = _validate_repository_key(row["repository_key"])
-            if repository_api != account_api:
-                raise ValidationError("stored Memory crosses API scope")
-        if (scope == "user") != (repository_key is None):
-            raise ValidationError("stored Memory scope is inconsistent")
-        content = _require_string(row["content"], "Memory content", maximum=500, allow_empty=False)
-        created_at = _require_utc_timestamp(row["created_at"], "created_at")
-        updated_at = _require_utc_timestamp(row["updated_at"], "updated_at")
-    except (KeyError, TypeError, ValueError, ValidationError) as exc:
-        raise StateError("stored Memory record is invalid") from exc
-    return MemoryRecord(
-        memory_id=memory_id,
-        account_key=account_key,
-        repository_key=repository_key,
-        scope=scope,
-        kind=kind,
-        content=content,
-        created_at=created_at,
-        updated_at=updated_at,
-    )
-
-
-def _validate_memory_type(scope: str, kind: str) -> None:
-    if (scope, kind) == ("user", "preference"):
-        return
-    if scope == "repository" and kind in {"decision", "constraint", "reference"}:
-        return
-    raise ValidationError("invalid Memory scope/kind combination")
-
-
 def _validate_scope_keys(account_key: Any, repository_key: Any) -> tuple[str, str]:
     account, account_api = _validate_account_key(account_key)
     repository, repository_api = _validate_repository_key(repository_key)
@@ -926,13 +767,6 @@ def _validate_session_id(value: Any) -> str:
     if _SESSION_ID.fullmatch(session_id) is None:
         raise ValidationError("session_id must be an unguessable local ID")
     return session_id
-
-
-def _validate_memory_id(value: Any) -> str:
-    memory_id = _require_string(value, "memory_id", allow_empty=False)
-    if _MEMORY_ID.fullmatch(memory_id) is None:
-        raise ValidationError("memory_id has an invalid shape")
-    return memory_id
 
 
 def _require_string(

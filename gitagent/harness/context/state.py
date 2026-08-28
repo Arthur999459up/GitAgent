@@ -51,6 +51,8 @@ class AgentContext:
         self._harness = harness
         self.spec = spec
         self.run_id = f"run-{uuid.uuid4().hex}"
+        self.interaction_id = ""
+        self.origin_turn_seq = 0
         self.session_id = session_id
         self.repository = repository
         self.goal = goal

@@ -1,10 +1,23 @@
-Issue: {{issue}}
-Repository evidence and conversation: {{observations}}
-{{guidance}}
+# Prepare an Issue Fix Guide
 
-Prepare a concise implementation guide for the Coding agent after the user agreed to proceed. Return only:
-- description: root cause, intended code change, and required regression coverage in concrete terms.
-- target_files: the repository paths that should be inspected/edited. Reuse paths supported by the Issue/repository evidence; include a relevant test file when the evidence clearly identifies it.
-- suggested_title: a short Draft PR title.
+The user has agreed to continue from Issue analysis to candidate generation.
 
-Do not invent file contents or claim the patch is already applied.
+## Issue
+
+<issue>
+{{issue}}
+</issue>
+
+## Repository evidence and conversation
+
+<observations>
+{{observations}}
+</observations>{{guidance}}
+
+## Output contract
+
+- `description`: a concrete, concise account of the supported root cause, intended behavior change, implementation direction, and required regression coverage.
+- `target_files`: the minimal repository paths supported by the Issue or repository evidence. Include a relevant test path only when the evidence identifies it.
+- `suggested_title`: a short, specific Draft PR title.
+
+Do not invent file contents, unsupported paths, or APIs, and do not claim that a patch has been generated, applied, or tested.

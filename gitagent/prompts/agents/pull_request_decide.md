@@ -1,19 +1,27 @@
-Goal: {{goal}}
-Entity: {{entity}}
-{{guidance}}
+# Select a Pull Request Operation
 
-Select exactly one Pull Request operation that matches the requested outcome:
-- LIST, SEARCH, or SUMMARIZE for collections.
-- GET for metadata/detail lookup that does not need Diff analysis.
-- EXPLAIN for behavior, symbols, calls, and impact.
-- REVIEW for implementation and test review.
-- REVIEW_DIALOGUE for existing Reviews/comments, applicability, conflicts, or reply drafting.
-- CI_ANALYZE for CI status or failure analysis without a code change.
-- PLAN for a modification proposal without generating code.
-- MODIFY for an explicit candidate code change to the PR.
-- CI_FIX when CI analysis and an explicit candidate fix are both requested.
-- POST_REVIEW only when the user explicitly asks to publish COMMENT, APPROVE, or REQUEST_CHANGES.
-- MERGE_READINESS for readiness assessment without merging.
-- MERGE only when the user explicitly asks to merge.
+## Request
 
-Set review_event only for POST_REVIEW. “Approve PR” means POST_REVIEW with APPROVE; it never means MERGE.
+- **Goal:** {{goal}}
+- **Selected entity:** {{entity}}{{guidance}}
+
+## Operation map
+
+Choose exactly one operation that matches the user's requested outcome:
+
+| Operation | Use when |
+| --- | --- |
+| `LIST`, `SEARCH`, `SUMMARIZE` | The request concerns a PR collection. |
+| `GET` | The user wants PR metadata or details without Diff analysis. |
+| `EXPLAIN` | The user asks about changed behavior, symbols, call relationships, or impact. |
+| `REVIEW` | The user asks for implementation or test review. |
+| `REVIEW_DIALOGUE` | The request concerns existing Reviews/comments, current applicability, conflicts, or a reply draft. |
+| `CI_ANALYZE` | The user asks for CI status or failure analysis without requesting a code change. |
+| `PLAN` | The user wants a modification plan without candidate code. |
+| `MODIFY` | The user explicitly requests a candidate code change to the PR. |
+| `CI_FIX` | The user explicitly requests both CI analysis and a candidate fix. |
+| `POST_REVIEW` | The user explicitly asks to publish a `COMMENT`, `APPROVE`, or `REQUEST_CHANGES` Review. |
+| `MERGE_READINESS` | The user asks whether the PR is ready to merge, without asking to merge it. |
+| `MERGE` | The user explicitly asks to merge the PR. |
+
+Set `review_event` only for `POST_REVIEW`; otherwise set it to an empty string. “Approve this PR” means `POST_REVIEW` with `APPROVE`, never `MERGE`.

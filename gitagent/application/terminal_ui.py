@@ -54,6 +54,20 @@ _AGENT_NAMES = {
     "static_verifier": "Static Verifier",
 }
 
+_KNOWLEDGE_KIND_NAMES = {
+    "preference": "偏好",
+    "decision": "决策",
+    "constraint": "约束",
+    "reference": "参考",
+    "experience": "经验",
+}
+
+_KNOWLEDGE_ACTIONS = {
+    "add": ("+", "新增", "green"),
+    "update": ("~", "更新", "cyan"),
+    "remove": ("-", "移除", "yellow"),
+}
+
 
 class TerminalUI:
     """Small presentation layer: concise by default, complete trace on demand."""
@@ -121,6 +135,13 @@ class TerminalUI:
         hides successful completion echoes, task ids, long agent messages and raw
         argument JSON; `/trace` renders the complete history when needed.
         """
+        if (
+            event.category == TraceCategory.WORKFLOW
+            and event.name == "long_term_learning"
+            and event.status == TraceStatus.COMPLETED
+        ):
+            self._learning_result(event)
+            return
         if event.status == TraceStatus.COMPLETED:
             return
         if event.status == TraceStatus.PROGRESS and not event.message:
@@ -153,6 +174,63 @@ class TerminalUI:
             line.append(f"  {_single_line(event.message, 140)}", style=status_style)
 
         self.console.print(line)
+
+    def _learning_result(self, event: TraceEvent) -> None:
+        details = event.details
+        changes = details.get("changes")
+        if not isinstance(changes, list):
+            changes = []
+        if not changes:
+            reason = str(details.get("reason") or "")
+            message = {
+                "no_candidates": "未发现值得保存的长期知识",
+                "all_candidates_skipped": "候选未通过持久化规则，未写入",
+            }.get(reason, "本轮没有写入长期知识")
+            line = Text("  ")
+            line.append("◇ ", style="bold dim")
+            line.append("长期学习", style="bold")
+            line.append(f"  {message}", style="dim")
+            self.console.print(line)
+            return
+
+        added = int(details.get("added") or 0)
+        updated = int(details.get("updated") or 0)
+        removed = int(details.get("removed") or 0)
+        counts = " · ".join(
+            label
+            for count, label in (
+                (added, f"新增 {added}"),
+                (updated, f"更新 {updated}"),
+                (removed, f"移除 {removed}"),
+            )
+            if count
+        )
+        header = Text("  ")
+        header.append("✦ ", style="bold green")
+        header.append("长期学习", style="bold")
+        header.append(f"  {counts}", style="green")
+        self.console.print(header)
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            action = str(change.get("action") or "")
+            symbol, action_name, style = _KNOWLEDGE_ACTIONS.get(action, ("·", "写入", "cyan"))
+            kind = _KNOWLEDGE_KIND_NAMES.get(
+                str(change.get("kind") or ""),
+                str(change.get("kind") or "长期知识"),
+            )
+            topic = _single_line(str(change.get("topic") or ""), 36)
+            content = _single_line(str(change.get("content") or ""), 120)
+            conditions = _single_line(str(change.get("conditions") or ""), 72)
+            line = Text("    ")
+            line.append(f"{symbol} ", style=f"bold {style}")
+            line.append(f"{action_name}{kind}", style=style)
+            if topic:
+                line.append(f" · {topic}", style="dim")
+            line.append(f"：{content}")
+            if conditions:
+                line.append(f"（适用：{conditions}）", style="dim")
+            self.console.print(line)
 
     def trace_history(self, events: list[TraceEvent]) -> None:
         """Render the complete audit-friendly trace, including ids/arguments/durations."""

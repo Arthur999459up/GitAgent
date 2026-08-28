@@ -6,6 +6,12 @@ import json
 from typing import Any
 
 from gitagent.domain.errors import RoutingError, ValidationError
+from gitagent.domain.learning import (
+    LearningAction,
+    LearningCandidate,
+    LearningProposal,
+    ReflectionContext,
+)
 from gitagent.domain.models import (
     AgentSpec,
     MainDecision,
@@ -16,8 +22,10 @@ from gitagent.domain.models import (
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.model import Reasoner, structured_request_payload
+from gitagent.prompts import get_prompt_library
 
 _DOMAIN_AGENTS = {"issues", "pull_requests", "repository"}
+_PROMPTS = get_prompt_library()
 _MAIN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -30,6 +38,60 @@ _MAIN_SCHEMA = {
         "requested_reply": {"type": "boolean"},
     },
     "required": ["target_agent", "request", "message", "clarify", "requested_reply"],
+}
+
+_REFLECTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "candidates": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["add", "update", "remove", "discard"]},
+                    "scope": {"type": "string", "enum": ["user", "repository"]},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["preference", "decision", "constraint", "reference", "experience"],
+                    },
+                    "topic": {"type": "string", "maxLength": 80},
+                    "content": {"type": "string", "maxLength": 800},
+                    "conditions": {
+                        "type": "string",
+                        "maxLength": 500,
+                        "description": (
+                            "Applicability conditions. Required and non-empty only for add/update "
+                            "Experience candidates; use an empty string for every other candidate."
+                        ),
+                    },
+                    "target_id": {"type": "string", "maxLength": 80},
+                    "reason": {"type": "string", "maxLength": 500},
+                    "evidence_strength": {
+                        "type": "string",
+                        "enum": ["direct", "strong", "moderate"],
+                    },
+                    "correction": {"type": "boolean"},
+                },
+                "required": [
+                    "action",
+                    "scope",
+                    "kind",
+                    "topic",
+                    "content",
+                    "conditions",
+                    "target_id",
+                    "reason",
+                    "evidence_strength",
+                    "correction",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "summary": {"type": "string", "maxLength": 500},
+    },
+    "required": ["candidates", "summary"],
+    "additionalProperties": False,
 }
 
 _MAIN_SYSTEM = """You are GitAgent's Main Agent. One Session is one continuous Main Agent context.
@@ -65,12 +127,21 @@ _MAIN_SPEC = AgentSpec(
     routes=frozenset({"conversation_orchestration"}),
 )
 
+_REFLECTION_SPEC = AgentSpec(
+    name="main_reflection",
+    role="Use the Main Agent identity to maintain durable contextual knowledge from temporary evidence.",
+    system_prompt=_PROMPTS.text("system.main_reflection"),
+    output_schema=("candidates", "summary"),
+    routes=frozenset({"internal_reflection"}),
+)
+
 
 class MainAgent:
     def __init__(self, harness: AgentHarness, reasoner: Reasoner) -> None:
         self.harness = harness
         self.reasoner = reasoner
         harness.register(_MAIN_SPEC)
+        harness.register(_REFLECTION_SPEC)
 
     def decide(
         self,
@@ -116,6 +187,74 @@ class MainAgent:
             tool_name="route_session_turn",
         )
         return json.dumps(request, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    def reflect(self, context: ReflectionContext) -> LearningProposal:
+        """Run the same conversation owner's isolated, capability-free learning invocation."""
+
+        return self.harness.run(
+            "main_reflection",
+            session_id=context.scope.session_id,
+            repository=context.repository_full_name,
+            goal=f"Reflect on {context.trigger} evidence",
+            operation=lambda agent_context: self._semantic_reflection(agent_context, context),
+        )
+
+    def _semantic_reflection(
+        self,
+        agent_context: AgentContext,
+        context: ReflectionContext,
+    ) -> LearningProposal:
+        payload = {
+            "trigger": context.trigger,
+            "scope": to_plain(context.scope),
+            "repository": context.repository_full_name,
+            "conversation": list(context.conversation_units),
+            "domain_interaction": context.interaction,
+            "existing_knowledge": [to_plain(item) for item in context.existing_knowledge],
+            "selection": context.selection_metadata,
+        }
+        raw = self.reasoner.complete_structured(
+            system=agent_context.system_prompt,
+            prompt=_PROMPTS.render(
+                "agents.main_reflection",
+                payload=json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str),
+            ),
+            schema=_REFLECTION_SCHEMA,
+            tool_name="propose_long_term_learning",
+        )
+        return self._validate_reflection(raw)
+
+    @staticmethod
+    def _validate_reflection(raw: dict[str, Any]) -> LearningProposal:
+        if not isinstance(raw, dict) or not isinstance(raw.get("candidates"), list):
+            raise ValidationError("MainAgent reflection output must contain a candidate list")
+        candidates: list[LearningCandidate] = []
+        for item in raw["candidates"]:
+            action = LearningAction(str(item.get("action") or ""))
+            scope = str(item.get("scope") or "")
+            kind = str(item.get("kind") or "")
+            topic = str(item.get("topic") or "").strip()
+            content = str(item.get("content") or "").strip()
+            conditions = str(item.get("conditions") or "").strip()
+            target_id = str(item.get("target_id") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            strength = str(item.get("evidence_strength") or "")
+            correction = bool(item.get("correction", False))
+            candidates.append(
+                LearningCandidate(
+                    action,
+                    scope,
+                    kind,
+                    topic,
+                    content,
+                    conditions,
+                    target_id,
+                    reason,
+                    strength,
+                    correction,
+                )
+            )
+        return LearningProposal(tuple(candidates), str(raw.get("summary") or "").strip())
 
     def _prompt(self, text: str, repository: str, context: RoutingContext) -> str:
         payload: dict[str, Any] = {

@@ -1,15 +1,21 @@
-User request:
+# Draft an Issue Reply
+
+## User request
+
 {{request}}
 
-{{guidance}}
-Evidence gathered from the Issue, comments, and repository (JSON, newest last):
+## Gathered evidence
+
+The JSON log contains Issue, comment, and repository observations ordered oldest to newest.
+
+<evidence>
 {{evidence}}
+</evidence>{{guidance}}
 
-Write the complete GitHub Issue reply draft for maintainer review.
+## Drafting rules
 
-Rules:
-- Answer the Issue directly and concretely from the evidence above.
-- Use repository evidence when it explains implementation details or design rationale.
-- Do not invent facts that are not supported by the evidence; state uncertainty when necessary.
-- Match the language of the Issue unless the user explicitly requested another language.
-- Return only the reply body. Do not add review notes, publication status, or other meta commentary.
+- Address the Issue directly and concretely from the evidence.
+- Use repository evidence when it supports implementation details or design rationale.
+- Do not invent facts, commitments, results, or maintainer intent; state material uncertainty naturally when needed.
+- Match the Issue's language unless the user explicitly requested another language.
+- Return only the complete reply body. Do not add review notes, publication status, or meta commentary.

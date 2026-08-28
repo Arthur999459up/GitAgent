@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,8 +42,13 @@ from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.file_reads import FileReadLedger
 from gitagent.harness.validation.static import StaticVerifier
-from gitagent.infra.observability import TraceBus
-from gitagent.infra.persistence import SessionManager
+from gitagent.infra.observability import TraceBus, TraceCategory, TraceStatus
+from gitagent.infra.persistence import (
+    DomainEvidenceStore,
+    KnowledgeStore,
+    SessionManager,
+)
+from gitagent.learning import LearningCoordinator
 from gitagent.model import Reasoner
 
 from .approval_intent import ApprovalIntentClassifier
@@ -56,6 +62,7 @@ class ServiceResult:
     goal: str = ""
     entity_type: str | None = None
     entity_id: str | None = None
+    interaction_id: str | None = None
 
 
 class GitAgentService:
@@ -68,9 +75,12 @@ class GitAgentService:
         main_reasoner: Reasoner,
         agent_reasoner: Reasoner | None = None,
         session_manager: SessionManager | None = None,
+        knowledge_store: KnowledgeStore | None = None,
+        evidence_store: DomainEvidenceStore | None = None,
         trace: TraceBus | None = None,
         session_scope: SessionScope | None = None,
         input_budget_tokens: int = 26_112,
+        auto_learning: bool = True,
     ) -> None:
         self.harness = AgentHarness(capabilities, trace=trace, context_budget=input_budget_tokens)
         self.coding = CodingAgent(self.harness, agent_reasoner)
@@ -88,8 +98,30 @@ class GitAgentService:
         self.classifier = ApprovalIntentClassifier(main_reasoner)
         self.reasoner = agent_reasoner or main_reasoner
         self.session_manager = session_manager
+        self.knowledge_store = knowledge_store or (
+            KnowledgeStore(session_manager.store) if session_manager is not None else None
+        )
+        self.evidence_store = evidence_store or (
+            DomainEvidenceStore(session_manager.store) if session_manager is not None else None
+        )
         self.session_scope = session_scope
+        self.auto_learning = auto_learning
+        self.learning = (
+            LearningCoordinator(
+                self.main_agent,
+                session_manager,
+                self.knowledge_store,
+                self.evidence_store,
+                self.harness.trace,
+                input_budget_tokens=input_budget_tokens,
+                enabled=auto_learning,
+            )
+            if session_manager is not None and self.knowledge_store is not None and self.evidence_store is not None
+            else None
+        )
         self.dispatch_started = False
+        self.completed_interaction_id: str | None = None
+        self._active_turn_seq = 0
         self._invalidated = False
 
     def handle(
@@ -99,6 +131,7 @@ class GitAgentService:
         repository: str,
         routing_context: RoutingContext | None = None,
         session_scope: SessionScope | None = None,
+        turn_seq: int | None = None,
     ) -> ServiceResult:
         self._require_live()
         self._require_scope(session_scope)
@@ -110,6 +143,8 @@ class GitAgentService:
         if routing_context.repository_full_name != repository:
             raise RoutingError("routing context belongs to a different repository")
         self.dispatch_started = False
+        self.completed_interaction_id = None
+        self._active_turn_seq = int(turn_seq or 0)
 
         current = self._load_context(routing_context)
         if current is not None:
@@ -156,6 +191,36 @@ class GitAgentService:
             goal=decision.request or user_input,
             entity_type=decision.entity_type,
             entity_id=decision.entity_id,
+            interaction_id=self.completed_interaction_id,
+        )
+
+    def reflect_after_turn(
+        self,
+        *,
+        turn_seq: int,
+        user_input: str,
+        assistant_text: str,
+        interaction_id: str | None,
+    ) -> Any:
+        """Run optional learning only after the successful Turn is durable."""
+
+        if self.learning is None:
+            return None
+        if interaction_id:
+            return self.learning.reflect_domain(self._scope(), interaction_id)
+        session = self._require_session_manager().get_session(
+            self._scope().account_key,
+            self._scope().repository_key,
+            self._scope().session_id,
+        )
+        if session is None:
+            return None
+        return self.learning.reflect_conversation(
+            self._scope(),
+            session.repository_full_name,
+            turn_seq=turn_seq,
+            user_input=user_input,
+            assistant_text=assistant_text,
         )
 
     def approve(self) -> Any:
@@ -208,6 +273,7 @@ class GitAgentService:
                 guidance=guidance,
             )
             self.repository_agent.prepare(context, operation)
+            self._start_interaction(context)
             self.loop.start(context, self.repository_agent)
             return self._after_loop(context)
         context = self.harness.context(
@@ -220,6 +286,7 @@ class GitAgentService:
             guidance=guidance,
         )
         if decision.target_agent == "issues":
+            self._start_interaction(context)
             if decision.requested_reply and context.entity_id:
                 context.result_required = False
                 self.loop.start(context, self.issue_agent)
@@ -242,6 +309,7 @@ class GitAgentService:
             self.loop.start(context, self.issue_agent)
             return self._after_loop(context)
         if decision.target_agent == "pull_requests":
+            self._start_interaction(context)
             self.loop.start(context, self.pull_request_agent)
             return self._after_loop(context)
         raise RoutingError(f"unsupported domain agent: {decision.target_agent}")
@@ -250,6 +318,7 @@ class GitAgentService:
         if context.pending is not None or context.question or (context.reply_draft is not None and not context.finished):
             self._save_context(context)
             return context
+        self._record_interaction(context)
         self._clear_context()
         if context.error:
             return context
@@ -270,6 +339,7 @@ class GitAgentService:
                 "state": "reviewing_draft",
             },
         )
+        self._observe_service_decision(context, decision, user_input)
         if decision.action == ApprovalIntent.AMBIGUOUS:
             self._save_context(context)
             return decision.message or "你是想发布当前草稿、继续修改，还是查看草稿内容？"
@@ -305,9 +375,11 @@ class GitAgentService:
         if context.pending is None:
             raise RoutingError("当前 Session 没有待审批提案")
         if decision.action == ApprovalIntent.AMBIGUOUS:
+            self._observe_service_decision(context, decision, user_input)
             self._save_context(context)
             return decision.message
         if decision.action == ApprovalIntent.QUESTION:
+            self._observe_service_decision(context, decision, user_input)
             self._save_context(context)
             return self._proposal_description(context)
 
@@ -315,6 +387,7 @@ class GitAgentService:
             ApprovalIntent.REJECT,
             ApprovalIntent.REVISE,
         }:
+            self._observe_service_decision(context, decision, user_input)
             self.harness.approvals.decide(context.pending.approval_id, "Reject")
             context.pending = None
             if decision.action == ApprovalIntent.REVISE:
@@ -329,6 +402,7 @@ class GitAgentService:
             )
 
         if context.agent == "repository" and decision.action == ApprovalIntent.REVISE:
+            self._observe_service_decision(context, decision, user_input)
             self.harness.approvals.decide(context.pending.approval_id, "Reject")
             request = context.change_request
             if request is None:
@@ -347,10 +421,14 @@ class GitAgentService:
                 repository=request.repository,
                 description=f"{request.description}\n\nUser revision: {instruction}",
             )
+            revised.interaction_id = context.interaction_id
+            revised.origin_turn_seq = context.origin_turn_seq
+            revised.observations = list(context.observations)
             self.loop.start(revised, self.repository_agent)
             return self._after_loop(revised)
 
         if context.agent == "pull_requests" and decision.action == ApprovalIntent.REVISE:
+            self._observe_service_decision(context, decision, user_input)
             return self._revise_pr_review(context, decision.instruction.strip() or user_input.strip())
 
         self.loop.resume(context, self._agent_for(context.agent), decision)
@@ -415,6 +493,7 @@ class GitAgentService:
             goal=context.goal,
             entity_type=context.entity_type,
             entity_id=context.entity_id,
+            interaction_id=self.completed_interaction_id,
         )
 
     def _save_context(self, context: AgentContext) -> None:
@@ -444,14 +523,34 @@ class GitAgentService:
 
     def _stored_guidance(self, context: AgentContext) -> AgentGuidance | None:
         scope = self._scope()
-        memories = self._require_session_manager().list_memories(scope.account_key, scope.repository_key)
+        memories = self._require_knowledge_store().relevant(
+            scope.account_key,
+            scope.repository_key,
+            context.goal,
+        )
         user_memories = tuple(
-            ContextMemory(memory.memory_id, memory.scope, memory.kind, memory.content)
+            ContextMemory(
+                memory.knowledge_id,
+                memory.scope,
+                memory.kind,
+                memory.content,
+                memory.topic,
+                memory.conditions,
+                memory.source,
+            )
             for memory in memories
             if memory.scope == "user"
         )
         repository_memories = tuple(
-            ContextMemory(memory.memory_id, memory.scope, memory.kind, memory.content)
+            ContextMemory(
+                memory.knowledge_id,
+                memory.scope,
+                memory.kind,
+                memory.content,
+                memory.topic,
+                memory.conditions,
+                memory.source,
+            )
             for memory in memories
             if memory.scope == "repository"
         )
@@ -485,6 +584,8 @@ class GitAgentService:
             }
         return {
             "agent": context.agent,
+            "interaction_id": context.interaction_id,
+            "origin_turn_seq": context.origin_turn_seq,
             "repository": context.repository,
             "goal": context.goal,
             "entity_type": context.entity_type,
@@ -525,6 +626,8 @@ class GitAgentService:
             guidance=None,
             max_steps=int(raw.get("max_steps") or 20),
         )
+        context.interaction_id = str(raw.get("interaction_id") or "")
+        context.origin_turn_seq = int(raw.get("origin_turn_seq") or 0)
         context.steps = int(raw.get("steps") or 0)
         context.observations = list(raw.get("observations") or [])
         context.operation = str(raw.get("operation") or "")
@@ -695,6 +798,78 @@ class GitAgentService:
         if self.session_manager is None:
             raise RoutingError("GitAgentService requires a SessionManager")
         return self.session_manager
+
+    def _require_knowledge_store(self) -> KnowledgeStore:
+        if self.knowledge_store is None:
+            raise RoutingError("GitAgentService requires a KnowledgeStore")
+        return self.knowledge_store
+
+    @staticmethod
+    def _observe_service_decision(
+        context: AgentContext,
+        decision: WorkflowTurnDecision,
+        user_input: str,
+    ) -> None:
+        context.observations.append(
+            {
+                "kind": "user_decision",
+                "payload": {
+                    "action": decision.action.value,
+                    "instruction": decision.instruction or user_input,
+                    "message": decision.message,
+                },
+            }
+        )
+
+    def _start_interaction(self, context: AgentContext) -> None:
+        context.interaction_id = f"interaction-{uuid.uuid4().hex}"
+        context.origin_turn_seq = self._active_turn_seq
+
+    def _record_interaction(self, context: AgentContext) -> None:
+        if (
+            not self.auto_learning
+            or not context.interaction_id
+            or context.origin_turn_seq < 1
+            or self.evidence_store is None
+        ):
+            return
+        evidence = {
+            "operation": context.operation,
+            "requested_outcome": context.requested_outcome,
+            "steps": context.steps,
+            "observations": to_plain(context.observations),
+            "file_coverage": context.file_reads.to_plain(),
+            "result": to_plain(context.result),
+            "final_message": context.final_message,
+            "error": context.error or "",
+            "code_candidate": to_plain(context.code_candidate),
+            "change_request": to_plain(context.change_request),
+            "verification": to_plain(context.verification),
+        }
+        try:
+            record = self.evidence_store.save(
+                self._scope(),
+                interaction_id=context.interaction_id,
+                repository_full_name=context.repository,
+                origin_turn_seq=context.origin_turn_seq,
+                completed_turn_seq=max(context.origin_turn_seq, self._active_turn_seq),
+                agent=context.agent,
+                entity_type=context.entity_type,
+                entity_id=context.entity_id,
+                goal=context.goal,
+                evidence=evidence,
+            )
+            self.completed_interaction_id = record.interaction_id
+        except Exception as exc:  # noqa: BLE001 - evidence capture cannot change Domain success semantics
+            self.harness.trace.emit(
+                session_id=self._scope().session_id,
+                category=TraceCategory.WORKFLOW,
+                name="domain_evidence_capture",
+                status=TraceStatus.FAILED,
+                message=str(exc),
+                details={"interaction_id": context.interaction_id, "error_type": type(exc).__name__},
+            )
+            return
 
     def _require_live(self) -> None:
         if self._invalidated:

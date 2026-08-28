@@ -1,4 +1,20 @@
-Analyze Pull Request CI for this request: {{request}}
-Evidence: {{evidence}}
+# Analyze Pull Request CI
 
-Return facts, suspected_causes, related_changes, and actions. Keep log facts separate from inference and connect failures to the supplied Diff, changed files, tests, or dependency changes only when evidence supports it.{{guidance}}
+## Request
+
+{{request}}
+
+## CI and change evidence
+
+<evidence>
+{{evidence}}
+</evidence>
+
+## Analysis rules
+
+- `facts`: report observed workflow, job, and log facts only, including missing or unavailable logs when relevant.
+- `suspected_causes`: label hypotheses as inference and tie them to specific log evidence where possible.
+- `related_changes`: connect failures to the supplied Diff, changed files, tests, or dependency changes only when the evidence supports the relationship.
+- `actions`: propose focused diagnostic or corrective next steps; do not claim they were run.
+
+Do not collapse missing evidence into a diagnosis, perform a write, or imply CI passed when results are incomplete.{{guidance}}

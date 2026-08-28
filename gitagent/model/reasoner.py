@@ -87,8 +87,9 @@ class LLMReasoner:
             tool_name=tool_name,
             tools=tools,
         )
-        response = self.client.chat(messages=request["messages"], tools=request["tools"])
+        response: ChatResponse | None = None
         try:
+            response = self.client.chat(messages=request["messages"], tools=request["tools"])
             return self._structured_value(
                 response,
                 schema=schema,
@@ -98,23 +99,24 @@ class LLMReasoner:
         except StructuredOutputError as first_error:
             if schema is None:
                 raise
-            previous = _response_text_for_retry(response)
-            retry = self.client.chat(
-                messages=[
-                    *request["messages"],
-                    {"role": "assistant", "content": previous},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"The previous response did not satisfy the required JSON schema ({first_error}). "
-                            f"Correct only the output format now: call {tool_name} exactly once with all required "
-                            "arguments. Do not explain the correction or use Markdown."
-                        ),
-                    },
-                ],
-                tools=request["tools"],
+            retry_messages = [*request["messages"]]
+            if response is not None:
+                retry_messages.append(
+                    {"role": "assistant", "content": _response_text_for_retry(response)}
+                )
+            retry_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The previous response could not be parsed or did not satisfy the required "
+                        f"structured-output contract ({first_error}). Correct only the output format now: "
+                        f"call {tool_name} exactly once with all required arguments. Do not explain the "
+                        "correction or use Markdown."
+                    ),
+                }
             )
             try:
+                retry = self.client.chat(messages=retry_messages, tools=request["tools"])
                 return self._structured_value(
                     retry,
                     schema=schema,

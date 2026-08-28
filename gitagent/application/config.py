@@ -48,6 +48,7 @@ class CLIConfig:
     prompts_dir: str | None = None
     context_window_tokens: int = 32768
     context_safety_tokens: int = 2048
+    auto_learning: bool = True
 
     @property
     def effective_input_budget(self) -> int:
@@ -87,6 +88,8 @@ class CLIConfig:
             )
         if self.prompts_dir is not None and not Path(self.prompts_dir).is_dir():
             raise ValueError(f"GITAGENT_PROMPTS_DIR 不是有效目录: {self.prompts_dir}")
+        if not isinstance(self.auto_learning, bool):
+            raise TypeError("GITAGENT_AUTO_LEARNING 必须为布尔值")
 
     @classmethod
     def from_env(cls) -> CLIConfig:
@@ -121,6 +124,19 @@ class CLIConfig:
             prompts_dir=_STARTUP_PROMPTS_DIR,
             context_window_tokens=int(os.getenv("GITAGENT_CONTEXT_WINDOW_TOKENS", "32768")),
             context_safety_tokens=int(os.getenv("GITAGENT_CONTEXT_SAFETY_TOKENS", "2048")),
+            auto_learning=_environment_boolean("GITAGENT_AUTO_LEARNING", default=True),
         )
         config.validate()
         return config
+
+
+def _environment_boolean(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} 必须是 true/false、yes/no、on/off 或 1/0")

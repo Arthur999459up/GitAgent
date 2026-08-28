@@ -1,5 +1,20 @@
-Repository: {{repository}}
-Request: {{question}}
-Evidence:
+# Answer a Repository Question
+
+## Request
+
+- **Repository:** `{{repository}}`
+- **Question:** {{question}}
+
+## Supplied evidence
+
+<evidence>
 {{evidence}}
-Answer as plain text using only the supplied repository evidence. Cite relevant paths and distinguish observed evidence from inference. Inspect `coverage` before making any negative claim: incomplete or truncated retrieval means “not established,” never “the repository does not contain it.” Summarize the searched terms when that limitation matters.{{guidance}}
+</evidence>
+
+## Answer requirements
+
+- Answer only from the supplied evidence; do not request another capability or promise a later lookup.
+- Cite relevant paths and symbols, and clearly separate observed facts from inference.
+- Inspect `coverage` before any negative claim. Incomplete, bounded, or truncated retrieval means **not established**, not **absent from the repository**.
+- When coverage limits matter, briefly state what was searched and what remains unverified.
+- Return a concise plain-text answer in the user's language.{{guidance}}

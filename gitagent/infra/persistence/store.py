@@ -1,4 +1,4 @@
-"""Secure single-process SQLite boundary for Session and Memory state."""
+"""Secure single-process SQLite boundary for Session and learning state."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Any
 
 from gitagent.domain.errors import StateError, ValidationError
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 REDACTED = "[REDACTED]"
 
 _SECRET_PATTERNS = (
@@ -74,22 +74,52 @@ _TABLE_DEFINITIONS = {
             FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         )
     """,
-    "memories": """
-        CREATE TABLE memories (
-            memory_id TEXT PRIMARY KEY,
+    "knowledge": """
+        CREATE TABLE knowledge (
+            knowledge_id TEXT PRIMARY KEY,
             account_key TEXT NOT NULL,
             repository_key TEXT,
             scope TEXT NOT NULL CHECK(scope IN ('user','repository')),
-            kind TEXT NOT NULL CHECK(kind IN ('preference','decision','constraint','reference')),
+            kind TEXT NOT NULL CHECK(kind IN ('preference','decision','constraint','reference','experience')),
+            topic TEXT NOT NULL,
             content TEXT NOT NULL,
+            conditions TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL CHECK(source IN (
+                'explicit_user','auto_reflection','user_feedback','domain_experience'
+            )),
+            confidence TEXT NOT NULL CHECK(confidence IN ('direct','strong','moderate')),
+            provenance TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             CHECK(
-                (scope='user' AND kind='preference' AND repository_key IS NULL)
+                (scope='user' AND kind IN ('preference','experience') AND repository_key IS NULL)
                 OR
-                (scope='repository' AND kind IN ('decision','constraint','reference')
+                (scope='repository' AND kind IN ('decision','constraint','reference','experience')
                     AND repository_key IS NOT NULL)
-            )
+            ),
+            CHECK((kind='experience' AND conditions!='') OR (kind!='experience' AND conditions=''))
+        )
+    """,
+    "domain_interactions": """
+        CREATE TABLE domain_interactions (
+            interaction_id TEXT PRIMARY KEY,
+            account_key TEXT NOT NULL,
+            repository_key TEXT NOT NULL,
+            repository_full_name TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            origin_turn_seq INTEGER NOT NULL CHECK(origin_turn_seq >= 1),
+            completed_turn_seq INTEGER NOT NULL CHECK(completed_turn_seq >= origin_turn_seq),
+            agent TEXT NOT NULL,
+            entity_type TEXT,
+            entity_id TEXT,
+            goal TEXT NOT NULL,
+            evidence TEXT NOT NULL,
+            reflection_status TEXT NOT NULL CHECK(reflection_status IN (
+                'pending','reflected','skipped','reflection_failed'
+            )),
+            reflection_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            reflected_at TEXT
         )
     """,
 }
@@ -102,8 +132,17 @@ _INDEX_DEFINITIONS = {
     "sessions_by_account_updated": (
         "CREATE INDEX sessions_by_account_updated ON sessions(account_key, updated_at DESC)"
     ),
-    "memories_by_scope_updated": (
-        "CREATE INDEX memories_by_scope_updated ON memories(account_key, repository_key, scope, updated_at DESC)"
+    "knowledge_by_scope_updated": (
+        "CREATE INDEX knowledge_by_scope_updated ON knowledge(account_key, repository_key, scope, updated_at DESC)"
+    ),
+    "knowledge_by_topic_updated": (
+        "CREATE INDEX knowledge_by_topic_updated ON knowledge(account_key, repository_key, topic, updated_at DESC)"
+    ),
+    "interactions_by_scope_created": (
+        "CREATE INDEX interactions_by_scope_created ON domain_interactions(account_key, repository_key, created_at DESC)"
+    ),
+    "interactions_by_reflection": (
+        "CREATE INDEX interactions_by_reflection ON domain_interactions(reflection_status, created_at ASC)"
     ),
 }
 

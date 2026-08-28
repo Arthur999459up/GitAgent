@@ -408,19 +408,28 @@ def _run_command(application: LiveApplication, request: str) -> None:
             _show_compaction(application.compact())
         except (GitAgentError, ValueError) as exc:
             console.print(f"[red]Context 压缩失败：{exc}[/red]")
+    elif command == "/learning":
+        state = argument.casefold()
+        if state not in {"", "on", "off"}:
+            console.print("[yellow]用法：/learning [on|off][/yellow]")
+            return
+        if state:
+            application.set_auto_learning(state == "on")
+        label = "已启用" if application.config.auto_learning else "已关闭"
+        console.print(f"自动长期学习：[cyan]{label}[/cyan]")
     elif command == "/remember":
         _remember(application, argument)
     elif command == "/memory":
         _memory(application, argument)
     elif command == "/forget":
-        if not argument:
-            console.print("[yellow]用法：/forget <memory_id>[/yellow]")
+        if not argument.isdigit() or int(argument) < 1:
+            console.print("[yellow]用法：/forget <编号>[/yellow]")
             return
         try:
-            application.forget(argument)
-            console.print(f"已删除 Memory [cyan]{argument}[/cyan]")
+            memory = application.forget(int(argument))
+            console.print(f"已忘记记忆 [cyan]#{argument}[/cyan]：{memory.content}")
         except (GitAgentError, ValueError) as exc:
-            console.print(f"[red]Memory 删除失败：{exc}[/red]")
+            console.print(f"[red]记忆删除失败：{exc}[/red]")
     else:
         console.print(f"[yellow]未知命令：{command}（使用 /help 查看命令）[/yellow]")
 
@@ -437,10 +446,10 @@ def _render_application_output(application: LiveApplication, output: Any) -> Non
 
 def _render_result(application: LiveApplication, result: ServiceResult) -> None:
     if result.decision.clarify:
-        ui.text(str(result.output or result.decision.message), title="需要补充信息", kind="router")
+        ui.markdown(str(result.output or result.decision.message), title="需要补充信息", kind="router")
         return
     if result.agent is None and isinstance(result.output, str):
-        ui.text(result.output, title="GitAgent", kind="info")
+        ui.markdown(result.output, title="GitAgent", kind="info")
         return
     _render_output(application, result.output)
 
@@ -749,42 +758,49 @@ def _remember(application: LiveApplication, argument: str) -> None:
         )
         return
     try:
-        record, created = application.remember(scope, kind, content)
-        memory_id = record.memory_id
+        memory, created = application.remember(scope, kind, content)
         if created:
-            console.print(f"已保存 Memory [cyan]{memory_id}[/cyan]")
+            console.print(f"已保存记忆 [cyan]#{memory.index}[/cyan]")
         else:
-            console.print(f"Memory [cyan]{memory_id}[/cyan] 已存在；未重复保存。")
+            console.print(f"记忆 [cyan]#{memory.index}[/cyan] 已存在；未重复保存。")
     except (GitAgentError, ValueError) as exc:
-        console.print(f"[red]Memory 保存失败：{exc}[/red]")
+        console.print(f"[red]Knowledge 保存失败：{exc}[/red]")
 
 
 def _memory(application: LiveApplication, argument: str) -> None:
     scope_token = argument.casefold()
-    if scope_token not in {"", "user", "repo"}:
-        console.print("[yellow]用法：/memory [user|repo][/yellow]")
+    if scope_token not in {"", "user", "repo", "experience"}:
+        console.print("[yellow]用法：/memory [user|repo|experience][/yellow]")
         return
-    scope = {"": None, "user": "user", "repo": "repository"}[scope_token]
+    scope = {"": None, "user": "user", "repo": "repository", "experience": None}[scope_token]
+    kind = "experience" if scope_token == "experience" else None
     try:
-        memories = application.list_memories(scope=scope)
+        memories = application.indexed_memories(scope=scope, kind=kind)
     except (GitAgentError, ValueError) as exc:
-        console.print(f"[red]Memory 读取失败：{exc}[/red]")
+        console.print(f"[red]Knowledge 读取失败：{exc}[/red]")
         return
     if not memories:
-        console.print("[dim]当前作用域没有 Memory。[/dim]")
+        console.print("[dim]当前作用域没有长期 Knowledge。[/dim]")
         return
-    table = Table(title="Memory")
-    table.add_column("Memory ID", style="cyan")
+    table = Table(title="Long-term Knowledge", show_lines=True)
+    table.add_column("编号", style="cyan", justify="right", no_wrap=True)
     table.add_column("作用域")
     table.add_column("类型")
+    table.add_column("主题")
     table.add_column("内容")
+    table.add_column("适用条件")
+    table.add_column("来源")
     table.add_column("更新时间")
-    for memory in memories:
+    for indexed in memories:
+        memory = indexed.record
         table.add_row(
-            memory.memory_id,
+            str(indexed.index),
             memory.scope,
             memory.kind,
+            memory.topic,
             memory.content,
+            memory.conditions,
+            memory.source,
             memory.updated_at,
         )
     console.print(table)
@@ -825,11 +841,12 @@ def _show_help() -> None:
             "  /reset                保留 Turn 并建立新 Context 边界\n"
             "  /delete <编号>        删除 Session\n"
             "  /compact              压缩旧 Turn 的 Context 投影\n"
+            "  /learning [on|off]    查看或切换机会式长期学习\n"
             "  /remember user <偏好>  保存 User Memory\n"
             "  /remember repo <decision|constraint|reference> <内容>\n"
             "                        保存 Repository Memory\n"
-            "  /memory [user|repo]   查看 Memory\n"
-            "  /forget <memory_id>   删除 Memory\n"
+            "  /memory [user|repo|experience]  查看长期 Knowledge\n"
+            "  /forget <编号>         按 /memory 编号删除记忆\n"
             "  /model [name]         查看或切换模型\n"
             "  /tokens               查看模型 token 与估算费用\n"
             "  /approve              批准当前 Session 的待执行提案\n"

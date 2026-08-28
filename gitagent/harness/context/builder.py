@@ -7,10 +7,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
+from gitagent.domain.learning import KnowledgeRecord
 from gitagent.domain.models import ContextMemory, RoutingContext, SessionScope
 from gitagent.infra.persistence import (
     OPEN_QUESTION_CHARACTER_LIMIT,
-    MemoryRecord,
+    KnowledgeStore,
     SessionManager,
     TurnRecord,
 )
@@ -64,6 +65,7 @@ class ContextBuilder:
     def __init__(
         self,
         session_manager: SessionManager,
+        knowledge_store: KnowledgeStore | None = None,
         *,
         context_window_tokens: int = 32768,
         max_output_tokens: int = 16_384,
@@ -72,6 +74,7 @@ class ContextBuilder:
         token_counter: TokenCounter = estimate_tokens,
     ) -> None:
         self.session_manager = session_manager
+        self.knowledge_store = knowledge_store or KnowledgeStore(session_manager.store)
         self.context_window_tokens = _non_negative_int(context_window_tokens, "context_window_tokens", positive=True)
         self.max_output_tokens = _non_negative_int(max_output_tokens, "max_output_tokens", positive=True)
         self.safety_tokens = _non_negative_int(safety_tokens, "safety_tokens")
@@ -106,7 +109,7 @@ class ContextBuilder:
         if not isinstance(user_input, str) or not user_input.strip():
             raise ContextBuildError("latest user input cannot be empty")
 
-        loaded = self._load(scope, repository_full_name)
+        loaded = self._load(scope, repository_full_name, user_input)
         stages: list[dict[str, Any]] = []
         decisions: list[dict[str, Any]] = []
         initial_raw_size = self._estimate_candidate(
@@ -163,7 +166,7 @@ class ContextBuilder:
                 for seq in range(summary_result.covered_from_seq or 0, (summary_result.covered_to_seq or -1) + 1):
                     decisions.append({"kind": "turn", "id": seq, "reason": "summary_covered"})
                 # A successful atomic save is followed by a clean reload and recount.
-                loaded = self._load(scope, repository_full_name)
+                loaded = self._load(scope, repository_full_name, user_input)
 
             rebuilt_raw = self._estimate_candidate(
                 scope,
@@ -269,7 +272,7 @@ class ContextBuilder:
     def compact(self, scope: SessionScope) -> CompactResult:
         """Manually compact all eligible history except the newest six units."""
 
-        loaded = self._load(scope, "")
+        loaded = self._load(scope, "", "")
         plan = self.compactor.plan(
             loaded.turns,
             context_boundary_seq=loaded.context_boundary_seq,
@@ -297,7 +300,7 @@ class ContextBuilder:
             built.summary,
         )
 
-    def _load(self, scope: SessionScope, repository_full_name: str) -> _LoadedState:
+    def _load(self, scope: SessionScope, repository_full_name: str, query: str) -> _LoadedState:
         if self.session_manager is None:
             raise ContextBuildError("a Session Manager is required")
         session = self.session_manager.get_session(scope.account_key, scope.repository_key, scope.session_id)
@@ -317,7 +320,7 @@ class ContextBuilder:
             _safe_history_unit(turn) for turn in turns if is_history_unit(turn) and turn.seq > history_floor
         )
 
-        raw_memories = self.session_manager.list_memories(scope.account_key, scope.repository_key)
+        raw_memories = self.knowledge_store.relevant(scope.account_key, scope.repository_key, query)
         user_memories = tuple(
             _context_memory(record)
             for record in raw_memories
@@ -745,12 +748,15 @@ def _safe_focus(value: Mapping[str, Any] | None) -> dict[str, str] | None:
     }
 
 
-def _context_memory(record: MemoryRecord) -> ContextMemory:
+def _context_memory(record: KnowledgeRecord) -> ContextMemory:
     return ContextMemory(
-        memory_id=record.memory_id,
+        memory_id=record.knowledge_id,
         scope=record.scope,
         kind=record.kind,
         content=record.content,
+        topic=record.topic,
+        conditions=record.conditions,
+        source=record.source,
     )
 
 
@@ -760,6 +766,9 @@ def _memory_plain(memory: ContextMemory) -> dict[str, str]:
         "scope": memory.scope,
         "kind": memory.kind,
         "content": memory.content,
+        "topic": memory.topic,
+        "conditions": memory.conditions,
+        "source": memory.source,
     }
 
 

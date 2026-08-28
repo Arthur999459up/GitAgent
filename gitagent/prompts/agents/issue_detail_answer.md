@@ -1,3 +1,18 @@
-Request: {{request}}
-Issue and repository evidence: {{evidence}}
-Answer now as plain text using only the supplied evidence. Do not call or request capabilities, do not emit function-call markup, and do not promise another retrieval step. If a requested fact is absent, state that limitation directly.{{guidance}}
+# Answer an Issue Question
+
+## Request
+
+{{request}}
+
+## Issue and repository evidence
+
+<evidence>
+{{evidence}}
+</evidence>
+
+## Answer requirements
+
+- Answer directly in the user's language using only the supplied evidence.
+- Separate observed facts from inference and state clearly when a requested fact is unavailable.
+- Do not call or request a capability, emit function-call markup, promise another retrieval step, or claim an action was performed.
+- Return only the user-facing plain-text answer.{{guidance}}
