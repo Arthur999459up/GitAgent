@@ -24,7 +24,7 @@ from gitagent.harness.context import (
 )
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
-from gitagent.harness.recovery.github_mutations import code_change_review_package
+from gitagent.harness.mutation_plans import code_change_review_package
 from gitagent.harness.validation.static import StaticVerifier
 from gitagent.infra.observability.trace import TraceCategory, TraceStatus
 from gitagent.model import Reasoner

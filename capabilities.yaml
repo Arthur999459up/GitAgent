@@ -7,6 +7,8 @@ agents:
     discover: []
     invoke:
       allow: []
+      ask: []
+      deny: []
 
   repository:
     discover:
@@ -26,6 +28,9 @@ agents:
         - repository.get_file_history
         - context7.*
         - skill.debug
+      ask:
+        - github.commit_to_default_branch
+      deny: []
 
   issues:
     discover:
@@ -59,11 +64,16 @@ agents:
         - repository.find_references
         - context7.*
         - skill.debug
-      approval_required:
+      ask:
         - github.post_comment
         - github.create_issue
         - github.update_issue
         - github.set_issue_lock
+        - github.create_branch
+        - github.commit
+        - github.push
+        - github.create_draft_pr
+      deny: []
 
   pull_requests:
     discover:
@@ -98,10 +108,11 @@ agents:
         - context7.*
         - skill.code-review
         - skill.debug
-      approval_required:
+      ask:
         - github.post_review
         - github.commit
         - github.merge
+      deny: []
 
   coding:
     discover:
@@ -138,14 +149,16 @@ agents:
         - native.glob
         - native.grep
         - native.now
-        - native.write
-        - native.edit
         - native.bash
         - native.agent
         - context7.*
         - skill.code-review
         - skill.debug
-      bash_profile: coding
+      ask:
+        - native.write
+        - native.edit
+      deny: []
+    bash_profile: coding
 
   static_verifier:
     discover:
@@ -159,7 +172,9 @@ agents:
         - native.glob
         - native.grep
         - native.bash
-      bash_profile: static_only
+      ask: []
+      deny: []
+    bash_profile: static_only
 
   coding_subagent:
     discover:
@@ -195,27 +210,12 @@ agents:
         - native.glob
         - native.grep
         - native.now
-        - native.write
-        - native.edit
         - native.bash
         - context7.*
         - skill.code-review
         - skill.debug
-      bash_profile: coding
-
-  github_mutator:
-    discover: []
-    invoke:
-      approved_only:
-        - github.post_comment
-        - github.create_issue
-        - github.update_issue
-        - github.set_issue_lock
-        - github.update_pr
-        - github.create_branch
-        - github.commit
-        - github.commit_to_default_branch
-        - github.push
-        - github.create_draft_pr
-        - github.post_review
-        - github.merge
+      ask:
+        - native.write
+        - native.edit
+      deny: []
+    bash_profile: coding

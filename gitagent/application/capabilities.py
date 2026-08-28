@@ -107,7 +107,11 @@ def _subagent_runner(layer: CapabilityLayer, reasoner: Reasoner) -> Any:
             value = reasoner.complete_structured(
                 system=(
                     "You are a restricted coding sub-agent. Work only on the assigned task, use only the supplied "
-                    "capabilities, do not request GitHub mutation, and finish with a concise evidence-based summary."
+                    "capabilities, do not request GitHub mutation, and finish with a concise evidence-based summary. "
+                    "READ actions may execute directly when allowed by runtime policy. "
+                    "WRITE and DESTRUCTIVE actions require explicit user approval enforced by the runtime. "
+                    "After approval, the same agent executes the exact approved capability call. "
+                    "Never claim a mutation succeeded before observing a successful capability result."
                 ),
                 prompt=json.dumps(
                     {"task": task, "repository": context.repository, "observations": observations[-12:]},

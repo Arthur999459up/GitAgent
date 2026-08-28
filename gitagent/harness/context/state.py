@@ -74,7 +74,6 @@ class AgentContext:
         self.reply_draft: str | None = None
         self.repository_search_plan: dict[str, Any] | None = None
         self.repository_history_path = ""
-        self.read_only = False
         self.result_required = True
         self.read_cache: dict[str, Any] = {}
         self.file_reads = FileReadLedger()

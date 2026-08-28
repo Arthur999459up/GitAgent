@@ -152,11 +152,9 @@ class RepositoryAgent:
     def prepare(self, context: AgentContext, operation: RepositoryOperation) -> None:
         context.operation = operation.value
         if operation == RepositoryOperation.MODIFY:
-            context.read_only = False
             if context.change_request is None:
                 context.change_request = ChangeRequest(repository=context.repository, description=context.goal)
             return
-        context.read_only = True
         context.max_steps = min(context.max_steps, _MAX_SEARCH_STEPS)
 
     def decide(self, context: AgentContext) -> AgentAction:
@@ -387,7 +385,7 @@ class RepositoryAgent:
             verification=context.verification,
             reasoning=(
                 "Direct repository modification was lowered through CodingAgent, static verification, "
-                "approval, and the GitHub mutator."
+                "exact user approval, and execution by this Repository Agent context."
             ),
         )
 

@@ -185,7 +185,6 @@ class AgentHarness:
             session_id=context.session_id,
             agent_id=context.agent,
             repository=context.repository,
-            read_only=context.read_only,
             approval_id=approval_id,
             delegation_depth=context.delegation_depth,
         )

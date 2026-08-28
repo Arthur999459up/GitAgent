@@ -51,7 +51,6 @@ _AGENT_NAMES = {
     "pull_requests": "Pull Requests",
     "repository": "Repository",
     "coding": "Coding",
-    "github_mutator": "GitHub Mutator",
     "static_verifier": "Static Verifier",
 }
 

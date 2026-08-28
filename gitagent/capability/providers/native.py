@@ -375,7 +375,6 @@ class NativeProvider:
             session_id=context.session_id,
             agent_id="coding_subagent",
             repository=context.repository,
-            read_only=context.read_only,
             delegation_depth=context.delegation_depth + 1,
         )
         parent = self.permission_resolver(context)
@@ -386,7 +385,6 @@ class NativeProvider:
             session_id=child_context.session_id,
             agent_id=child_context.agent_id,
             repository=child_context.repository,
-            read_only=child_context.read_only,
             approval_id=child_context.approval_id,
             delegation_depth=child_context.delegation_depth,
             effective_capabilities=effective,

@@ -816,8 +816,8 @@ def prepare_verified_candidate(
 ) -> CandidatePreparationResult:
     """Generate a candidate synchronously and gate it behind static verification.
 
-    Read-only throughout: no GitHub mutation is proposed unless every static
-    check passes.  One repair attempt is allowed, matching the previous
+    Candidate preparation emits no GitHub mutation call unless every static
+    check passes. One repair attempt is allowed, matching the previous
     workflow's ``MAX_REPAIR_ATTEMPTS``.
     """
     prepared = coding.create_candidate(request, session_id=session_id, guidance=guidance)

@@ -57,7 +57,6 @@ class InvocationContext:
     session_id: str
     agent_id: str
     repository: str = ""
-    read_only: bool = False
     approval_id: str | None = None
     delegation_depth: int = 0
     effective_capabilities: frozenset[str] | None = None
@@ -71,4 +70,3 @@ class CapabilityResult:
     content: Any = None
     error: Any = None
     attempts: int = 1
-

@@ -16,7 +16,7 @@ from gitagent.domain.models import (
     PlannedCapabilityCall,
     WorkflowTurnDecision,
 )
-from gitagent.harness.recovery.github_mutations import (
+from gitagent.harness.mutation_plans import (
     code_change_review_package,
     issue_fix_approval_summary,
     issue_fix_mutation_plan,
@@ -163,20 +163,13 @@ class HarnessActionDispatcher:
         context.pending = PendingAction(approval.approval_id, approval.summary, calls)
 
     def _execute_pending(self, context: Any, pending: PendingAction) -> None:
-        mutator = self.harness.context(
-            "github_mutator",
-            context.session_id,
-            repository=context.repository,
-            goal=context.goal,
-        )
         for call in pending.calls:
-            executor = mutator if call.capability_id.startswith("github.") else context
-            result = executor.invoke(
+            result = context.invoke(
                 call.capability_id,
                 approval_id=pending.approval_id,
                 **call.arguments,
             )
-            invocation = executor.last_capability_call
+            invocation = context.last_capability_call
             if invocation is None:
                 raise WorkflowError("approved capability invocation did not record its result")
             if invocation.result.status != "success":

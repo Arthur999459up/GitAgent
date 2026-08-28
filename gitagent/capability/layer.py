@@ -105,6 +105,7 @@ class CapabilityLayer:
                     [item for item in registrations if item.capability.source_id == source_id],
                 )
             self._provider_sources[provider_id] = sources
+        self.policy.validate_capabilities(self.registry.list())
 
     def refresh(self, provider_id: str | None = None) -> None:
         providers = (
@@ -135,6 +136,7 @@ class CapabilityLayer:
                     [item for item in registrations if item.capability.source_id == source_id],
                 )
             self._provider_sources[current_provider_id] = current_sources
+        self.policy.validate_capabilities(self.registry.list())
 
     def discover(self, context: InvocationContext) -> tuple[Capability, ...]:
         return tuple(
@@ -174,7 +176,7 @@ class CapabilityLayer:
         if authorization.decision == PermissionDecision.DENY:
             error = capability_error(CapabilityErrorType.PERMISSION_DENIED, authorization.reason)
             return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0)
-        if authorization.decision == PermissionDecision.APPROVAL_REQUIRED:
+        if authorization.decision == PermissionDecision.ASK:
             result = CapabilityResult(capability_id, "approval_required", "none", attempts=0)
             self._emit(context, call_id, capability_id, "call.succeeded", {"status": result.status})
             return result

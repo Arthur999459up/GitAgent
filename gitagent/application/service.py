@@ -40,7 +40,6 @@ from gitagent.domain.models import (
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.file_reads import FileReadLedger
-from gitagent.harness.recovery import register_github_mutator
 from gitagent.harness.validation.static import StaticVerifier
 from gitagent.infra.observability import TraceBus
 from gitagent.infra.persistence import SessionManager
@@ -74,7 +73,6 @@ class GitAgentService:
         input_budget_tokens: int = 26_112,
     ) -> None:
         self.harness = AgentHarness(capabilities, trace=trace, context_budget=input_budget_tokens)
-        register_github_mutator(self.harness)
         self.coding = CodingAgent(self.harness, agent_reasoner)
         self.verifier = StaticVerifier(self.harness)
         self.repository_agent = RepositoryAgent(
@@ -223,13 +221,11 @@ class GitAgentService:
         )
         if decision.target_agent == "issues":
             if decision.requested_reply and context.entity_id:
-                context.read_only = True
                 context.result_required = False
                 self.loop.start(context, self.issue_agent)
                 if context.finished and not context.error:
                     draft = self.issue_agent.draft_reply(context, self.reasoner)
                     context.reply_draft = draft
-                    context.read_only = False
                     context.result_required = True
                     context.finished = False
                     context.result = None
@@ -477,6 +473,7 @@ class GitAgentService:
         pending = None
         if context.pending is not None:
             pending = {
+                "approval_id": context.pending.approval_id,
                 "summary": context.pending.summary,
                 "calls": [
                     {
@@ -504,7 +501,6 @@ class GitAgentService:
             "change_request": to_plain(context.change_request),
             "verification": to_plain(context.verification),
             "reply_draft": context.reply_draft,
-            "read_only": context.read_only,
             "result_required": context.result_required,
             "read_cache": to_plain(context.read_cache),
             "file_reads": context.file_reads.to_plain(),
@@ -539,7 +535,6 @@ class GitAgentService:
         context.change_request = self._restore_change_request(raw.get("change_request"))
         context.verification = self._restore_verification(raw.get("verification"))
         context.reply_draft = str(raw.get("reply_draft")) if raw.get("reply_draft") is not None else None
-        context.read_only = bool(raw.get("read_only", False))
         context.result_required = bool(raw.get("result_required", True))
         context.read_cache = dict(raw.get("read_cache") or {})
         context.file_reads = FileReadLedger.from_plain(raw.get("file_reads"))
@@ -560,7 +555,7 @@ class GitAgentService:
                 len(calls) != 1
                 or calls[0].capability_id != "github.commit_to_default_branch"
             ):
-                raise RoutingError("stored RepositoryAgent proposal uses an obsolete mutation strategy")
+                raise RoutingError("stored RepositoryAgent proposal contains an invalid mutation plan")
             if any(
                 "repository" in call.arguments and str(call.arguments["repository"]) != repository
                 for call in calls

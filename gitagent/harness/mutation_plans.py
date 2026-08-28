@@ -1,32 +1,15 @@
-"""Exact-approval GitHub mutation executor specification and code-change plan builders."""
+"""Deterministic capability-call plan builders for reviewed code changes."""
 
 from __future__ import annotations
 
 from gitagent.domain.errors import WorkflowError
 from gitagent.domain.models import (
-    AgentSpec,
     CandidatePatch,
     ChangeRequest,
     HumanReviewPackage,
     PlannedCapabilityCall,
     VerificationReport,
 )
-from gitagent.harness.execution import AgentHarness
-from gitagent.prompts import get_prompt_library
-
-_PROMPTS = get_prompt_library()
-
-GITHUB_MUTATOR_SPEC = AgentSpec(
-    name="github_mutator",
-    role="Execute only an exact, already-approved GitHub mutation plan.",
-    system_prompt=_PROMPTS.text("system.github_mutator"),
-    output_schema=(),
-    routes=frozenset({"github_mutation"}),
-)
-
-
-def register_github_mutator(harness: AgentHarness) -> None:
-    harness.register(GITHUB_MUTATOR_SPEC)
 
 
 def issue_fix_mutation_plan(

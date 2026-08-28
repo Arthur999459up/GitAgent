@@ -43,7 +43,11 @@ If no child agent is needed, return an empty target_agent and answer directly in
 Set clarify=true only when a safe interpretation is impossible; otherwise clarify=false.
 When the user refers to a concrete Issue, Pull Request, or workflow run, return its entity_type and entity_id from the request/context.
 Set requested_reply=true only when the user wants to compose, revise, or publish an Issue reply/comment.
-Approval and mutation safety are deterministic runtime responsibilities; never claim write authority."""
+READ actions may execute directly when allowed by runtime policy.
+WRITE and DESTRUCTIVE actions require explicit user approval enforced by the runtime.
+After approval, the same agent executes the exact approved capability call.
+Never claim a mutation succeeded before observing a successful capability result.
+Main Agent does not invoke capabilities or manage approvals; those are deterministic runtime responsibilities."""
 
 _MAIN_SPEC = AgentSpec(
     name="main",
