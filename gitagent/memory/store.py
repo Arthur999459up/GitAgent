@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
+import shutil
 import tempfile
 import unicodedata
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -25,6 +27,16 @@ _ITEM_TYPES = {"memory", "experience"}
 _SCOPES = {"user", "repository"}
 _ROOT_TO_SCOPE = {"user_memory": "user", "repository_memory": "repository"}
 _FRONTMATTER_FIELDS = {"type", "priority", "last_accessed_at", "pinned"}
+_INDEX_ENTRY_RE = re.compile(
+    r"^- \[(HIGH|NORMAL|LOW)\] \[([^\]]+)\]\((items/[A-Za-z0-9_-]+\.md)\) "
+    r"(.*?) <!-- last_accessed_at=(.+) -->$"
+)
+
+
+@dataclass(frozen=True)
+class _ScopedIndexItem:
+    scope: str
+    item: MemoryItem
 
 
 class MemoryAccessTracker:
@@ -68,43 +80,42 @@ class MemoryStore:
         self._secure_directory(self.root)
 
     def roots(self, account_key: str, repository_key: str) -> dict[str, Path]:
-        """Return the two read-only roots authorized for the current scope."""
+        """Return and prepare the two roots authorized for direct item access."""
 
+        roots = self._root_paths(account_key, repository_key)
+        for path in roots.values():
+            self._secure_directory(path / "items")
+        return roots
+
+    def _root_paths(self, account_key: str, repository_key: str) -> dict[str, Path]:
         account_root = self.root / "accounts" / _key_hash(account_key)
-        roots = {
+        return {
             "user_memory": account_root / "user",
             "repository_memory": account_root
             / "repositories"
             / _key_hash(repository_key),
         }
-        for path in roots.values():
-            self._secure_directory(path / "items")
-        return roots
 
-    def render_index(
+    def read_index(
         self,
         account_key: str,
         repository_key: str,
         *,
         full: bool = False,
     ) -> str:
-        """Render user and repository indexes without semantic filtering."""
+        """Read persisted indexes only; normal context construction never scans items."""
 
-        roots = self.roots(account_key, repository_key)
-        sections: list[str] = []
+        roots = self._root_paths(account_key, repository_key)
         with self._locked():
-            for root_name, title in (
-                ("user_memory", "用户长期上下文"),
-                ("repository_memory", "当前仓库长期上下文"),
-            ):
-                scope_root = roots[root_name]
-                items = self._list_scope(scope_root)
-                self._write_index(scope_root, items)
-                if not items:
-                    continue
-                sections.append(self._render_scope(title, root_name, items))
-        rendered = "\n\n".join(sections)
-        return rendered if full else _bounded_index(rendered)
+            entries = tuple(
+                _ScopedIndexItem(scope, item)
+                for root_name, scope in (
+                    ("user_memory", "user"),
+                    ("repository_memory", "repository"),
+                )
+                for item in self._read_scope_index(roots[root_name])
+            )
+        return _render_combined_index(entries, full=full)
 
     def list_items(
         self,
@@ -122,7 +133,6 @@ class MemoryStore:
         root = self._scope_root(account_key, repository_key, scope)
         with self._locked():
             items = self._list_scope(root)
-            self._write_index(root, items)
         if item_type is not None:
             items = tuple(item for item in items if item.type == item_type)
         return items
@@ -154,15 +164,15 @@ class MemoryStore:
                         last_accessed_at=self._timestamp(),
                         pinned=True,
                     )
-                    self._write_item(root, pinned)
-                    self._write_index(
-                        root,
-                        tuple(
-                            pinned
-                            if item.relative_path == pinned.relative_path
-                            else item
-                            for item in items
-                        ),
+                    self._commit_scope_states(
+                        {
+                            root: tuple(
+                                pinned
+                                if item.relative_path == pinned.relative_path
+                                else item
+                                for item in items
+                            )
+                        }
                     )
                     return pinned, False
                 return duplicate, False
@@ -170,8 +180,7 @@ class MemoryStore:
             item = MemoryItem(
                 relative_path, "memory", clean_text, priority, self._timestamp(), True
             )
-            self._write_item(root, item)
-            self._write_index(root, (*items, item))
+            self._commit_scope_states({root: (*items, item)})
             return item, True
 
     def forget(
@@ -187,12 +196,21 @@ class MemoryStore:
         root = self._scope_root(account_key, repository_key, _scope(scope))
         relative_path = _item_path(relative_path)
         with self._locked():
-            target = self._resolved_item(root, relative_path, must_exist=False)
-            if not target.exists():
+            items = self._list_scope(root)
+            item = next(
+                (item for item in items if item.relative_path == relative_path), None
+            )
+            if item is None:
                 return None
-            item = self._read_item(root, target)
-            target.unlink()
-            self._write_index(root, self._list_scope(root))
+            self._commit_scope_states(
+                {
+                    root: tuple(
+                        current
+                        for current in items
+                        if current.relative_path != relative_path
+                    )
+                }
+            )
             return item
 
     def apply_changes(
@@ -237,12 +255,15 @@ class MemoryStore:
                 "Reflection cannot apply multiple changes to the same Memory path"
             )
         with self._locked():
-            by_scope = {
+            original_by_scope = {
                 scope: {item.relative_path: item for item in self._list_scope(root)}
                 for scope, root in (
                     ("user", roots["user_memory"]),
                     ("repository", roots["repository_memory"]),
                 )
+            }
+            by_scope = {
+                scope: dict(items) for scope, items in original_by_scope.items()
             }
             for change in add_changes:
                 if change["path"] in by_scope[change["scope"]]:
@@ -265,7 +286,6 @@ class MemoryStore:
                     now,
                     False,
                 )
-                self._write_item(self._root_for_scope(roots, scope), item)
                 items[path] = item
                 added.append(f"{scope}:{path}")
 
@@ -282,7 +302,6 @@ class MemoryStore:
                     priority=change["priority"],
                     last_accessed_at=now,
                 )
-                self._write_item(self._root_for_scope(roots, scope), item)
                 by_scope[scope][path] = item
                 replaced.append(f"{scope}:{path}")
 
@@ -293,9 +312,6 @@ class MemoryStore:
                 if current is None or current.pinned:
                     skipped.append(path)
                     continue
-                self._resolved_item(
-                    self._root_for_scope(roots, scope), path, must_exist=True
-                ).unlink()
                 del by_scope[scope][path]
                 deleted.append(f"{scope}:{path}")
 
@@ -311,13 +327,14 @@ class MemoryStore:
                 if current is None or current.last_accessed_at == now:
                     continue
                 touched = replace(current, last_accessed_at=now)
-                self._write_item(self._root_for_scope(roots, scope), touched)
                 by_scope[scope][path] = touched
 
-            for scope in ("user", "repository"):
-                self._write_index(
-                    self._root_for_scope(roots, scope), tuple(by_scope[scope].values())
-                )
+            updates = {
+                self._root_for_scope(roots, scope): tuple(by_scope[scope].values())
+                for scope in ("user", "repository")
+                if by_scope[scope] != original_by_scope[scope]
+            }
+            self._commit_scope_states(updates)
         return {
             "added": tuple(added),
             "replaced": tuple(replaced),
@@ -328,9 +345,11 @@ class MemoryStore:
     def rebuild_index(self, account_key: str, repository_key: str) -> str:
         """Rebuild complete indexes from item files without refreshing access time."""
 
-        return self.render_index(account_key, repository_key, full=True)
-
-    compact = rebuild_index
+        roots = self.roots(account_key, repository_key)
+        with self._locked():
+            for root in roots.values():
+                self._write_index(root, self._list_scope(root))
+        return self.read_index(account_key, repository_key, full=True)
 
     def _validated_change(self, raw: dict[str, str], *, action: str) -> dict[str, str]:
         if not isinstance(raw, dict):
@@ -373,6 +392,25 @@ class MemoryStore:
             if path.is_file():
                 items.append(self._read_item(root, path))
         return tuple(sorted(items, key=_sort_key))
+
+    def _read_scope_index(self, root: Path) -> tuple[MemoryItem, ...]:
+        path = root / "MEMORY.md"
+        if not path.exists():
+            return ()
+        if path.is_symlink():
+            raise StateError(f"Memory index must not be a symbolic link: {path}")
+        try:
+            if (
+                os.name == "posix"
+                and path.stat(follow_symlinks=False).st_uid != os.getuid()
+            ):
+                raise StateError(f"Memory index is not owned by the current user: {path}")
+            raw = path.read_text(encoding="utf-8")
+        except StateError:
+            raise
+        except OSError as exc:
+            raise StateError(f"cannot read Memory index: {path}") from exc
+        return _parse_index(raw)
 
     def _read_item(self, root: Path, path: Path) -> MemoryItem:
         resolved = self._resolved_item(
@@ -418,22 +456,60 @@ class MemoryStore:
     def _write_index(self, root: Path, items: Iterable[MemoryItem]) -> None:
         ordered = tuple(sorted(items, key=_sort_key))
         lines: list[str] = ["# Memory", ""]
-        lines.extend(_index_line(item) for item in ordered if item.type == "memory")
+        lines.extend(
+            _stored_index_line(item) for item in ordered if item.type == "memory"
+        )
         lines.extend(("", "# Experience", ""))
-        lines.extend(_index_line(item) for item in ordered if item.type == "experience")
+        lines.extend(
+            _stored_index_line(item) for item in ordered if item.type == "experience"
+        )
         _atomic_write(root / "MEMORY.md", "\n".join(lines).rstrip() + "\n")
 
-    @staticmethod
-    def _render_scope(title: str, root_name: str, items: tuple[MemoryItem, ...]) -> str:
-        lines = [f"### {title} · root={root_name}", "", "#### Memory"]
-        memory_lines = [_index_line(item) for item in items if item.type == "memory"]
-        lines.extend(memory_lines or ["- （无）"])
-        lines.extend(("", "#### Experience"))
-        experience_lines = [
-            _index_line(item) for item in items if item.type == "experience"
-        ]
-        lines.extend(experience_lines or ["- （无）"])
-        return "\n".join(lines)
+    def _commit_scope_states(
+        self, updates: dict[Path, tuple[MemoryItem, ...]]
+    ) -> None:
+        """Stage complete scope states and roll every scope back if commit fails."""
+
+        if not updates:
+            return
+        transaction_root = Path(
+            tempfile.mkdtemp(prefix=".memory-batch-", dir=self.root)
+        )
+        staged: dict[Path, Path] = {}
+        backups: dict[Path, Path] = {}
+        swapped: list[Path] = []
+        ordered_updates = tuple(sorted(updates.items(), key=lambda item: str(item[0])))
+        try:
+            for index, (root, items) in enumerate(ordered_updates):
+                stage = transaction_root / f"stage-{index}"
+                self._secure_directory(stage / "items")
+                for item in items:
+                    self._write_item(stage, item)
+                self._write_index(stage, items)
+                staged[root] = stage
+
+            for index, (root, _) in enumerate(ordered_updates):
+                backup = transaction_root / f"backup-{index}"
+                os.replace(root, backup)
+                backups[root] = backup
+                try:
+                    os.replace(staged[root], root)
+                except BaseException:
+                    os.replace(backup, root)
+                    backups.pop(root, None)
+                    raise
+                swapped.append(root)
+        except BaseException:
+            for rollback_index, root in enumerate(reversed(swapped)):
+                backup = backups.get(root)
+                if backup is None or not backup.exists():
+                    continue
+                if root.exists():
+                    os.replace(root, transaction_root / f"failed-{rollback_index}")
+                os.replace(backup, root)
+            raise
+        finally:
+            shutil.rmtree(transaction_root, ignore_errors=True)
 
     def _available_path(self, root: Path, text: str) -> str:
         stem = _readable_stem(text)
@@ -568,6 +644,44 @@ def _parse_item(raw: str) -> tuple[dict[str, Any], str]:
     }, text
 
 
+def _parse_index(raw: str) -> tuple[MemoryItem, ...]:
+    current_type: str | None = None
+    items: list[MemoryItem] = []
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "# Memory":
+            current_type = "memory"
+            continue
+        if line == "# Experience":
+            current_type = "experience"
+            continue
+        if current_type is None:
+            raise StateError("Memory index has content before a section header")
+        match = _INDEX_ENTRY_RE.fullmatch(line)
+        if match is None:
+            raise StateError("Memory index entry has an invalid shape")
+        priority, _, relative_path, summary, timestamp = match.groups()
+        try:
+            parsed = datetime.fromisoformat(timestamp)
+        except ValueError as exc:
+            raise StateError("Memory index last_accessed_at is invalid") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise StateError("Memory index last_accessed_at must include a timezone")
+        items.append(
+            MemoryItem(
+                relative_path=_item_path(relative_path),
+                type=current_type,
+                text=summary,
+                priority=priority.casefold(),
+                last_accessed_at=timestamp,
+                pinned=False,
+            )
+        )
+    return tuple(items)
+
+
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -655,20 +769,82 @@ def _title(path: str) -> str:
     )
 
 
-def _index_line(item: MemoryItem) -> str:
-    return f"- [{item.priority.upper()}] [{_title(item.relative_path)}]({item.relative_path}) {_summary(item.text)}"
+def _display_index_line(item: MemoryItem) -> str:
+    return (
+        f"- [{item.priority.upper()}] [{_title(item.relative_path)}]"
+        f"({item.relative_path}) {_summary(item.text)}"
+    )
 
 
-def _bounded_index(value: str) -> str:
-    selected: list[str] = []
-    size = 0
-    for line in value.splitlines():
-        encoded = (line + "\n").encode("utf-8")
-        if len(selected) >= INDEX_LINE_LIMIT or size + len(encoded) > INDEX_BYTE_LIMIT:
+def _stored_index_line(item: MemoryItem) -> str:
+    return (
+        f"{_display_index_line(item)} "
+        f"<!-- last_accessed_at={item.last_accessed_at} -->"
+    )
+
+
+def _scoped_sort_key(entry: _ScopedIndexItem) -> tuple[int, float, str, str]:
+    item = entry.item
+    timestamp = datetime.fromisoformat(item.last_accessed_at).timestamp()
+    return (
+        _PRIORITY_ORDER[item.priority],
+        -timestamp,
+        item.relative_path,
+        entry.scope,
+    )
+
+
+def _render_combined_index(
+    entries: Iterable[_ScopedIndexItem], *, full: bool
+) -> str:
+    ordered = tuple(sorted(entries, key=_scoped_sort_key))
+    if not ordered:
+        return ""
+    if full:
+        return _render_selected_index(ordered)
+
+    selected: list[_ScopedIndexItem] = []
+    for entry in ordered:
+        candidate = (*selected, entry)
+        rendered = _render_selected_index(candidate)
+        if not _index_within_limits(rendered):
             break
-        selected.append(line)
-        size += len(encoded)
-    return "\n".join(selected).rstrip()
+        selected.append(entry)
+    return _render_selected_index(tuple(selected)) if selected else ""
+
+
+def _render_selected_index(entries: tuple[_ScopedIndexItem, ...]) -> str:
+    groups: dict[tuple[str, str], list[MemoryItem]] = {
+        ("user", "memory"): [],
+        ("user", "experience"): [],
+        ("repository", "memory"): [],
+        ("repository", "experience"): [],
+    }
+    for entry in entries:
+        groups[(entry.scope, entry.item.type)].append(entry.item)
+
+    sections: list[str] = []
+    for scope, root_name, title in (
+        ("user", "user_memory", "用户长期上下文"),
+        ("repository", "repository_memory", "当前仓库长期上下文"),
+    ):
+        lines = [f"### {title} · root={root_name}", "", "#### Memory"]
+        lines.extend(
+            [_display_index_line(item) for item in groups[(scope, "memory")]]
+            or ["- （无）"]
+        )
+        lines.extend(("", "#### Experience"))
+        lines.extend(
+            [_display_index_line(item) for item in groups[(scope, "experience")]]
+            or ["- （无）"]
+        )
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
+
+
+def _index_within_limits(value: str) -> bool:
+    lines = value.splitlines()
+    return len(lines) <= INDEX_LINE_LIMIT and len(value.encode("utf-8")) <= INDEX_BYTE_LIMIT
 
 
 def _readable_stem(text: str) -> str:

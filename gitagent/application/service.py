@@ -629,7 +629,7 @@ class GitAgentService:
     def _stored_guidance(self, context: AgentContext) -> AgentGuidance | None:
         scope = self._scope()
         guidance = AgentGuidance(
-            memory_index=self._require_memory_store().render_index(
+            memory_index=self._require_memory_store().read_index(
                 scope.account_key,
                 scope.repository_key,
             ),
@@ -953,7 +953,7 @@ class GitAgentService:
             step
             for step in (_trace_step(item) for item in context.observations)
             if step is not None
-        )[-5:]
+        )
         outcome = (
             context.final_message
             or _trace_result(to_plain(context.result))

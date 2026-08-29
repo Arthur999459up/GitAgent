@@ -364,7 +364,7 @@ class ContextBuilder:
         )
 
         del query
-        memory_index = self.memory_store.render_index(
+        memory_index = self.memory_store.read_index(
             scope.account_key, scope.repository_key
         )
         return _LoadedState(

@@ -14,7 +14,7 @@ from gitagent.memory import MemoryStore
 
 
 class ReflectionContextBuilder:
-    """Build small learning contexts without touching Main conversation state."""
+    """Build one-turn learning contexts without touching Main conversation state."""
 
     def __init__(
         self,
@@ -47,7 +47,7 @@ class ReflectionContextBuilder:
             trigger="domain_trace",
             conversation_units=self._conversation(scope, turn_seq),
             learning_trace=trace,
-            memory_index=self.memory.render_index(
+            memory_index=self.memory.read_index(
                 scope.account_key, scope.repository_key
             ),
         )
@@ -65,7 +65,7 @@ class ReflectionContextBuilder:
             repository_full_name=repository_full_name,
             trigger="main_conversation",
             conversation_units=self._conversation(scope, turn_seq),
-            memory_index=self.memory.render_index(
+            memory_index=self.memory.read_index(
                 scope.account_key, scope.repository_key
             ),
         )
@@ -78,7 +78,7 @@ class ReflectionContextBuilder:
             scope=scope,
             repository_full_name=repository_full_name,
             trigger="explicit_memory_compact",
-            memory_index=self.memory.render_index(
+            memory_index=self.memory.read_index(
                 scope.account_key, scope.repository_key, full=True
             ),
         )
@@ -103,42 +103,63 @@ class ReflectionContextBuilder:
                 scope.account_key,
                 scope.repository_key,
                 scope.session_id,
-                after_seq=max(0, turn_seq - 3),
+                after_seq=max(0, turn_seq - 1),
             )
-            if turn.seq <= turn_seq
+            if turn.seq == turn_seq
         )
 
     def _fit(self, context: ReflectionInput) -> ReflectionInput:
-        conversation = list(context.conversation_units)
+        """Fit required evidence by compacting fields, never by dropping trajectory steps."""
+
         candidate = context
-        while self._tokens(candidate) > self.input_budget_tokens and conversation:
-            conversation.pop(0)
-            candidate = replace(candidate, conversation_units=tuple(conversation))
+        if self._tokens(candidate) <= self.input_budget_tokens:
+            return candidate
+
         trace = candidate.learning_trace
         if trace is not None:
-            steps = list(trace.trajectory)
-            while self._tokens(candidate) > self.input_budget_tokens and len(steps) > 1:
-                steps.pop()
-                candidate = replace(
-                    candidate, learning_trace=replace(trace, trajectory=tuple(steps))
-                )
-            if self._tokens(candidate) > self.input_budget_tokens:
-                bounded = tuple(
-                    TraceStep(step.action[:300], _bounded_result(step.result, 600))
-                    for step in steps
-                )
-                candidate = replace(
-                    candidate,
-                    learning_trace=replace(
-                        trace,
-                        goal=trace.goal[:1000],
-                        outcome=_bounded_result(trace.outcome, 1000),
-                        trajectory=bounded,
-                    ),
-                )
+            candidate = replace(
+                candidate,
+                learning_trace=_compact_trace(
+                    trace,
+                    action_limit=300,
+                    result_limit=600,
+                    goal_limit=1000,
+                    outcome_limit=1000,
+                ),
+            )
+
+        if self._tokens(candidate) > self.input_budget_tokens:
+            candidate = replace(
+                candidate,
+                conversation_units=_compact_conversation(
+                    candidate.conversation_units, limit=800
+                ),
+            )
+
+        trace = candidate.learning_trace
+        if self._tokens(candidate) > self.input_budget_tokens and trace is not None:
+            candidate = replace(
+                candidate,
+                learning_trace=_compact_trace(
+                    trace,
+                    action_limit=160,
+                    result_limit=320,
+                    goal_limit=600,
+                    outcome_limit=600,
+                ),
+            )
+
+        if self._tokens(candidate) > self.input_budget_tokens:
+            candidate = replace(
+                candidate,
+                conversation_units=_compact_conversation(
+                    candidate.conversation_units, limit=400
+                ),
+            )
+
         if self._tokens(candidate) > self.input_budget_tokens:
             raise ValueError(
-                "required Memory index and learning evidence exceed the reflection budget"
+                "required one-turn Memory index and learning evidence exceed the reflection budget"
             )
         return candidate
 
@@ -147,6 +168,40 @@ class ReflectionContextBuilder:
         return estimate_tokens(
             json.dumps(to_plain(context), ensure_ascii=False, default=str)
         )
+
+
+def _compact_trace(
+    trace: LearningTrace,
+    *,
+    action_limit: int,
+    result_limit: int,
+    goal_limit: int,
+    outcome_limit: int,
+) -> LearningTrace:
+    return replace(
+        trace,
+        goal=_bounded_result(trace.goal, goal_limit),
+        outcome=_bounded_result(trace.outcome, outcome_limit),
+        trajectory=tuple(
+            TraceStep(
+                _bounded_result(step.action, action_limit),
+                _bounded_result(step.result, result_limit),
+            )
+            for step in trace.trajectory
+        ),
+    )
+
+
+def _compact_conversation(
+    units: tuple[dict[str, Any], ...], *, limit: int
+) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        {
+            key: _bounded_result(value, limit) if isinstance(value, str) else value
+            for key, value in unit.items()
+        }
+        for unit in units
+    )
 
 
 def _bounded_result(value: str, limit: int) -> str:

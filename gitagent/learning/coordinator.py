@@ -66,7 +66,6 @@ class LearningCoordinator:
             self._emit(scope, TraceStatus.COMPLETED, result, changes)
             return result
         except Exception as exc:  # noqa: BLE001 - learning never changes Domain success
-            self._touch_after_failure(scope, accessed)
             self._emit_failure(scope, exc)
             return None
 
@@ -97,7 +96,6 @@ class LearningCoordinator:
             self._emit(scope, TraceStatus.COMPLETED, result, changes)
             return result
         except Exception as exc:  # noqa: BLE001 - response is already durable
-            self._touch_after_failure(scope, accessed)
             self._emit_failure(scope, exc)
             return None
 
@@ -132,16 +130,6 @@ class LearningCoordinator:
             ReflectionChanges(),
             accessed_paths=accessed,
         )
-
-    def _touch_after_failure(
-        self,
-        scope: SessionScope,
-        accessed: tuple[tuple[str, str], ...],
-    ) -> None:
-        try:
-            self._touch_only(scope, accessed)
-        except Exception:  # noqa: BLE001, S110 - keep the original reflection failure
-            pass
 
     def _emit(
         self,
