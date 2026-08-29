@@ -33,6 +33,7 @@ from .compact import (
 
 RETRY_RESERVE_TOKENS = 512
 MINIMUM_EFFECTIVE_INPUT_BUDGET = 4096
+_DOMAIN_HISTORY_ROUTES = frozenset({"issues", "pull_requests", "repository"})
 TokenCounter = Callable[[str], int]
 PromptRenderer = Callable[[RoutingContext], str]
 
@@ -699,16 +700,25 @@ class ContextBuilder:
 
 def _safe_history_unit(turn: TurnRecord) -> dict[str, Any]:
     status = turn.status.casefold()
+    route_summary = _safe_route_summary(turn.route_summary)
     unit: dict[str, Any] = {
         "seq": turn.seq,
         "status": status,
         "history_text": turn.history_text,
-        "route_summary": _safe_route_summary(turn.route_summary),
+        "route_summary": route_summary,
     }
     if status == "completed":
-        unit["assistant_text"] = turn.assistant_text
+        if not _is_domain_history(route_summary):
+            unit["assistant_text"] = turn.assistant_text
         unit["entity_manifests"] = _safe_manifests(turn.entity_manifests)
     return unit
+
+
+def _is_domain_history(route_summary: Sequence[Mapping[str, Any]]) -> bool:
+    return any(
+        str(entry.get("route", "")).strip() in _DOMAIN_HISTORY_ROUTES
+        for entry in route_summary
+    )
 
 
 def _minimal_history_unit(unit: Mapping[str, Any]) -> dict[str, Any]:

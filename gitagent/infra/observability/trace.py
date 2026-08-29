@@ -36,6 +36,7 @@ class TraceEvent:
     message: str = ""
     details: dict[str, Any] = field(default_factory=dict)
     duration_ms: float | None = None
+    turn_seq: int | None = None
 
 
 TraceListener = Callable[[TraceEvent], None]
@@ -44,10 +45,18 @@ TraceListener = Callable[[TraceEvent], None]
 class TraceBus:
     """保存当前会话事件，并把新事件同步通知 CLI。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, persistent_sink: TraceListener | None = None) -> None:
         self._events: list[TraceEvent] = []
         self._listeners: list[TraceListener] = []
+        self._turns: dict[str, int] = {}
+        self._persistent_sink = persistent_sink
         self._lock = Lock()
+
+    def bind_turn(self, session_id: str, turn_seq: int) -> None:
+        if not isinstance(turn_seq, int) or isinstance(turn_seq, bool) or turn_seq < 1:
+            raise ValueError("turn_seq must be a positive integer")
+        with self._lock:
+            self._turns[session_id] = turn_seq
 
     def subscribe(self, listener: TraceListener) -> None:
         with self._lock:
@@ -64,7 +73,10 @@ class TraceBus:
         message: str = "",
         details: dict[str, Any] | None = None,
         duration_ms: float | None = None,
+        turn_seq: int | None = None,
     ) -> TraceEvent:
+        with self._lock:
+            effective_turn_seq = turn_seq or self._turns.get(session_id)
         event = TraceEvent(
             timestamp=datetime.now(UTC).isoformat(),
             session_id=session_id,
@@ -74,7 +86,10 @@ class TraceBus:
             message=message,
             details=details or {},
             duration_ms=duration_ms,
+            turn_seq=effective_turn_seq,
         )
+        if self._persistent_sink is not None:
+            self._persistent_sink(event)
         with self._lock:
             self._events.append(event)
             listeners = tuple(self._listeners)

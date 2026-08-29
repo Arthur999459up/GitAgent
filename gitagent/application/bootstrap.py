@@ -15,6 +15,8 @@ from gitagent.harness.context import CompactResult, ContextBuilder
 from gitagent.infra.github import GitHubClient
 from gitagent.infra.observability import TraceBus
 from gitagent.infra.persistence import (
+    SessionEventLog,
+    SessionEventRecorder,
     SessionManager,
     SessionRecord,
     StateStore,
@@ -501,7 +503,6 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         timeout=config.effective_llm_timeout,
     )
     reasoner = LLMReasoner(llm)
-    trace = TraceBus()
     github = GitHubClient(
         token=config.github_token,
         api_url=config.github_api_url,
@@ -510,7 +511,12 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
     store = StateStore(
         config.state_path, secret_values=(config.github_token, config.api_key)
     )
-    sessions = SessionManager(store)
+    event_log = SessionEventLog(config.event_path, redactor=store.redact)
+    sessions = SessionManager(store, event_log)
+    sessions.collect_event_logs(config.event_retention_days)
+    trace = TraceBus(
+        persistent_sink=SessionEventRecorder(event_log, sessions.scope_for_session)
+    )
     memory = MemoryStore(
         config.memory_path,
         text_sanitizer=lambda value: store.text(

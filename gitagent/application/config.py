@@ -10,7 +10,9 @@ from pathlib import Path
 # Capture this before dotenv loading. Repository-controlled .env files must never
 # select the persistent state location.
 _STARTUP_STATE_PATH = os.environ.get("GITAGENT_STATE_PATH")
+_STARTUP_EVENT_PATH = os.environ.get("GITAGENT_EVENT_PATH")
 _STARTUP_MEMORY_PATH = os.environ.get("GITAGENT_MEMORY_PATH")
+_STARTUP_EVENT_RETENTION_DAYS = os.environ.get("GITAGENT_EVENT_RETENTION_DAYS")
 # Same pre-dotenv stance for the prompt directory: a repository-controlled .env
 # must never redirect which prompts are loaded (mirrors prompts/library.py).
 _STARTUP_PROMPTS_DIR = os.environ.get("GITAGENT_PROMPTS_DIR")
@@ -22,7 +24,10 @@ _DEFAULT_REQUEST_TIMEOUT = 30.0
 _DEFAULT_LLM_TIMEOUT = 300.0
 _DEFAULT_MAX_TOKENS = 16_384
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_MEMORY_PATH = _PROJECT_ROOT / ".gitagent" / "memory"
+_DEFAULT_DATA_ROOT = _PROJECT_ROOT.parent / "database"
+_DEFAULT_STATE_PATH = _DEFAULT_DATA_ROOT / "state.db"
+_DEFAULT_EVENT_PATH = _DEFAULT_DATA_ROOT / "sessions"
+_DEFAULT_MEMORY_PATH = _DEFAULT_DATA_ROOT / "memory"
 
 
 def _load_dotenv() -> None:
@@ -47,8 +52,10 @@ class CLIConfig:
     request_timeout: float = _DEFAULT_REQUEST_TIMEOUT
     llm_timeout: float | None = None
     github_timeout: float | None = None
-    state_path: str = str(Path.home() / ".gitagent" / "state.db")
+    state_path: str = str(_DEFAULT_STATE_PATH)
+    event_path: str = str(_DEFAULT_EVENT_PATH)
     memory_path: str = str(_DEFAULT_MEMORY_PATH)
+    event_retention_days: int = 30
     prompts_dir: str | None = None
     context_window_tokens: int = 32768
     context_safety_tokens: int = 2048
@@ -108,8 +115,19 @@ class CLIConfig:
             )
         if self.prompts_dir is not None and not Path(self.prompts_dir).is_dir():
             raise ValueError(f"GITAGENT_PROMPTS_DIR 不是有效目录: {self.prompts_dir}")
-        if not Path(self.memory_path).expanduser().is_absolute():
-            raise ValueError("GITAGENT_MEMORY_PATH 必须是绝对路径")
+        for name, value in (
+            ("GITAGENT_STATE_PATH", self.state_path),
+            ("GITAGENT_EVENT_PATH", self.event_path),
+            ("GITAGENT_MEMORY_PATH", self.memory_path),
+        ):
+            if not Path(value).expanduser().is_absolute():
+                raise ValueError(f"{name} 必须是绝对路径")
+        if (
+            not isinstance(self.event_retention_days, int)
+            or isinstance(self.event_retention_days, bool)
+            or self.event_retention_days < 0
+        ):
+            raise ValueError("GITAGENT_EVENT_RETENTION_DAYS 必须是非负整数")
         if not isinstance(self.auto_learning, bool):
             raise TypeError("GITAGENT_AUTO_LEARNING 必须为布尔值")
 
@@ -128,6 +146,8 @@ class CLIConfig:
             llm_timeout = None
         else:
             llm_timeout = _DEFAULT_LLM_TIMEOUT
+        state_path = _STARTUP_STATE_PATH or str(_DEFAULT_STATE_PATH)
+        data_root = Path(state_path).expanduser().parent
         config = cls(
             model=os.getenv("GITAGENT_MODEL") or "gpt-5.4-mini",
             api_key=(
@@ -151,9 +171,12 @@ class CLIConfig:
                 if "GITAGENT_GITHUB_TIMEOUT" in os.environ
                 else None
             ),
-            state_path=_STARTUP_STATE_PATH
-            or str(Path.home() / ".gitagent" / "state.db"),
-            memory_path=_STARTUP_MEMORY_PATH or str(_DEFAULT_MEMORY_PATH),
+            state_path=state_path,
+            event_path=_STARTUP_EVENT_PATH or str(data_root / "sessions"),
+            memory_path=_STARTUP_MEMORY_PATH or str(data_root / "memory"),
+            event_retention_days=int(
+                _STARTUP_EVENT_RETENTION_DAYS or "30"
+            ),
             prompts_dir=_STARTUP_PROMPTS_DIR,
             context_window_tokens=int(
                 os.getenv("GITAGENT_CONTEXT_WINDOW_TOKENS", "32768")

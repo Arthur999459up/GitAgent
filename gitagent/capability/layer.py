@@ -155,7 +155,13 @@ class CapabilityLayer:
             raise CapabilityInternalError("CapabilityLayer.invoke arguments must be a dict")
         call_id = f"call-{uuid.uuid4().hex}"
         identity = self.failure_guard.call_identity(context.agent_id, capability_id, arguments)
-        self._emit(context, call_id, capability_id, "call.started", {"argument_keys": sorted(arguments)})
+        self._emit(
+            context,
+            call_id,
+            capability_id,
+            "call.started",
+            {"argument_keys": sorted(arguments), "arguments": arguments},
+        )
         if self.failure_guard.blocked(context.run_id, identity):
             error = capability_error(
                 CapabilityErrorType.REPEATED_FAILURE,
@@ -178,7 +184,13 @@ class CapabilityLayer:
             return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0)
         if authorization.decision == PermissionDecision.ASK:
             result = CapabilityResult(capability_id, "approval_required", "none", attempts=0)
-            self._emit(context, call_id, capability_id, "call.succeeded", {"status": result.status})
+            self._emit(
+                context,
+                call_id,
+                capability_id,
+                "call.succeeded",
+                {"status": result.status, "content": ""},
+            )
             return result
 
         try:
@@ -258,7 +270,13 @@ class CapabilityLayer:
                 "rag": "retrieval",
             }[capability.kind.value]
             result = CapabilityResult(capability_id, "success", result_type, raw, attempts=attempts)
-            self._emit(context, call_id, capability_id, "call.succeeded", {"attempts": attempts})
+            self._emit(
+                context,
+                call_id,
+                capability_id,
+                "call.succeeded",
+                {"attempts": attempts, "status": "ok", "content": raw},
+            )
             return result
         raise CapabilityInternalError("capability recovery loop exceeded its invariant")
 
@@ -309,6 +327,6 @@ class CapabilityLayer:
             call_id=call_id,
             capability_id=capability_id,
             event=event,
-            details=details,
+            details={"agent": context.agent_id, **details},
             session_id=context.session_id,
         )

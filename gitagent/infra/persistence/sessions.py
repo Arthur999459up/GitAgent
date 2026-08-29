@@ -8,12 +8,14 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from gitagent.domain.errors import StateError, ValidationError
 from gitagent.domain.models import SessionScope
 
+from .event_log import SessionEventLog
 from .store import StateStore
 
 OPEN_QUESTION_CHARACTER_LIMIT = 50_000
@@ -97,9 +99,17 @@ def build_repository_key(api_url: str, repository_id: int) -> str:
 class SessionManager:
     """The application boundary for Session and Turn state."""
 
-    def __init__(self, store: StateStore, *, token_counter: Any = None) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        event_log: SessionEventLog,
+        *,
+        token_counter: Any = None,
+    ) -> None:
         self.store = store
+        self.event_log = event_log
         self.token_counter = token_counter or estimate_tokens
+        self.recover_event_log()
         self.recover_interrupted()
 
     def create_session(
@@ -117,13 +127,15 @@ class SessionManager:
             _require_string(repository_full_name, "repository_full_name", maximum=240, allow_empty=False)
         )
         with self.store.transaction() as connection:
-            return self._insert_session_tx(
+            created = self._insert_session_tx(
                 connection,
                 account_key,
                 repository_key,
                 full_name,
                 session_id=session_id,
             )
+        self._record_session_started(created)
+        return created
 
     def get_account_session(self, account_key: str, session_id: str) -> SessionRecord | None:
         account_key, _ = _validate_account_key(account_key)
@@ -219,7 +231,20 @@ class SessionManager:
                 """,
                 (last_seq, last_seq, working_state, now, scope.session_id),
             )
-            return _session(self._session_row_tx(connection, scope.account_key, scope.repository_key, scope.session_id))
+            reset = _session(
+                self._session_row_tx(
+                    connection,
+                    scope.account_key,
+                    scope.repository_key,
+                    scope.session_id,
+                )
+            )
+        self.event_log.append(
+            scope,
+            "workflow_step",
+            data={"operation": "session_reset", "through_turn_seq": last_seq},
+        )
+        return reset
 
     def delete_session(
         self,
@@ -237,7 +262,9 @@ class SessionManager:
             if target is None:
                 raise StateError("Session not found")
             connection.execute("DELETE FROM sessions WHERE session_id=?", (scope.session_id,))
-            return _session(target)
+            deleted = _session(target)
+        self.event_log.delete(scope)
+        return deleted
 
     def replace_session(self, scope: SessionScope, replacement_session_id: str) -> SessionRecord:
         _validate_session_scope(scope)
@@ -260,7 +287,9 @@ class SessionManager:
                 session_id=replacement_session_id,
             )
             connection.execute("DELETE FROM sessions WHERE session_id=?", (scope.session_id,))
-            return replacement
+        self.event_log.delete(scope)
+        self._record_session_started(replacement)
+        return replacement
 
     def start_turn(
         self,
@@ -285,21 +314,30 @@ class SessionManager:
             ).fetchone() is None
             connection.execute(
                 """
-                INSERT INTO turns(session_id,seq,status,user_text,created_at)
-                VALUES(?,?,'started',?,?)
+                INSERT INTO turns(session_id,seq,status,created_at)
+                VALUES(?,?,'started',?)
                 """,
-                (scope.session_id, seq, safe_user, now),
+                (scope.session_id, seq, now),
             )
             connection.execute(
                 "UPDATE sessions SET title=CASE WHEN ? THEN ? ELSE title END,updated_at=? WHERE session_id=?",
                 (first_conversation, _title_from_user_text(safe_user), now, scope.session_id),
             )
-            return _turn(
-                connection.execute(
-                    "SELECT * FROM turns WHERE session_id=? AND seq=?",
-                    (scope.session_id, seq),
-                ).fetchone()
-            )
+            row = connection.execute(
+                "SELECT * FROM turns WHERE session_id=? AND seq=?",
+                (scope.session_id, seq),
+            ).fetchone()
+        self.event_log.append(scope, "turn_started", turn_seq=seq)
+        self.event_log.append(
+            scope,
+            "user_message",
+            turn_seq=seq,
+            data={"content": safe_user},
+        )
+        return _turn(
+            row,
+            user_text=safe_user,
+        )
 
     def complete_turn(
         self,
@@ -321,9 +359,33 @@ class SessionManager:
         state = _validate_working_state(working_state)
         safe_assistant = self.store.text(_require_string(assistant_text, "assistant_text"), max_bytes=8 * 1024)
         safe_history = self.store.text(_require_string(history_text, "history_text"), max_bytes=2 * 1024)
-        safe_routes = self.store.json(routes, max_bytes=8 * 1024)
+        routes = json.loads(self.store.json(routes, max_bytes=8 * 1024))
         safe_manifests = self.store.json(manifests, max_bytes=16 * 1024)
         safe_state = self.store.json(state, max_bytes=32 * 1024)
+        projected_manifests = json.loads(safe_manifests)
+        self._require_started_turn(scope, seq)
+        self.event_log.append(
+            scope,
+            "assistant_message",
+            turn_seq=seq,
+            data={"content": safe_assistant},
+        )
+        if routes:
+            self.event_log.append(
+                scope,
+                "route_selected",
+                turn_seq=seq,
+                data={"routes": routes},
+            )
+        self.event_log.append(
+            scope,
+            "workflow_outcome",
+            turn_seq=seq,
+            data={
+                "summary": safe_history,
+                "entity_manifests": projected_manifests,
+            },
+        )
         with self.store.transaction() as connection:
             self._session_row_tx(connection, scope.account_key, scope.repository_key, scope.session_id)
             row = connection.execute(
@@ -335,21 +397,22 @@ class SessionManager:
             now = _utc_now()
             connection.execute(
                 """
-                UPDATE turns SET status='completed',assistant_text=?,history_text=?,route_summary=?,
-                    entity_manifests=?,completed_at=? WHERE session_id=? AND seq=?
+                UPDATE turns SET status='completed',completed_at=?
+                WHERE session_id=? AND seq=?
                 """,
-                (safe_assistant, safe_history, safe_routes, safe_manifests, now, scope.session_id, seq),
+                (now, scope.session_id, seq),
             )
             connection.execute(
                 "UPDATE sessions SET working_state=?,updated_at=? WHERE session_id=?",
                 (safe_state, now, scope.session_id),
             )
-            return _turn(
-                connection.execute(
-                    "SELECT * FROM turns WHERE session_id=? AND seq=?",
-                    (scope.session_id, seq),
-                ).fetchone()
-            )
+            row = connection.execute(
+                "SELECT * FROM turns WHERE session_id=? AND seq=?",
+                (scope.session_id, seq),
+            ).fetchone()
+        self.event_log.append(scope, "turn_completed", turn_seq=seq)
+        projection = _event_projection(self.event_log.iter_events(scope))
+        return _turn(row, **projection.get(seq, {}))
 
     def fail_turn(self, scope: SessionScope, seq: int, error: str) -> TurnRecord:
         _validate_session_scope(scope)
@@ -357,6 +420,7 @@ class SessionManager:
         raw_error = _require_string(error, "error", allow_empty=False)
         message = _bounded_characters(self.store.text(raw_error), 500)
         category = _error_category(message)
+        self._require_started_turn(scope, seq)
         with self.store.transaction() as connection:
             self._session_row_tx(connection, scope.account_key, scope.repository_key, scope.session_id)
             row = connection.execute(
@@ -366,33 +430,163 @@ class SessionManager:
             if row is None or row["status"] != "started":
                 raise StateError("Turn is missing or no longer in started state")
             now = _utc_now()
-            history = f"failed: {category}"
             connection.execute(
                 """
-                UPDATE turns SET status='failed',assistant_text=?,history_text=?,completed_at=?
+                UPDATE turns SET status='failed',completed_at=?
                 WHERE session_id=? AND seq=?
                 """,
-                (message, history, now, scope.session_id, seq),
+                (now, scope.session_id, seq),
             )
             connection.execute(
                 "UPDATE sessions SET updated_at=? WHERE session_id=?",
                 (now, scope.session_id),
             )
-            return _turn(
-                connection.execute(
-                    "SELECT * FROM turns WHERE session_id=? AND seq=?",
-                    (scope.session_id, seq),
-                ).fetchone()
-            )
+            row = connection.execute(
+                "SELECT * FROM turns WHERE session_id=? AND seq=?",
+                (scope.session_id, seq),
+            ).fetchone()
+        self.event_log.append(
+            scope,
+            "turn_failed",
+            turn_seq=seq,
+            data={"error_type": category, "message": message},
+        )
+        projection = _event_projection(self.event_log.iter_events(scope))
+        return _turn(row, **projection.get(seq, {}))
 
     def recover_interrupted(self) -> int:
+        connection = self.store.read()
+        try:
+            interrupted = connection.execute(
+                """
+                SELECT s.account_key,s.repository_key,t.session_id,t.seq
+                FROM turns AS t
+                JOIN sessions AS s ON s.session_id=t.session_id
+                WHERE t.status='started'
+                ORDER BY t.session_id,t.seq
+                """
+            ).fetchall()
+        finally:
+            connection.close()
         with self.store.transaction() as connection:
             now = _utc_now()
             cursor = connection.execute(
                 "UPDATE turns SET status='interrupted',completed_at=? WHERE status='started'",
                 (now,),
             )
-            return _require_non_negative_integer(cursor.rowcount, "interrupted Turn count")
+            count = _require_non_negative_integer(
+                cursor.rowcount, "interrupted Turn count"
+            )
+        for row in interrupted:
+            scope = SessionScope(
+                str(row["account_key"]),
+                str(row["repository_key"]),
+                str(row["session_id"]),
+            )
+            turn_seq = _require_positive_integer(row["seq"], "Turn sequence")
+            self.event_log.append(
+                scope,
+                "turn_failed",
+                turn_seq=turn_seq,
+                data={
+                    "error_type": "interrupted",
+                    "message": "Turn was interrupted before completion",
+                    "recovered": True,
+                },
+            )
+        return count
+
+    def recover_event_log(self) -> int:
+        """Repair terminal markers inferable from authoritative SQLite state."""
+
+        connection = self.store.read()
+        try:
+            sessions = connection.execute(
+                "SELECT * FROM sessions ORDER BY session_id"
+            ).fetchall()
+            turns = connection.execute(
+                "SELECT * FROM turns ORDER BY session_id,seq"
+            ).fetchall()
+        finally:
+            connection.close()
+        turns_by_session: dict[str, list[Any]] = {}
+        for row in turns:
+            turns_by_session.setdefault(str(row["session_id"]), []).append(row)
+
+        repaired = 0
+        for row in sessions:
+            session = _session(row)
+            scope = session.scope
+            events = tuple(self.event_log.iter_events(scope))
+            if not events:
+                self._record_session_started(session)
+                repaired += 1
+                events = tuple(self.event_log.iter_events(scope))
+            terminal = {
+                (event.turn_seq, event.type)
+                for event in events
+                if event.turn_seq is not None
+                and event.type in {"turn_completed", "turn_failed"}
+            }
+            for turn_row in turns_by_session.get(session.session_id, ()):
+                status = str(turn_row["status"])
+                seq = _require_positive_integer(turn_row["seq"], "Turn sequence")
+                event_type = "turn_completed" if status == "completed" else "turn_failed"
+                if status == "started" or (seq, event_type) in terminal:
+                    continue
+                data: dict[str, Any] = {"recovered": True}
+                if event_type == "turn_failed":
+                    data.update(
+                        {
+                            "error_type": status,
+                            "message": f"Turn state recovered as {status}",
+                        }
+                    )
+                self.event_log.append(
+                    scope,
+                    event_type,
+                    turn_seq=seq,
+                    data=data,
+                )
+                repaired += 1
+        return repaired
+
+    def scope_for_session(self, session_id: str) -> SessionScope | None:
+        _validate_session_id(session_id)
+        connection = self.store.read()
+        try:
+            row = connection.execute(
+                "SELECT account_key,repository_key FROM sessions WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return SessionScope(
+            str(row["account_key"]), str(row["repository_key"]), session_id
+        )
+
+    def collect_event_logs(
+        self, retention_days: int = 30, *, now: datetime | None = None
+    ) -> tuple[Path, ...]:
+        connection = self.store.read()
+        try:
+            scopes = tuple(
+                SessionScope(
+                    str(row["account_key"]),
+                    str(row["repository_key"]),
+                    str(row["session_id"]),
+                )
+                for row in connection.execute(
+                    "SELECT account_key,repository_key,session_id FROM sessions"
+                )
+            )
+        finally:
+            connection.close()
+        return self.event_log.collect_garbage(
+            scopes, retention_days=retention_days, now=now
+        )
 
     def list_turns(
         self,
@@ -402,7 +596,9 @@ class SessionManager:
         *,
         after_seq: int = 0,
     ) -> tuple[TurnRecord, ...]:
-        _validate_scope_keys(account_key, repository_key)
+        account_key, repository_key = _validate_scope_keys(
+            account_key, repository_key
+        )
         _validate_session_id(session_id)
         if not isinstance(after_seq, int) or isinstance(after_seq, bool) or after_seq < 0:
             raise ValidationError("after_seq must be a non-negative integer")
@@ -415,9 +611,11 @@ class SessionManager:
                 "SELECT * FROM turns WHERE session_id=? AND seq>? ORDER BY seq ASC",
                 (session_id, after_seq),
             ).fetchall()
-            return tuple(_turn(item) for item in rows)
         finally:
             connection.close()
+        scope = SessionScope(account_key, repository_key, session_id)
+        projection = _event_projection(self.event_log.iter_events(scope))
+        return tuple(_turn(item, **projection.get(int(item["seq"]), {})) for item in rows)
 
     def save_summary(
         self,
@@ -496,6 +694,34 @@ class SessionManager:
             ),
         )
         return _session(connection.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone())
+
+    def _record_session_started(self, session: SessionRecord) -> None:
+        self.event_log.append(
+            session.scope,
+            "session_started",
+            data={
+                "repository_full_name": session.repository_full_name,
+                "created_at": session.created_at,
+            },
+        )
+
+    def _require_started_turn(self, scope: SessionScope, seq: int) -> None:
+        connection = self.store.read()
+        try:
+            self._session_row_tx(
+                connection,
+                scope.account_key,
+                scope.repository_key,
+                scope.session_id,
+            )
+            row = connection.execute(
+                "SELECT status FROM turns WHERE session_id=? AND seq=?",
+                (scope.session_id, seq),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None or row["status"] != "started":
+            raise StateError("Turn is missing or no longer in started state")
 
     @staticmethod
     def _session_row_tx(
@@ -692,20 +918,30 @@ def _session(row: Any) -> SessionRecord:
     )
 
 
-def _turn(row: Any) -> TurnRecord:
+def _turn(
+    row: Any,
+    *,
+    user_text: str = "",
+    assistant_text: str = "",
+    history_text: str = "",
+    route_summary: Sequence[Mapping[str, Any]] = (),
+    entity_manifests: Sequence[Mapping[str, Any]] = (),
+) -> TurnRecord:
     try:
         session_id = _validate_session_id(row["session_id"])
         seq = _require_positive_integer(row["seq"], "Turn sequence")
         status = _require_string(row["status"], "Turn status", allow_empty=False)
         if status not in {"started", "completed", "failed", "interrupted"}:
             raise ValidationError("stored Turn status is invalid")
-        user_text = _bounded_stored_text(row["user_text"], "user_text", 8 * 1024)
-        assistant_text = _bounded_stored_text(row["assistant_text"], "assistant_text", 8 * 1024)
-        history_text = _bounded_stored_text(row["history_text"], "history_text", 2 * 1024)
-        route_text = _bounded_stored_text(row["route_summary"], "route_summary", 8 * 1024)
-        manifest_text = _bounded_stored_text(row["entity_manifests"], "entity_manifests", 16 * 1024)
-        route_summary = _validate_route_summary(json.loads(route_text))
-        entity_manifests = _validate_manifests(json.loads(manifest_text), allow_empty=True)
+        user_text = _bounded_stored_text(user_text, "user_text", 32 * 1024)
+        assistant_text = _bounded_stored_text(
+            assistant_text, "assistant_text", 32 * 1024
+        )
+        history_text = _bounded_stored_text(history_text, "history_text", 2 * 1024)
+        route_summary = _validate_route_summary(route_summary)
+        entity_manifests = _validate_manifests(
+            entity_manifests, allow_empty=True
+        )
         if any(manifest["turn_seq"] != seq for manifest in entity_manifests):
             raise ValidationError("stored entity manifest belongs to another Turn")
         created_at = _require_utc_timestamp(row["created_at"], "created_at")
@@ -728,6 +964,52 @@ def _turn(row: Any) -> TurnRecord:
         created_at=created_at,
         completed_at=completed_at,
     )
+
+
+def _event_projection(events: Any) -> dict[int, dict[str, Any]]:
+    projected: dict[int, dict[str, Any]] = {}
+    for event in events:
+        if event.turn_seq is None:
+            continue
+        turn = projected.setdefault(
+            event.turn_seq,
+            {
+                "user_text": "",
+                "assistant_text": "",
+                "history_text": "",
+                "route_summary": [],
+                "entity_manifests": [],
+            },
+        )
+        if event.type == "user_message":
+            content = event.data.get("content", "")
+            if isinstance(content, str):
+                turn["user_text"] = content
+        elif event.type == "assistant_message":
+            content = event.data.get("content", "")
+            if isinstance(content, str):
+                turn["assistant_text"] = content
+        elif event.type == "route_selected":
+            routes = event.data.get("routes", [])
+            if isinstance(routes, list):
+                turn["route_summary"] = routes
+        elif event.type == "workflow_outcome":
+            if "summary" in event.data:
+                summary = event.data["summary"]
+                if isinstance(summary, str):
+                    turn["history_text"] = summary
+            if "entity_manifests" in event.data:
+                manifests = event.data["entity_manifests"]
+                if isinstance(manifests, list):
+                    turn["entity_manifests"] = manifests
+        elif event.type == "turn_failed":
+            message = event.data.get("message", "")
+            error_type = event.data.get("error_type", "error")
+            if isinstance(message, str) and message:
+                turn["assistant_text"] = message
+            if isinstance(error_type, str):
+                turn["history_text"] = f"failed: {_error_category(error_type)}"
+    return projected
 
 
 def _validate_scope_keys(account_key: Any, repository_key: Any) -> tuple[str, str]:

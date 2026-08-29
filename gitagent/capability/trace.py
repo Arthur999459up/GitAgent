@@ -73,7 +73,12 @@ class CapabilityTrace:
                     category=TraceCategory.CAPABILITY,
                     name=capability_id,
                     status=status,
-                    details={"run_id": run_id, "call_id": call_id, "event": event, **(details or {})},
+                    details={
+                        "run_id": run_id,
+                        "call_id": call_id,
+                        "event": event,
+                        **(details or {}),
+                    },
                 )
             except Exception:  # noqa: BLE001, S110 - observability cannot affect invocation
                 pass

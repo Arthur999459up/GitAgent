@@ -14,7 +14,7 @@ from typing import Any
 
 from gitagent.domain.errors import StateError, ValidationError
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 REDACTED = "[REDACTED]"
 
 _SECRET_PATTERNS = (
@@ -63,11 +63,6 @@ _TABLE_DEFINITIONS = {
             session_id TEXT NOT NULL,
             seq INTEGER NOT NULL CHECK(seq >= 1),
             status TEXT NOT NULL CHECK(status IN ('started','completed','failed','interrupted')),
-            user_text TEXT NOT NULL,
-            assistant_text TEXT NOT NULL DEFAULT '',
-            history_text TEXT NOT NULL DEFAULT '',
-            route_summary TEXT NOT NULL DEFAULT '[]',
-            entity_manifests TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL,
             completed_at TEXT,
             PRIMARY KEY(session_id, seq),

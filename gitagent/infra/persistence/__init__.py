@@ -1,5 +1,11 @@
 """Local, scoped transactional Session persistence."""
 
+from .event_log import (
+    DEFAULT_MAX_EVENT_BYTES,
+    EVENT_SCHEMA_VERSION,
+    SessionEventLog,
+    SessionEventRecorder,
+)
 from .sessions import (
     OPEN_QUESTION_CHARACTER_LIMIT,
     SessionManager,
@@ -14,9 +20,13 @@ from .sessions import (
 from .store import REDACTED, SCHEMA_VERSION, StateStore, truncate_utf8
 
 __all__ = [
+    "DEFAULT_MAX_EVENT_BYTES",
+    "EVENT_SCHEMA_VERSION",
     "OPEN_QUESTION_CHARACTER_LIMIT",
     "REDACTED",
     "SCHEMA_VERSION",
+    "SessionEventLog",
+    "SessionEventRecorder",
     "SessionManager",
     "SessionRecord",
     "StateStore",

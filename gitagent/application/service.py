@@ -144,6 +144,10 @@ class GitAgentService:
         self.completed_learning_trace = None
         self.completed_learning_turn_seq = 0
         self._active_turn_seq = int(turn_seq or 0)
+        if self._active_turn_seq > 0:
+            self.harness.trace.bind_turn(
+                self._scope().session_id, self._active_turn_seq
+            )
 
         current = self._load_context(routing_context)
         if current is not None:

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import asdict
 from time import perf_counter
 from typing import Any, TypeVar
 
 from gitagent.capability import CapabilityLayer, CapabilityResult, InvocationContext
 from gitagent.domain.errors import ValidationError
-from gitagent.domain.models import AgentGuidance, AgentSpec
+from gitagent.domain.models import AgentGuidance, AgentSpec, VerificationReport
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.validation.output import validate_agent_output
 from gitagent.infra.observability import AuditLog, TraceBus, TraceCategory, TraceStatus
@@ -116,6 +117,18 @@ class AgentHarness:
             details={"output_type": type(result).__name__},
             duration_ms=(perf_counter() - started) * 1000,
         )
+        if isinstance(result, VerificationReport):
+            self.trace.emit(
+                session_id=session_id,
+                category=TraceCategory.WORKFLOW,
+                name="verification",
+                status=TraceStatus.COMPLETED,
+                details={
+                    "agent": agent_name,
+                    "result": asdict(result),
+                    "status": "passed" if result.passed else "failed",
+                },
+            )
         return result
 
     def invoke(

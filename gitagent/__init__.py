@@ -32,6 +32,7 @@ from gitagent.domain.models import (
     Replacement,
     Route,
     RoutingContext,
+    SessionEvent,
     WorkflowTurnDecision,
 )
 from gitagent.harness import AgentHarness
@@ -92,6 +93,7 @@ __all__ = [
     "Replacement",
     "Route",
     "RoutingContext",
+    "SessionEvent",
     "TraceBus",
     "TraceCategory",
     "TraceEvent",

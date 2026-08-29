@@ -39,6 +39,20 @@ class SessionScope:
 
 
 @dataclass(frozen=True)
+class SessionEvent:
+    """One observable, durable event in a Session event stream."""
+
+    version: int
+    seq: int
+    type: str
+    time: str
+    session_id: str
+    turn_seq: int | None
+    agent: str | None
+    data: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ResolvedReference:
     """A repository entity resolved from the user's request and Session context."""
 
