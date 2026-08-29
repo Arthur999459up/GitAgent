@@ -8,23 +8,26 @@ from .budget import (
     estimate_tokens,
 )
 from .builder import (
+    CompactResult,
     ContextBudgetExceeded,
     ContextBuilder,
     ContextBuildError,
+    MessageCompactionPlan,
+    fit_messages,
+    fit_messages_with_plan,
 )
 from .capability_history import (
     capability_attempted,
     capability_failure_observed,
     find_capability_observation,
 )
-from .compact import (
-    CompactResult,
-    DeterministicCompactor,
-    merge_summary_records,
-    render_summary_record,
+from .messages import (
+    assistant_tool_call,
+    canonical_message,
+    request_tokens,
+    tool_result_message,
 )
-from .observations import render_agent_observations
-from .rendering import render_context_observations
+from .projector import derive_domain_messages, derive_main_messages
 
 __all__ = [
     "EMERGENCY_THRESHOLD",
@@ -34,14 +37,18 @@ __all__ = [
     "ContextBudgetExceeded",
     "ContextBuildError",
     "ContextBuilder",
-    "DeterministicCompactor",
+    "MessageCompactionPlan",
+    "assistant_tool_call",
+    "canonical_message",
     "capability_attempted",
     "capability_failure_observed",
     "context_pressure",
+    "derive_domain_messages",
+    "derive_main_messages",
     "estimate_tokens",
     "find_capability_observation",
-    "merge_summary_records",
-    "render_agent_observations",
-    "render_context_observations",
-    "render_summary_record",
+    "fit_messages",
+    "fit_messages_with_plan",
+    "request_tokens",
+    "tool_result_message",
 ]

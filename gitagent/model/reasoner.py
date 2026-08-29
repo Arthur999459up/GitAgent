@@ -13,57 +13,33 @@ from .chat_client import ChatClient, ChatResponse
 
 _PROMPTS = get_prompt_library()
 
-# The instruction files contain the sentence without a leading newline; the
-# ``\n`` separator stays in ``structured_message_contents`` so the combined
-# system content remains byte-identical to the pre-externalization layout.
-STRUCTURED_OUTPUT_INSTRUCTION = _PROMPTS.text("reasoning.structured_output_instruction")
-STRUCTURED_CALL_INSTRUCTION = _PROMPTS.text("reasoning.structured_call_instruction")
 _TOOL_DESCRIPTION = _PROMPTS.text("reasoning.tool_description")
 
 
-def structured_message_contents(
-    system: str, prompt: str, *, schema: dict[str, Any] | None = None
-) -> tuple[str, str]:
-    """Return the exact text contents sent for one structured model call."""
+class StructuredValue(dict[str, Any]):
+    """Structured value with the provider's canonical assistant message."""
 
-    instruction = STRUCTURED_CALL_INSTRUCTION if schema is not None else STRUCTURED_OUTPUT_INSTRUCTION
-    return system + "\n" + instruction, prompt
-
-
-def structured_request_payload(
-    system: str,
-    prompt: str,
-    *,
-    schema: dict[str, Any] | None = None,
-    tool_name: str = "respond",
-    tools: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Build the exact messages and tool definitions used for a structured call."""
-
-    system_content, user_content = structured_message_contents(system, prompt, schema=schema)
-    available_tools = [*_structured_tools(tool_name, schema), *(tools or [])] if schema is not None else tools
-    return {
-        "messages": [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
-        ],
-        "tools": available_tools or None,
-    }
+    def __init__(self, value: dict[str, Any], message: dict[str, Any]) -> None:
+        super().__init__(value)
+        self.assistant_message = message
 
 
 class Reasoner(Protocol):
-    def complete_structured(
+    def complete_structured_messages(
         self,
         *,
-        system: str,
-        prompt: str,
+        messages: list[dict[str, Any]],
         schema: dict[str, Any] | None = None,
         tool_name: str = "respond",
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]: ...
 
-    def complete_text(self, *, system: str, prompt: str) -> str: ...
-
+    def complete_text_messages(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str: ...
 
 class LLMReasoner:
     """Use structured function calls for control contracts and plain text for content."""
@@ -71,25 +47,21 @@ class LLMReasoner:
     def __init__(self, client: ChatClient) -> None:
         self.client = client
 
-    def complete_structured(
+    def complete_structured_messages(
         self,
         *,
-        system: str,
-        prompt: str,
+        messages: list[dict[str, Any]],
         schema: dict[str, Any] | None = None,
         tool_name: str = "respond",
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        request = structured_request_payload(
-            system,
-            prompt,
-            schema=schema,
-            tool_name=tool_name,
-            tools=tools,
-        )
+        available_tools = structured_tools(tool_name, schema, tools)
         response: ChatResponse | None = None
         try:
-            response = self.client.chat(messages=request["messages"], tools=request["tools"])
+            response = self.client.chat(
+                messages=messages,
+                tools=available_tools or None,
+            )
             return self._structured_value(
                 response,
                 schema=schema,
@@ -99,24 +71,32 @@ class LLMReasoner:
         except StructuredOutputError as first_error:
             if schema is None:
                 raise
-            retry_messages = [*request["messages"]]
-            if response is not None:
-                retry_messages.append(
-                    {"role": "assistant", "content": _response_text_for_retry(response)}
+            # An invalid tool-call message cannot be followed by a user correction
+            # until every call has a matching tool result. Keep rejected tool calls
+            # out of the canonical thread and retry from the last valid message.
+            if response is not None and not response.tool_calls:
+                messages.append(response.message)
+            if tools:
+                correction = (
+                    "The previous response could not be parsed or did not satisfy the required "
+                    f"structured-output contract ({first_error}). Correct only the output format now: "
+                    "call exactly one available tool. For a capability action, call that capability tool "
+                    f"directly; otherwise call {tool_name} exactly once with all required arguments. "
+                    "Do not explain the correction or use Markdown."
                 )
-            retry_messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "The previous response could not be parsed or did not satisfy the required "
-                        f"structured-output contract ({first_error}). Correct only the output format now: "
-                        f"call {tool_name} exactly once with all required arguments. Do not explain the "
-                        "correction or use Markdown."
-                    ),
-                }
-            )
+            else:
+                correction = (
+                    "The previous response could not be parsed or did not satisfy the required "
+                    f"structured-output contract ({first_error}). Correct only the output format now: "
+                    f"call {tool_name} exactly once with all required arguments. Do not explain the "
+                    "correction or use Markdown."
+                )
+            messages.append({"role": "user", "content": correction})
             try:
-                retry = self.client.chat(messages=retry_messages, tools=request["tools"])
+                retry = self.client.chat(
+                    messages=messages,
+                    tools=available_tools or None,
+                )
                 return self._structured_value(
                     retry,
                     schema=schema,
@@ -136,28 +116,35 @@ class LLMReasoner:
         tool_name: str,
         domain_tools_available: bool,
     ) -> dict[str, Any]:
+        if len(response.tool_calls) > 1:
+            raise StructuredOutputError(
+                "model must call at most one tool per agent step"
+            )
         if response.tool_calls:
             call = response.tool_calls[0]
             arguments = call.arguments
             if isinstance(arguments, dict):
                 if call.name == tool_name:
                     self._validate_structured(arguments, schema)
-                    return arguments
+                    return StructuredValue(arguments, response.message)
                 if not domain_tools_available:
                     raise StructuredOutputError(
                         f"model called {call.name or '<unnamed>'} instead of required function {tool_name}"
                     )
-                return {
-                    "kind": "capability",
-                    "summary": f"Call {call.name}",
-                    "capability_id": call.name,
-                    "arguments": arguments,
-                }
+                return StructuredValue(
+                    {
+                        "kind": "capability",
+                        "summary": f"Call {call.name}",
+                        "capability_id": call.name,
+                        "arguments": arguments,
+                    },
+                    response.message,
+                )
         value = _first_json_object(response.content)
         if not isinstance(value, dict):
             raise StructuredOutputError("structured reasoning output must be a JSON object")
         self._validate_structured(value, schema)
-        return value
+        return StructuredValue(value, response.message)
 
     @staticmethod
     def _validate_structured(value: dict[str, Any], schema: dict[str, Any] | None) -> None:
@@ -168,16 +155,14 @@ class LLMReasoner:
         except ValidationError as exc:
             raise StructuredOutputError(str(exc)) from exc
 
-    def complete_text(self, *, system: str, prompt: str) -> str:
-        response = self.client.chat(
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-            tools=None,
-        )
+    def complete_text_messages(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str:
+        response = self.client.chat(messages=messages, tools=tools)
         return response.content.strip()
-
 
 def _first_json_object(content: str) -> Any:
     decoder = json.JSONDecoder()
@@ -190,20 +175,6 @@ def _first_json_object(content: str) -> Any:
             continue
         return value
     raise StructuredOutputError("model did not return a valid JSON object")
-
-
-def _response_text_for_retry(response: ChatResponse) -> str:
-    if response.content.strip():
-        return response.content[-20_000:]
-    if response.tool_calls:
-        return json.dumps(
-            [
-                {"name": call.name, "arguments": call.arguments}
-                for call in response.tool_calls
-            ],
-            ensure_ascii=False,
-        )[-20_000:]
-    return "(empty response)"
 
 
 def _structured_tools(tool_name: str, schema: dict[str, Any]) -> list[dict[str, Any]]:
@@ -219,3 +190,21 @@ def _structured_tools(tool_name: str, schema: dict[str, Any]) -> list[dict[str, 
             },
         }
     ]
+
+
+def structured_tools(
+    tool_name: str,
+    schema: dict[str, Any] | None,
+    tools: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Return one deduplicated provider tool list for token accounting and calls."""
+
+    result = list(tools or ())
+    if schema is not None and not any(
+        tool.get("type") == "function"
+        and isinstance(tool.get("function"), dict)
+        and tool["function"].get("name") == tool_name
+        for tool in result
+    ):
+        result = [*_structured_tools(tool_name, schema), *result]
+    return result or None

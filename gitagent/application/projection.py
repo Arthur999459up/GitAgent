@@ -32,8 +32,8 @@ def visible_items(items: list[T]) -> tuple[tuple[T, ...], bool]:
 @dataclass(frozen=True)
 class TurnProjection:
     assistant_text: str
-    history_text: str
-    route_summary: list[dict[str, Any]]
+    workflow_summary: str
+    route: dict[str, Any] | None
     entity_manifests: list[dict[str, Any]]
     focus: dict[str, str] | None
     open_question: str | None = None
@@ -47,44 +47,124 @@ def project_service_result(
     text_sanitizer: TextSanitizer | None = None,
 ) -> TurnProjection:
     assistant, manifests, focus = project_output(
-        result.output,
+        result.domain_output if result.domain_output is not None else result.output,
         turn_seq=turn_seq,
         text_sanitizer=text_sanitizer,
     )
+    final_assistant = (
+        _sanitized(result.output, text_sanitizer)
+        if isinstance(result.output, str)
+        else assistant
+    )
     if result.decision.clarify:
-        return TurnProjection(assistant, "", [], manifests, focus, open_question=assistant)
+        return TurnProjection(
+            final_assistant,
+            assistant,
+            None,
+            manifests,
+            focus,
+            open_question=assistant,
+        )
     if result.agent is None:
-        return TurnProjection(assistant, "", [], manifests, focus)
+        return TurnProjection(final_assistant, assistant, None, manifests, focus)
 
     resolved = []
     if result.entity_id is not None and result.entity_type in {"issue", "pull_request", "workflow_run"}:
         resolved = [{"type": result.entity_type, "id": result.entity_id}]
-    workflow_status = _workflow_status(result.output)
-    route_summary = [
-        {
-            "route": _bounded(result.agent, 80, text_sanitizer),
-            "session_goal": _bounded(result.goal, 1000, text_sanitizer),
-            "resolved_references": resolved,
-            "workflow_type": _bounded(result.agent, 80, text_sanitizer),
-            "workflow_status": workflow_status,
-        }
-    ]
+    workflow_status = _workflow_status(result.domain_output)
+    route = {
+        "route": _bounded(result.agent, 80, text_sanitizer),
+        "goal": _bounded(result.goal, 1000, text_sanitizer),
+        "resolved_references": resolved,
+        "status": workflow_status,
+    }
     if focus is None and result.entity_id is not None and result.entity_type in {"issue", "pull_request"}:
         focus = {
             "type": result.entity_type,
             "id": result.entity_id,
             "short_label": _reference_label(result.entity_type, result.entity_id),
         }
-    history = f"{result.agent} | goal={_bounded(result.goal, 1000, text_sanitizer)} | {workflow_status}"
+    summary = result.workflow_summary or domain_summary(
+        agent=result.agent,
+        goal=result.goal,
+        output=result.domain_output,
+        entity_type=result.entity_type,
+        entity_id=result.entity_id,
+    )
     return TurnProjection(
-        assistant_text=assistant,
-        history_text=_bounded(history, 2 * 1024, text_sanitizer),
-        route_summary=route_summary,
+        assistant_text=final_assistant,
+        workflow_summary=_bounded(summary, 8 * 1024, text_sanitizer),
+        route=route,
         entity_manifests=manifests,
         focus=focus,
-        open_question=result.output.question if isinstance(result.output, AgentContext) and result.output.question else None,
+        open_question=(
+            result.domain_output.question
+            if isinstance(result.domain_output, AgentContext) and result.domain_output.question
+            else None
+        ),
         goals=(result.goal,) if result.goal else (),
     )
+
+
+def domain_summary(
+    *,
+    agent: str,
+    goal: str,
+    output: Any,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    context: AgentContext | None = None,
+) -> str:
+    """Build the bounded semantic bridge from a Domain run to Main."""
+
+    status = _workflow_status(output)
+    try:
+        result_text, _, _ = project_output(output)
+    except ValidationError:
+        result_text = str(output or "")
+    references: list[str] = []
+    if entity_type and entity_id:
+        references.append(f"{entity_type}:{entity_id}")
+    if isinstance(output, RepositoryResult):
+        references.extend(f"file:{path}" for path in output.files[:20])
+    elif isinstance(output, IssueAgentResult):
+        references.extend(f"issue:{item.number}" for item in output.issues[:20])
+    elif isinstance(output, PullRequestAgentResult):
+        references.extend(f"pull_request:{item.number}" for item in output.pull_requests[:20])
+        references.extend(f"file:{path}" for path in output.changed_files[:20])
+
+    runtime = context or (output if isinstance(output, AgentContext) else None)
+    mutation_observation = (
+        _last_write_like_observation(runtime) if runtime is not None else None
+    )
+    mutation_executed = mutation_observation is not None
+    mutation = (
+        mutation_observation.get("data")
+        if isinstance(mutation_observation, dict)
+        else None
+    )
+    if isinstance(output, PullRequestAgentResult) and output.execution_result is not None:
+        mutation_executed = True
+        mutation = output.execution_result
+    pending = runtime.pending.summary if runtime is not None and runtime.pending is not None else ""
+    question = runtime.question if runtime is not None else ""
+    failure = runtime.error if runtime is not None else ""
+    if isinstance(output, MutationRejectedResult):
+        failure = output.reason
+    incomplete = question or pending
+    payload = {
+        "task": _bounded(goal, 1000),
+        "agent": agent,
+        "status": status,
+        "result": _bounded(result_text, 6000),
+        "mutation_executed": mutation_executed,
+        "mutation_result": mutation,
+        "key_references": list(dict.fromkeys(references)),
+        "unfinished_or_next": _bounded(incomplete, 2000),
+        "pending_confirmation": _bounded(pending or question, 2000),
+        "failure_reason": _bounded(failure, 2000),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def project_output(
@@ -186,7 +266,10 @@ def _project_context(
         parts.append("待人工批准后执行。")
     mutation = _last_write_like_observation(context)
     if mutation is not None:
-        parts.append("执行结果：" + json.dumps(mutation, ensure_ascii=False, sort_keys=True))
+        parts.append(
+            "执行结果："
+            + json.dumps(mutation.get("data"), ensure_ascii=False, sort_keys=True)
+        )
     if context.result is not None:
         nested = project_output(context.result, turn_seq=turn_seq, text_sanitizer=text_sanitizer)
         parts.append(nested[0])
@@ -220,7 +303,7 @@ def _last_write_like_observation(context: AgentContext) -> Any | None:
             "github.get_workflow_runs",
             "github.get_job_logs",
         }:
-            return payload.get("data")
+            return payload
     return None
 
 

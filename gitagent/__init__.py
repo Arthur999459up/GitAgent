@@ -31,7 +31,6 @@ from gitagent.domain.models import (
     PullRequestSummary,
     Replacement,
     Route,
-    RoutingContext,
     SessionEvent,
     WorkflowTurnDecision,
 )
@@ -92,7 +91,6 @@ __all__ = [
     "PullRequestSummary",
     "Replacement",
     "Route",
-    "RoutingContext",
     "SessionEvent",
     "TraceBus",
     "TraceCategory",

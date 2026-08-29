@@ -141,21 +141,29 @@ class LiveApplication:
         dispatch_started = False
         rendered = False
         try:
-            routing_context = self.context_builder.build(
+            memory_index = self.memory.read_index(scope.account_key, scope.repository_key)
+            main_tools = self.service.main_agent.provider_tools(
+                session_id=scope.session_id,
+                repository=repository,
+                goal=text,
+            )
+            main_messages, main_tools = self.context_builder.build(
                 scope,
                 repository,
                 text,
-                prompt_renderer=lambda context: (
-                    self.service.main_agent.render_input_context(
-                        text, repository, context
-                    )
+                system=self.service.main_agent.current_system(
+                    repository=repository,
+                    memory_index=memory_index,
                 ),
+                tools=main_tools,
+                turn_seq=turn.seq,
             )
             try:
                 result = self.service.handle(
                     text,
                     repository=repository,
-                    routing_context=routing_context,
+                    main_messages=main_messages,
+                    main_tools=main_tools,
                     session_scope=scope,
                     turn_seq=turn.seq,
                 )
@@ -177,8 +185,8 @@ class LiveApplication:
                 scope,
                 turn.seq,
                 assistant_text=projection.assistant_text,
-                history_text=projection.history_text,
-                route_summary=projection.route_summary,
+                workflow_summary=projection.workflow_summary,
+                route=projection.route,
                 entity_manifests=projection.entity_manifests,
                 working_state=next_state,
             )

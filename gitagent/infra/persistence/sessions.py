@@ -52,8 +52,6 @@ class TurnRecord:
     status: str
     user_text: str
     assistant_text: str
-    history_text: str
-    route_summary: list[dict[str, Any]]
     entity_manifests: list[dict[str, Any]]
     created_at: str
     completed_at: str | None
@@ -103,12 +101,9 @@ class SessionManager:
         self,
         store: StateStore,
         event_log: SessionEventLog,
-        *,
-        token_counter: Any = None,
     ) -> None:
         self.store = store
         self.event_log = event_log
-        self.token_counter = token_counter or estimate_tokens
         self.recover_event_log()
         self.recover_interrupted()
 
@@ -171,6 +166,10 @@ class SessionManager:
     def save_agent_context(self, scope: SessionScope, value: Mapping[str, Any] | None) -> SessionRecord:
         _validate_session_scope(scope)
         context = {} if value is None else dict(value)
+        if "messages" in context:
+            raise ValidationError(
+                "agent_context stores runtime state only; model messages belong in the Session event log"
+            )
         encoded = self.store.json(context, max_bytes=512 * 1024)
         with self.store.transaction() as connection:
             self._session_row_tx(connection, scope.account_key, scope.repository_key, scope.session_id)
@@ -297,7 +296,7 @@ class SessionManager:
         user_text: str,
     ) -> TurnRecord:
         _validate_session_scope(scope)
-        safe_user = self.store.text(_require_string(user_text, "user_text", allow_empty=False), max_bytes=8 * 1024)
+        safe_user = self.store.text(_require_string(user_text, "user_text", allow_empty=False))
         with self.store.transaction() as connection:
             self._session_row_tx(connection, scope.account_key, scope.repository_key, scope.session_id)
             seq = _require_positive_integer(
@@ -345,21 +344,26 @@ class SessionManager:
         seq: int,
         *,
         assistant_text: str,
-        history_text: str,
-        route_summary: Sequence[Mapping[str, Any]],
+        workflow_summary: str,
+        route: Mapping[str, Any] | None,
         entity_manifests: Sequence[Mapping[str, Any]],
         working_state: Mapping[str, Any],
     ) -> TurnRecord:
         _validate_session_scope(scope)
         _require_positive_integer(seq, "Turn sequence")
-        routes = _validate_route_summary(route_summary)
         manifests = _validate_manifests(entity_manifests, allow_empty=True)
         if any(manifest["turn_seq"] != seq for manifest in manifests):
             raise ValidationError("entity manifest turn_seq must match the completed Turn")
         state = _validate_working_state(working_state)
-        safe_assistant = self.store.text(_require_string(assistant_text, "assistant_text"), max_bytes=8 * 1024)
-        safe_history = self.store.text(_require_string(history_text, "history_text"), max_bytes=2 * 1024)
-        routes = json.loads(self.store.json(routes, max_bytes=8 * 1024))
+        safe_assistant = self.store.text(_require_string(assistant_text, "assistant_text"))
+        safe_summary = self.store.text(
+            _require_string(workflow_summary, "workflow_summary"), max_bytes=8 * 1024
+        )
+        safe_route = (
+            json.loads(self.store.json(dict(route), max_bytes=8 * 1024))
+            if route is not None
+            else None
+        )
         safe_manifests = self.store.json(manifests, max_bytes=16 * 1024)
         safe_state = self.store.json(state, max_bytes=32 * 1024)
         projected_manifests = json.loads(safe_manifests)
@@ -370,19 +374,19 @@ class SessionManager:
             turn_seq=seq,
             data={"content": safe_assistant},
         )
-        if routes:
+        if safe_route is not None:
             self.event_log.append(
                 scope,
                 "route_selected",
                 turn_seq=seq,
-                data={"routes": routes},
+                data={"route": safe_route},
             )
         self.event_log.append(
             scope,
             "workflow_outcome",
             turn_seq=seq,
             data={
-                "summary": safe_history,
+                "summary": safe_summary,
                 "entity_manifests": projected_manifests,
             },
         )
@@ -413,6 +417,95 @@ class SessionManager:
         self.event_log.append(scope, "turn_completed", turn_seq=seq)
         projection = _event_projection(self.event_log.iter_events(scope))
         return _turn(row, **projection.get(seq, {}))
+
+    def record_model_message(
+        self,
+        scope: SessionScope,
+        message: Mapping[str, Any],
+        *,
+        turn_seq: int,
+        agent: str,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist the same bounded canonical message appended to a live thread."""
+
+        from gitagent.harness.context.messages import canonical_message
+
+        _validate_session_scope(scope)
+        _require_positive_integer(turn_seq, "Turn sequence")
+        safe = canonical_message(self.store.redact(canonical_message(message)))
+        data: dict[str, Any] = {"message": safe}
+        if run_id:
+            data["run_id"] = _require_string(run_id, "run_id", allow_empty=False)
+        self.event_log.append(
+            scope,
+            "model_message",
+            turn_seq=turn_seq,
+            agent=_require_string(agent, "agent", allow_empty=False),
+            data=data,
+        )
+        return safe
+
+    def record_message_compaction(
+        self,
+        scope: SessionScope,
+        *,
+        turn_seq: int,
+        agent: str,
+        checkpoint: str = "",
+        retain_message_indexes: Sequence[int] | None = None,
+        tool_replacements: Sequence[tuple[str, str]] = (),
+        run_id: str | None = None,
+    ) -> None:
+        """Persist the deterministic delta that produced a compacted provider thread."""
+
+        _validate_session_scope(scope)
+        _require_positive_integer(turn_seq, "Turn sequence")
+        safe_agent = _require_string(agent, "agent", allow_empty=False)
+        data: dict[str, Any] = {}
+        if checkpoint:
+            data["content"] = self.store.text(
+                _require_string(checkpoint, "checkpoint", allow_empty=False)
+            )
+        if retain_message_indexes is not None:
+            indexes = []
+            previous = -1
+            for index in retain_message_indexes:
+                if (
+                    not isinstance(index, int)
+                    or isinstance(index, bool)
+                    or index < 0
+                    or index <= previous
+                ):
+                    raise ValidationError(
+                        "retained message indexes must be unique ascending non-negative integers"
+                    )
+                indexes.append(index)
+                previous = index
+            data["retain_message_indexes"] = indexes
+        if tool_replacements:
+            replacements: list[dict[str, str]] = []
+            for call_id, content in tool_replacements:
+                replacements.append(
+                    {
+                        "tool_call_id": _require_string(
+                            call_id, "tool_call_id", allow_empty=False
+                        ),
+                        "content": self.store.text(str(content), max_bytes=4 * 1024),
+                    }
+                )
+            data["tool_replacements"] = replacements
+        if run_id:
+            data["run_id"] = _require_string(run_id, "run_id", allow_empty=False)
+        if not data or set(data) == {"run_id"}:
+            return
+        self.event_log.append(
+            scope,
+            "compaction_checkpoint",
+            turn_seq=turn_seq,
+            agent=safe_agent,
+            data=data,
+        )
 
     def fail_turn(self, scope: SessionScope, seq: int, error: str) -> TurnRecord:
         _validate_session_scope(scope)
@@ -617,44 +710,6 @@ class SessionManager:
         projection = _event_projection(self.event_log.iter_events(scope))
         return tuple(_turn(item, **projection.get(int(item["seq"]), {})) for item in rows)
 
-    def save_summary(
-        self,
-        account_key: str,
-        repository_key: str,
-        session_id: str,
-        summary: str,
-        through_seq: int,
-    ) -> SessionRecord:
-        _validate_scope_keys(account_key, repository_key)
-        _validate_session_id(session_id)
-        if not isinstance(through_seq, int) or isinstance(through_seq, bool) or through_seq < 0:
-            raise ValidationError("summary_through_seq must be a non-negative integer")
-        safe_summary = self.store.text(_require_string(summary, "summary"))
-        if self.token_counter(safe_summary) > 1500:
-            raise ValidationError("rolling summary exceeds 1500 estimated tokens")
-        with self.store.transaction() as connection:
-            row = self._session_row_tx(connection, account_key, repository_key, session_id)
-            current_through = _require_non_negative_integer(row["summary_through_seq"], "stored summary_through_seq")
-            boundary = _require_non_negative_integer(row["context_boundary_seq"], "stored context_boundary_seq")
-            if through_seq < current_through:
-                raise StateError("summary_through_seq cannot move backwards")
-            if through_seq < boundary:
-                raise StateError("summary_through_seq cannot precede the Context boundary")
-            max_seq = _require_non_negative_integer(
-                connection.execute(
-                    "SELECT COALESCE(MAX(seq),0) FROM turns WHERE session_id=?",
-                    (session_id,),
-                ).fetchone()[0],
-                "last Turn sequence",
-            )
-            if through_seq > max_seq:
-                raise StateError("summary_through_seq exceeds the last Turn")
-            connection.execute(
-                "UPDATE sessions SET summary=?,summary_through_seq=?,updated_at=? WHERE session_id=?",
-                (safe_summary, through_seq, _utc_now(), session_id),
-            )
-            return _session(self._session_row_tx(connection, account_key, repository_key, session_id))
-
     def _insert_session_tx(
         self,
         connection: Any,
@@ -739,42 +794,6 @@ class SessionManager:
         if row is None and required:
             raise StateError("Session not found")
         return row
-
-
-def _validate_route_summary(value: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) > 4:
-        raise ValidationError("route_summary must contain at most four entries")
-    keys = {"route", "session_goal", "resolved_references", "workflow_type", "workflow_status"}
-    result: list[dict[str, Any]] = []
-    for entry in value:
-        if not isinstance(entry, Mapping) or set(entry) != keys:
-            raise ValidationError("route_summary entry has an invalid shape")
-        references = entry["resolved_references"]
-        if not isinstance(references, Sequence) or isinstance(references, (str, bytes)) or len(references) > 8:
-            raise ValidationError("route_summary resolved_references is invalid")
-        normalized_references = []
-        for reference in references:
-            if not isinstance(reference, Mapping) or set(reference) != {"type", "id"}:
-                raise ValidationError("route_summary reference has an invalid shape")
-            normalized_references.append({
-                "type": _require_string(reference["type"], "reference type", allow_empty=False),
-                "id": _require_string(reference["id"], "reference id", allow_empty=False),
-            })
-        workflow_type = entry["workflow_type"]
-        workflow_status = entry["workflow_status"]
-        if (workflow_type is None) != (workflow_status is None):
-            raise ValidationError("workflow_type and workflow_status must both be strings or both be null")
-        if workflow_type is not None:
-            workflow_type = _require_string(workflow_type, "workflow_type", allow_empty=False)
-            workflow_status = _require_string(workflow_status, "workflow_status", allow_empty=False)
-        result.append({
-            "route": _require_string(entry["route"], "route", allow_empty=False),
-            "session_goal": _require_string(entry["session_goal"], "session_goal", maximum=1000),
-            "resolved_references": normalized_references,
-            "workflow_type": workflow_type,
-            "workflow_status": workflow_status,
-        })
-    return result
 
 
 def _validate_manifests(value: Sequence[Mapping[str, Any]], *, allow_empty: bool) -> list[dict[str, Any]]:
@@ -923,8 +942,6 @@ def _turn(
     *,
     user_text: str = "",
     assistant_text: str = "",
-    history_text: str = "",
-    route_summary: Sequence[Mapping[str, Any]] = (),
     entity_manifests: Sequence[Mapping[str, Any]] = (),
 ) -> TurnRecord:
     try:
@@ -937,8 +954,6 @@ def _turn(
         assistant_text = _bounded_stored_text(
             assistant_text, "assistant_text", 32 * 1024
         )
-        history_text = _bounded_stored_text(history_text, "history_text", 2 * 1024)
-        route_summary = _validate_route_summary(route_summary)
         entity_manifests = _validate_manifests(
             entity_manifests, allow_empty=True
         )
@@ -958,8 +973,6 @@ def _turn(
         status=status,
         user_text=user_text,
         assistant_text=assistant_text,
-        history_text=history_text,
-        route_summary=route_summary,
         entity_manifests=entity_manifests,
         created_at=created_at,
         completed_at=completed_at,
@@ -976,8 +989,6 @@ def _event_projection(events: Any) -> dict[int, dict[str, Any]]:
             {
                 "user_text": "",
                 "assistant_text": "",
-                "history_text": "",
-                "route_summary": [],
                 "entity_manifests": [],
             },
         )
@@ -989,26 +1000,15 @@ def _event_projection(events: Any) -> dict[int, dict[str, Any]]:
             content = event.data.get("content", "")
             if isinstance(content, str):
                 turn["assistant_text"] = content
-        elif event.type == "route_selected":
-            routes = event.data.get("routes", [])
-            if isinstance(routes, list):
-                turn["route_summary"] = routes
         elif event.type == "workflow_outcome":
-            if "summary" in event.data:
-                summary = event.data["summary"]
-                if isinstance(summary, str):
-                    turn["history_text"] = summary
             if "entity_manifests" in event.data:
                 manifests = event.data["entity_manifests"]
                 if isinstance(manifests, list):
                     turn["entity_manifests"] = manifests
         elif event.type == "turn_failed":
             message = event.data.get("message", "")
-            error_type = event.data.get("error_type", "error")
             if isinstance(message, str) and message:
                 turn["assistant_text"] = message
-            if isinstance(error_type, str):
-                turn["history_text"] = f"failed: {_error_category(error_type)}"
     return projected
 
 

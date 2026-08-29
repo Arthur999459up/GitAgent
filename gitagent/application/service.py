@@ -30,12 +30,18 @@ from gitagent.domain.models import (
     RepositoryOperation,
     RepositoryRef,
     ResolvedReference,
-    RoutingContext,
     SessionScope,
     VerificationCheck,
     VerificationReport,
     WorkflowTurnDecision,
     to_plain,
+)
+from gitagent.harness.context import (
+    MessageCompactionPlan,
+    assistant_tool_call,
+    canonical_message,
+    derive_domain_messages,
+    tool_result_message,
 )
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
@@ -59,6 +65,8 @@ class ServiceResult:
     entity_type: str | None = None
     entity_id: str | None = None
     learning_trace: LearningTrace | None = None
+    domain_output: Any = None
+    workflow_summary: str = ""
 
 
 class GitAgentService:
@@ -81,6 +89,8 @@ class GitAgentService:
         self.harness = AgentHarness(
             capabilities, trace=trace, context_budget=input_budget_tokens
         )
+        self.harness.message_sink = self._persist_domain_message
+        self.harness.compaction_sink = self._persist_domain_compaction
         self.coding = CodingAgent(self.harness, agent_reasoner)
         self.verifier = StaticVerifier(self.harness)
         self.repository_agent = RepositoryAgent(
@@ -96,7 +106,12 @@ class GitAgentService:
             self.harness, self.coding, self.verifier, agent_reasoner
         )
         self.loop = AgentLoop(self.harness)
-        self.main_agent = MainAgent(self.harness, main_reasoner)
+        self.main_agent = MainAgent(
+            self.harness,
+            main_reasoner,
+            message_sink=self._persist_main_message,
+            compaction_sink=self._persist_main_compaction,
+        )
         self.classifier = ApprovalIntentClassifier(main_reasoner)
         self.reasoner = agent_reasoner or main_reasoner
         self.session_manager = session_manager
@@ -127,19 +142,16 @@ class GitAgentService:
         user_input: str,
         *,
         repository: str,
-        routing_context: RoutingContext | None = None,
+        main_messages: list[dict[str, Any]],
+        main_tools: list[dict[str, Any]] | None = None,
         session_scope: SessionScope | None = None,
         turn_seq: int | None = None,
     ) -> ServiceResult:
         self._require_live()
         self._require_scope(session_scope)
         repository = self._repository(repository)
-        if routing_context is None:
-            raise RoutingError("GitAgentService requires Session routing context")
-        if routing_context.scope != self._scope():
-            raise RoutingError("routing context belongs to a different Session scope")
-        if routing_context.repository_full_name != repository:
-            raise RoutingError("routing context belongs to a different repository")
+        if not main_messages or main_messages[-1].get("role") != "user":
+            raise RoutingError("GitAgentService requires the current Main message thread")
         self.dispatch_started = False
         self.completed_learning_trace = None
         self.completed_learning_turn_seq = 0
@@ -149,28 +161,36 @@ class GitAgentService:
                 self._scope().session_id, self._active_turn_seq
             )
 
-        current = self._load_context(routing_context)
+        current = self._load_context()
         if current is not None:
+            self._ensure_domain_thread_durable(current)
             if (
                 current.reply_draft is not None
                 and current.pending is None
                 and not current.question
             ):
+                self._append_resume_delegation(main_messages, current)
                 self.dispatch_started = True
-                output = self._continue_draft(current, user_input)
-                return self._result_for_context(current, output)
+                domain_output = self._continue_draft(current, user_input)
+                return self._finish_domain_turn(
+                    main_messages, current, domain_output
+                )
             if current.pending is not None:
+                self._append_resume_delegation(main_messages, current)
                 self.dispatch_started = True
                 decision = self.classifier.classify(
                     user_input=user_input,
                     proposal_context=self._context_description(current),
                 )
-                output = self._continue_approval(current, decision, user_input)
-                return self._result_for_context(current, output)
+                domain_output = self._continue_approval(current, decision, user_input)
+                return self._finish_domain_turn(
+                    main_messages, current, domain_output
+                )
             if current.question and (
                 current.agent != "pull_requests"
                 or self.pull_request_agent.accept_question_reply(current, user_input)
             ):
+                self._append_resume_delegation(main_messages, current)
                 self.dispatch_started = True
                 self.loop.resume(
                     current,
@@ -179,28 +199,33 @@ class GitAgentService:
                         ApprovalIntent.APPROVE, instruction=user_input
                     ),
                 )
-                output = self._after_loop(current)
-                return self._result_for_context(current, output)
+                domain_output = self._after_loop(current)
+                return self._finish_domain_turn(
+                    main_messages, current, domain_output
+                )
             self._clear_context()
 
         decision = self.main_agent.decide(
-            user_input,
+            main_messages,
             repository=repository,
-            context=routing_context,
+            scope=self._scope(),
+            tools=main_tools,
         )
         if not decision.target_agent:
-            return ServiceResult(decision, decision.message or None)
+            self._append_main_message(
+                main_messages,
+                tool_result_message(
+                    self._main_tool_call_id(main_messages),
+                    {"direct_answer": decision.message, "clarify": decision.clarify},
+                ),
+            )
+            final = self.main_agent.finalize(main_messages)
+            return ServiceResult(decision, final)
 
         self.dispatch_started = True
-        output = self._start_child(decision, repository, routing_context)
-        return ServiceResult(
-            decision,
-            output,
-            agent=decision.target_agent,
-            goal=decision.request or user_input,
-            entity_type=decision.entity_type,
-            entity_id=decision.entity_id,
-            learning_trace=self.completed_learning_trace,
+        domain_output, context = self._start_child(decision, repository)
+        return self._finish_domain_turn(
+            main_messages, context, domain_output, decision=decision
         )
 
     def reflect_after_turn(
@@ -317,13 +342,10 @@ class GitAgentService:
         self,
         decision: MainDecision,
         repository: str,
-        routing_context: RoutingContext,
-    ) -> Any:
+    ) -> tuple[Any, AgentContext]:
         scope = self._scope()
         goal = decision.request.strip()
-        guidance = self._guidance(
-            decision.entity_type, decision.entity_id, routing_context
-        )
+        guidance = self._guidance(decision.entity_type, decision.entity_id)
         if decision.target_agent == "repository":
             operation = self.repository_agent.operation_for(goal)
             context = self.harness.context(
@@ -337,7 +359,7 @@ class GitAgentService:
             self.repository_agent.prepare(context, operation)
             self._start_learning_trace(context)
             self.loop.start(context, self.repository_agent)
-            return self._after_loop(context)
+            return self._after_loop(context), context
         context = self.harness.context(
             decision.target_agent,
             scope.session_id,
@@ -367,14 +389,14 @@ class GitAgentService:
                         "Issue 回复草稿",
                         draft,
                         "草稿尚未发布。你可以直接提出修改，或确认发布。",
-                    )
-                return self._after_loop(context)
+                    ), context
+                return self._after_loop(context), context
             self.loop.start(context, self.issue_agent)
-            return self._after_loop(context)
+            return self._after_loop(context), context
         if decision.target_agent == "pull_requests":
             self._start_learning_trace(context)
             self.loop.start(context, self.pull_request_agent)
-            return self._after_loop(context)
+            return self._after_loop(context), context
         raise RoutingError(f"unsupported domain agent: {decision.target_agent}")
 
     def _after_loop(self, context: AgentContext) -> Any:
@@ -490,31 +512,21 @@ class GitAgentService:
             )
 
         if context.agent == "repository" and decision.action == ApprovalIntent.REVISE:
-            self._observe_service_decision(context, decision, user_input)
-            self.harness.approvals.decide(context.pending.approval_id, "Reject")
             request = context.change_request
             if request is None:
                 raise RoutingError(
                     "repository modification revision has no change request"
                 )
             instruction = decision.instruction.strip() or user_input.strip()
-            revised = self.harness.context(
-                "repository",
-                context.session_id,
-                repository=context.repository,
-                goal=f"{request.description}\n\nUser revision: {instruction}",
-                entity_type="repository",
-                guidance=context.guidance,
-            )
-            revised.operation = RepositoryOperation.MODIFY.value
-            revised.change_request = ChangeRequest(
-                repository=request.repository,
-                description=f"{request.description}\n\nUser revision: {instruction}",
-            )
-            revised.origin_turn_seq = context.origin_turn_seq
-            revised.observations = list(context.observations)
-            self.loop.start(revised, self.repository_agent)
-            return self._after_loop(revised)
+            revised_description = f"{request.description}\n\nUser revision: {instruction}"
+            request.description = revised_description
+            context.goal = revised_description
+            context.code_candidate = None
+            context.verification = None
+            context.result = None
+            context.final_message = ""
+            self.loop.resume(context, self.repository_agent, decision)
+            return self._after_loop(context)
 
         if (
             context.agent == "pull_requests"
@@ -567,15 +579,23 @@ class GitAgentService:
         return context
 
     def _revise_text(self, artifact: str, current: str, instruction: str) -> str:
-        revised = self.reasoner.complete_text(
-            system=(
-                f"You revise a {artifact}. Follow the user's editing instruction exactly. "
-                "Return only the revised text. Do not claim it was posted and do not add meta commentary."
-            ),
-            prompt=json.dumps(
-                {"current_draft": current, "instruction": instruction},
-                ensure_ascii=False,
-            ),
+        revised = self.reasoner.complete_text_messages(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"You revise a {artifact}. Follow the user's editing instruction exactly. "
+                        "Return only the revised text. Do not claim it was posted and do not add meta commentary."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"current_draft": current, "instruction": instruction},
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
         ).strip()
         if not revised:
             raise RoutingError(f"{artifact} revision returned empty text")
@@ -595,6 +615,151 @@ class GitAgentService:
             entity_type=context.entity_type,
             entity_id=context.entity_id,
             learning_trace=self.completed_learning_trace,
+            domain_output=output,
+        )
+
+    def _finish_domain_turn(
+        self,
+        main_messages: list[dict[str, Any]],
+        context: AgentContext,
+        domain_output: Any,
+        *,
+        decision: MainDecision | None = None,
+    ) -> ServiceResult:
+        from .projection import domain_summary
+
+        effective_decision = decision or MainDecision(
+            target_agent=context.agent,
+            entity_type=context.entity_type,
+            entity_id=context.entity_id,
+            request=context.goal,
+        )
+        summary = domain_summary(
+            agent=context.agent,
+            goal=context.goal,
+            output=domain_output,
+            entity_type=context.entity_type,
+            entity_id=context.entity_id,
+            context=context,
+        )
+        self._append_main_message(
+            main_messages,
+            tool_result_message(self._main_tool_call_id(main_messages), summary),
+        )
+        final = self.main_agent.finalize(main_messages)
+        return ServiceResult(
+            effective_decision,
+            final,
+            agent=context.agent,
+            goal=context.goal,
+            entity_type=context.entity_type,
+            entity_id=context.entity_id,
+            learning_trace=self.completed_learning_trace,
+            domain_output=domain_output,
+            workflow_summary=summary,
+        )
+
+    def _append_resume_delegation(
+        self, main_messages: list[dict[str, Any]], context: AgentContext
+    ) -> None:
+        self._append_main_message(
+            main_messages,
+            assistant_tool_call(
+                f"call-resume-{context.run_id}",
+                f"delegate_{context.agent}",
+                {"task": context.goal, "resume": True},
+            ),
+        )
+
+    def _append_main_message(
+        self, messages: list[dict[str, Any]], message: dict[str, Any]
+    ) -> dict[str, Any]:
+        safe = self._persist_main_message(message)
+        messages.append(safe)
+        return safe
+
+    def _persist_main_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        if self._active_turn_seq < 1:
+            raise RoutingError("Main model message requires an active Turn")
+        return self._require_session_manager().record_model_message(
+            self._scope(),
+            message,
+            turn_seq=self._active_turn_seq,
+            agent="main",
+        )
+
+    def _persist_main_compaction(self, plan: MessageCompactionPlan) -> None:
+        if self._active_turn_seq < 1:
+            raise RoutingError("Main compaction requires an active Turn")
+        self._require_session_manager().record_message_compaction(
+            self._scope(),
+            turn_seq=self._active_turn_seq,
+            agent="main",
+            checkpoint=plan.checkpoint,
+            retain_message_indexes=plan.retain_message_indexes,
+            tool_replacements=plan.tool_replacements,
+        )
+
+    @staticmethod
+    def _main_tool_call_id(messages: list[dict[str, Any]]) -> str:
+        resolved = {
+            str(message.get("tool_call_id") or "")
+            for message in messages
+            if message.get("role") == "tool"
+        }
+        for message in reversed(messages):
+            for call in reversed(message.get("tool_calls") or []):
+                call_id = str(call.get("id") or "")
+                if call_id and call_id not in resolved:
+                    return call_id
+        raise RoutingError("Main delegation is missing its assistant tool call")
+
+    def _ensure_domain_thread_durable(self, context: AgentContext) -> None:
+        """Migrate an old paused in-memory Domain thread only when a new Turn resumes it."""
+
+        if self._active_turn_seq < 1 or not context.messages:
+            return
+        persisted = derive_domain_messages(
+            self._require_session_manager().event_log.iter_events(self._scope()),
+            agent=context.agent,
+            run_id=context.run_id,
+        )
+        if persisted:
+            context.messages = persisted
+            return
+        context.messages = [
+            self._require_session_manager().record_model_message(
+                self._scope(),
+                message,
+                turn_seq=self._active_turn_seq,
+                agent=context.agent,
+                run_id=context.run_id,
+            )
+            for message in context.messages
+        ]
+
+    def _persist_domain_message(
+        self, context: AgentContext, message: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._require_session_manager().record_model_message(
+            self._scope(),
+            message,
+            turn_seq=self._active_turn_seq or context.origin_turn_seq,
+            agent=context.agent,
+            run_id=context.run_id,
+        )
+
+    def _persist_domain_compaction(
+        self, context: AgentContext, plan: MessageCompactionPlan
+    ) -> None:
+        self._require_session_manager().record_message_compaction(
+            self._scope(),
+            turn_seq=self._active_turn_seq or context.origin_turn_seq,
+            agent=context.agent,
+            checkpoint=plan.checkpoint,
+            retain_message_indexes=plan.retain_message_indexes,
+            tool_replacements=plan.tool_replacements,
+            run_id=context.run_id,
         )
 
     def _save_context(self, context: AgentContext) -> None:
@@ -605,9 +770,7 @@ class GitAgentService:
     def _clear_context(self) -> None:
         self._require_session_manager().save_agent_context(self._scope(), None)
 
-    def _load_context(
-        self, routing_context: RoutingContext | None = None
-    ) -> AgentContext | None:
+    def _load_context(self) -> AgentContext | None:
         session = self._require_session_manager().get_session(
             self._scope().account_key,
             self._scope().repository_key,
@@ -622,11 +785,7 @@ class GitAgentService:
             if session.agent_context
             else None
         )
-        if context is not None and routing_context is not None:
-            context.guidance = self._guidance(
-                context.entity_type, context.entity_id, routing_context
-            )
-        elif context is not None:
+        if context is not None:
             context.guidance = self._stored_guidance(context)
         return context
 
@@ -666,6 +825,7 @@ class GitAgentService:
             }
         return {
             "agent": context.agent,
+            "run_id": context.run_id,
             "origin_turn_seq": context.origin_turn_seq,
             "repository": context.repository,
             "goal": context.goal,
@@ -709,9 +869,24 @@ class GitAgentService:
             guidance=None,
             max_steps=int(raw.get("max_steps") or 20),
         )
+        context.run_id = str(raw.get("run_id") or context.run_id)
         context.origin_turn_seq = int(raw.get("origin_turn_seq") or 0)
         context.steps = int(raw.get("steps") or 0)
         context.observations = list(raw.get("observations") or [])
+        persisted_messages = derive_domain_messages(
+            self._require_session_manager().event_log.iter_events(self._scope()),
+            agent=agent,
+            run_id=context.run_id,
+        )
+        context.messages = (
+            persisted_messages
+            if persisted_messages
+            else [
+                canonical_message(message)
+                for message in raw.get("messages", [])
+                if isinstance(message, dict)
+            ]
+        )
         context.operation = str(raw.get("operation") or "")
         context.requested_outcome = str(raw.get("requested_outcome") or "")
         context.question = str(raw.get("question") or "")
@@ -760,6 +935,19 @@ class GitAgentService:
                 summary=str(pending.get("summary") or ""),
                 calls=calls,
             )
+            if not context.messages:
+                origin_turn_seq = context.origin_turn_seq
+                context.origin_turn_seq = 0
+                try:
+                    context.start_message_thread()
+                    context.append_message(
+                        {
+                            "role": "assistant",
+                            "content": f"{context.pending.summary}\n\n请确认是否执行。",
+                        }
+                    )
+                finally:
+                    context.origin_turn_seq = origin_turn_seq
         return context
 
     @staticmethod
@@ -838,13 +1026,15 @@ class GitAgentService:
             attempts=int(raw.get("attempts") or 1),
         )
 
-    @staticmethod
     def _guidance(
-        entity_type: str | None, entity_id: str | None, context: RoutingContext
+        self, entity_type: str | None, entity_id: str | None
     ) -> AgentGuidance | None:
+        scope = self._scope()
         guidance = AgentGuidance(
-            memory_index=context.memory_index,
-            resolved_references=GitAgentService._resolved_references(
+            memory_index=self._require_memory_store().read_index(
+                scope.account_key, scope.repository_key
+            ),
+            resolved_references=self._resolved_references(
                 entity_type, entity_id
             ),
         )
@@ -936,6 +1126,13 @@ class GitAgentService:
         decision: WorkflowTurnDecision,
         user_input: str,
     ) -> None:
+        context.start_message_thread()
+        context.append_message(
+            {
+                "role": "user",
+                "content": user_input or decision.instruction or decision.message or decision.action.value,
+            }
+        )
         context.observations.append(
             {
                 "kind": "user_decision",

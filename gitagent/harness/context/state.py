@@ -16,7 +16,12 @@ from gitagent.domain.models import (
     ChangeRequest,
     VerificationReport,
 )
-from gitagent.harness.context import estimate_tokens
+from gitagent.harness.context.builder import fit_messages_with_plan
+from gitagent.harness.context.messages import (
+    assistant_tool_call,
+    canonical_message,
+    tool_result_message,
+)
 from gitagent.harness.file_reads import FileReadLedger
 
 if TYPE_CHECKING:
@@ -65,6 +70,7 @@ class AgentContext:
         self.max_steps = max_steps
         self.delegation_depth = 0
         self.observations: list[dict[str, Any]] = []
+        self.messages: list[dict[str, Any]] = []
         self.pending: Any = None
         self.question = ""
         self.result: Any = None
@@ -185,14 +191,172 @@ class AgentContext:
         )
         return content
 
-    def prompt_overhead(self) -> int:
-        value = {
-            "system": self.system_prompt,
-            "goal": self.goal,
+    def start_message_thread(self) -> None:
+        if self.messages:
+            return
+        self.append_message({"role": "system", "content": self.system_prompt})
+        delegated = {
+            "task": self.goal,
             "repository": self.repository,
             "entity_type": self.entity_type,
             "entity_id": self.entity_id,
             "guidance": asdict(self.guidance) if self.guidance is not None else None,
-            "capabilities": self._harness.llm_tools(self),
         }
-        return estimate_tokens(json.dumps(value, ensure_ascii=False, default=str)) + 512
+        self.append_message(
+            {
+                "role": "user",
+                "content": json.dumps(
+                    delegated, ensure_ascii=False, separators=(",", ":"), default=str
+                ),
+            }
+        )
+
+    def append_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        safe = canonical_message(message)
+        sink = self._harness.message_sink
+        if sink is not None and self.origin_turn_seq > 0:
+            safe = sink(self, safe)
+        self.messages.append(safe)
+        return safe
+
+    def model_messages(
+        self, tools: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        self.start_message_thread()
+        fitted, _, _, plan = fit_messages_with_plan(
+            self.messages,
+            tools,
+            effective_input_budget=self.context_budget,
+        )
+        if plan.changed:
+            sink = self._harness.compaction_sink
+            if sink is not None and self.origin_turn_seq > 0:
+                sink(self, plan)
+            self.messages[:] = fitted
+        return self.messages
+
+    def reason_structured(
+        self,
+        reasoner: Any,
+        *,
+        schema: dict[str, Any] | None = None,
+        tool_name: str = "respond",
+        tools: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Run structured inference and persist retry messages added by the Reasoner."""
+
+        request = self.model_messages(tools)
+        before = len(request)
+        try:
+            return reasoner.complete_structured_messages(
+                messages=request,
+                schema=schema,
+                tool_name=tool_name,
+                tools=tools,
+            )
+        finally:
+            self._persist_external_messages(before)
+
+    def _persist_external_messages(self, start: int) -> None:
+        for index in range(start, len(self.messages)):
+            safe = canonical_message(self.messages[index])
+            sink = self._harness.message_sink
+            if sink is not None and self.origin_turn_seq > 0:
+                safe = sink(self, safe)
+            self.messages[index] = safe
+
+    def record_model_response(
+        self,
+        value: dict[str, Any],
+        *,
+        tool_name: str,
+    ) -> dict[str, Any]:
+        message = getattr(value, "assistant_message", None)
+        if not isinstance(message, dict):
+            message = assistant_tool_call(
+                f"call-{uuid.uuid4().hex}", tool_name, value
+            )
+        return self.append_message(message)
+
+    def ensure_capability_tool_call(
+        self, capability_id: str, arguments: dict[str, Any]
+    ) -> str:
+        expected_name = self._harness.function_name(capability_id)
+        open_call = self.open_tool_call()
+        if open_call is not None:
+            function = open_call.get("function") or {}
+            actual_name = str(function.get("name") or "") if isinstance(function, dict) else ""
+            if actual_name != expected_name:
+                raise ValidationError(
+                    f"open tool call {actual_name or '<unnamed>'} does not match capability {expected_name}"
+                )
+            return str(open_call["id"])
+        call_id = f"call-{uuid.uuid4().hex}"
+        self.append_message(assistant_tool_call(call_id, expected_name, arguments))
+        return call_id
+
+    def append_tool_result(self, content: Any) -> dict[str, Any]:
+        call_id = self.open_tool_call_id()
+        if not call_id:
+            raise ValidationError("Domain tool result has no matching assistant call")
+        return self.append_message(tool_result_message(call_id, content))
+
+    def open_tool_calls(self) -> list[dict[str, Any]]:
+        resolved: set[str] = {
+            str(message.get("tool_call_id") or "")
+            for message in self.messages
+            if message.get("role") == "tool"
+        }
+        open_calls: list[dict[str, Any]] = []
+        for message in self.messages:
+            if message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                call_id = str(call.get("id") or "")
+                if call_id and call_id not in resolved:
+                    open_calls.append(call)
+        return open_calls
+
+    def open_tool_call(self) -> dict[str, Any] | None:
+        open_calls = self.open_tool_calls()
+        if len(open_calls) > 1:
+            raise ValidationError("Domain thread has multiple unresolved tool calls")
+        return open_calls[0] if open_calls else None
+
+    def open_tool_call_id(self) -> str:
+        call = self.open_tool_call()
+        return str(call.get("id") or "") if call is not None else ""
+
+    def complete_control_call(self, outcome: Any) -> None:
+        if self.open_tool_call() is not None:
+            self.append_tool_result(outcome)
+
+    def complete_structured(
+        self,
+        reasoner: Any,
+        *,
+        prompt: str,
+        schema: dict[str, Any] | None = None,
+        tool_name: str = "respond",
+        tools: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        self.start_message_thread()
+        self.append_message({"role": "user", "content": prompt})
+        value = self.reason_structured(
+            reasoner,
+            schema=schema,
+            tool_name=tool_name,
+            tools=tools,
+        )
+        self.record_model_response(value, tool_name=tool_name)
+        self.complete_control_call({"status": "accepted", "result": value})
+        return value
+
+    def complete_text(self, reasoner: Any, *, prompt: str) -> str:
+        self.start_message_thread()
+        self.append_message({"role": "user", "content": prompt})
+        content = reasoner.complete_text_messages(
+            messages=self.model_messages()
+        ).strip()
+        self.append_message({"role": "assistant", "content": content})
+        return content

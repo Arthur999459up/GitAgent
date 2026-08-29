@@ -20,7 +20,6 @@ from gitagent.domain.models import (
 from gitagent.harness.context import (
     capability_attempted,
     capability_failure_observed,
-    render_context_observations,
 )
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
@@ -132,15 +131,20 @@ class RepositoryAgent:
             raise ValidationError("repository request cannot be empty")
         if self.reasoner is None:
             return self._fallback_operation(text)
-        raw = self.reasoner.complete_structured(
-            system=(
-                "Classify one repository request into exactly one operation. "
-                "EXPLORE browses structure; SEARCH locates code; EXPLAIN explains behavior/call chains; "
-                "IMPACT_ANALYZE evaluates change impact; PLAN proposes an implementation plan without writing; "
-                "HISTORY inspects file history; MODIFY requests an arbitrary direct repository code change. "
-                "Issue-scoped and Pull-Request-scoped work must already have been routed elsewhere."
-            ),
-            prompt=text,
+        raw = self.reasoner.complete_structured_messages(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify one repository request into exactly one operation. "
+                        "EXPLORE browses structure; SEARCH locates code; EXPLAIN explains behavior/call chains; "
+                        "IMPACT_ANALYZE evaluates change impact; PLAN proposes an implementation plan without writing; "
+                        "HISTORY inspects file history; MODIFY requests an arbitrary direct repository code change. "
+                        "Issue-scoped and Pull-Request-scoped work must already have been routed elsewhere."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
             schema=_OPERATION_SCHEMA,
             tool_name="select_repository_operation",
         )
@@ -185,21 +189,14 @@ class RepositoryAgent:
     ) -> AgentAction:
         if self.reasoner is None:
             raise WorkflowError("capability failure recovery requires a reasoner")
-        value = self.reasoner.complete_structured(
-            system=context.system_prompt,
-            prompt=_PROMPTS.render(
-                "agents.repository_recovery_decide",
-                goal=context.goal,
-                repository=context.repository,
-                operation=operation.value,
-                budget=str(max(0, context.max_steps - context.steps)),
-                guidance=guidance_section(context.guidance),
-                observations=render_context_observations(context),
-            ),
+        tools = self.harness.llm_tools(context)
+        value = context.reason_structured(
+            self.reasoner,
             schema=AGENT_ACTION_SCHEMA,
             tool_name="decide_action",
-            tools=self.harness.llm_tools(context),
+            tools=tools,
         )
+        context.record_model_response(value, tool_name="decide_action")
         if value.get("kind") == "capability":
             value["capability_id"] = self.harness.resolve_llm_name(
                 str(value.get("capability_id", "")),
@@ -507,8 +504,8 @@ class RepositoryAgent:
             context.repository_search_plan = fallback
             return fallback
         try:
-            raw = self.reasoner.complete_structured(
-                system=context.system_prompt,
+            raw = context.complete_structured(
+                self.reasoner,
                 prompt=_PROMPTS.render(
                     "agents.repository_search_plan",
                     operation=operation.value,
@@ -597,8 +594,8 @@ class RepositoryAgent:
     def _grounded_text(self, context: AgentContext, evidence: dict[str, Any]) -> str:
         if self.reasoner is None:
             return json.dumps(evidence, ensure_ascii=False, default=str)[:12000]
-        return self.reasoner.complete_text(
-            system=context.system_prompt,
+        return context.complete_text(
+            self.reasoner,
             prompt=_PROMPTS.render(
                 "agents.repository",
                 repository=context.repository,
@@ -612,9 +609,15 @@ class RepositoryAgent:
         if len(candidates) == 1:
             return candidates[0]
         if self.reasoner is not None and candidates:
-            selected = self.reasoner.complete_text(
-                system="Choose exactly one file path from the candidates. Return only that path.",
-                prompt=json.dumps({"request": context.goal, "candidates": candidates}, ensure_ascii=False),
+            selected = context.complete_text(
+                self.reasoner,
+                prompt=(
+                    "Choose exactly one file path from the candidates. Return only that path.\n"
+                    + json.dumps(
+                        {"request": context.goal, "candidates": candidates},
+                        ensure_ascii=False,
+                    )
+                ),
             ).strip()
             if selected in candidates:
                 return selected

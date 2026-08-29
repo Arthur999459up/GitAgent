@@ -259,8 +259,8 @@ class CodingAgent:
                 call_relationships=[],
                 impact_scope=changed,
             )
-        value = self.reasoner.complete_structured(
-            system=context.system_prompt,
+        value = context.complete_structured(
+            self.reasoner,
             prompt=_PROMPTS.render(
                 "agents.coding_explain",
                 request=request,
@@ -301,8 +301,8 @@ class CodingAgent:
                 recommendation=Recommendation.NEEDS_HUMAN_REVIEW,
                 goal_alignment="UNKNOWN",
             )
-        value = self.reasoner.complete_structured(
-            system=context.system_prompt,
+        value = context.complete_structured(
+            self.reasoner,
             prompt=_PROMPTS.render(
                 "agents.pr_review",
                 request=request,
@@ -344,8 +344,8 @@ class CodingAgent:
                 tradeoffs=["需要结合运行时行为确认具体取舍。"],
                 tests=["运行受影响模块的项目测试。"],
             )
-        value = self.reasoner.complete_structured(
-            system=context.system_prompt,
+        value = context.complete_structured(
+            self.reasoner,
             prompt=_PROMPTS.render(
                 "agents.coding_plan",
                 request=request,
@@ -364,6 +364,7 @@ class CodingAgent:
 
     @staticmethod
     def _invoke_capability(context: AgentContext, capability_id: str, **arguments: Any) -> Any:
+        context.ensure_capability_tool_call(capability_id, arguments)
         content = context.invoke(capability_id, **arguments)
         call = context.last_capability_call
         if call is None:
@@ -372,6 +373,14 @@ class CodingAgent:
             error = call.result.error
             if error is None:
                 raise WorkflowError("Coding capability failed without a structured error")
+            context.append_tool_result(
+                {
+                    "status": "failed",
+                    "capability_id": call.result.capability_id,
+                    "error": error.type.value,
+                    "message": error.message,
+                }
+            )
             raise _CodingCapabilityFailure(
                 {
                     "capability_id": call.result.capability_id,
@@ -384,6 +393,7 @@ class CodingAgent:
             )
         if call.result.status != "success":
             raise WorkflowError(f"Coding capability returned unsupported status: {call.result.status}")
+        context.append_tool_result(call.observation_data)
         return content
 
     def _create(
@@ -481,8 +491,8 @@ class CodingAgent:
             new_files = {}
             for operation in writable_operations:
                 try:
-                    content = self.reasoner.complete_text(
-                        system=context.system_prompt,
+                    content = context.complete_text(
+                        self.reasoner,
                         prompt=_PROMPTS.render(
                             "agents.coding_create",
                             repository=request.repository,
@@ -534,8 +544,8 @@ class CodingAgent:
         )
         mentioned.extend(path for path in tree_paths if path in request.description and path not in mentioned)
         context.phase = "planning_changes"
-        value = self.reasoner.complete_structured(
-            system=context.system_prompt,
+        value = context.complete_structured(
+            self.reasoner,
             prompt=json.dumps(
                 {
                     "request": request.description,
@@ -680,8 +690,8 @@ class CodingAgent:
         ]
         repaired: dict[str, str] = {}
         for operation in writable_operations:
-            content = self.reasoner.complete_text(
-                system=context.system_prompt,
+            content = context.complete_text(
+                self.reasoner,
                 prompt=_PROMPTS.render(
                     "agents.coding_repair",
                     description=request.description,

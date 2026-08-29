@@ -18,7 +18,7 @@ from gitagent.domain.errors import StateError, ValidationError
 from gitagent.domain.models import SessionEvent, SessionScope
 
 EVENT_SCHEMA_VERSION = 1
-DEFAULT_MAX_EVENT_BYTES = 64 * 1024
+DEFAULT_MAX_EVENT_BYTES = 4 * 1024 * 1024
 DEFAULT_ARGUMENT_BYTES = 16 * 1024
 DEFAULT_CONTENT_BYTES = 16 * 1024
 _OMITTED = "\n… content omitted …\n"
@@ -495,16 +495,6 @@ def _bound_payload(event_type: str, data: dict[str, Any]) -> dict[str, Any]:
         result["content"] = content
         result["truncated"] = truncated
         result["original_bytes"] = original_bytes
-    if event_type in {"user_message", "assistant_message"} and isinstance(
-        result.get("content"), str
-    ):
-        content, truncated, original_bytes = _bounded_text(
-            result["content"], DEFAULT_CONTENT_BYTES * 2
-        )
-        result["content"] = content
-        if truncated:
-            result["truncated"] = True
-            result["original_bytes"] = original_bytes
     return result
 
 

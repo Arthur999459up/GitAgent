@@ -86,27 +86,36 @@ class ReflectionContextBuilder:
     def _conversation(
         self, scope: SessionScope, turn_seq: int
     ) -> tuple[dict[str, Any], ...]:
-        session = self.sessions.get_session(
-            scope.account_key, scope.repository_key, scope.session_id
-        )
-        if session is None:
-            return ()
-        return tuple(
-            {
-                "seq": turn.seq,
-                "status": turn.status,
-                "user": turn.user_text,
-                "assistant": turn.assistant_text,
-                "route": turn.route_summary,
-            }
-            for turn in self.sessions.list_turns(
-                scope.account_key,
-                scope.repository_key,
-                scope.session_id,
-                after_seq=max(0, turn_seq - 1),
-            )
-            if turn.seq == turn_seq
-        )
+        evidence: dict[str, Any] = {
+            "seq": turn_seq,
+            "user": "",
+            "assistant": "",
+            "route": None,
+            "outcome": "",
+        }
+        found = False
+        for event in self.sessions.event_log.iter_events(scope):
+            if event.turn_seq != turn_seq:
+                continue
+            if event.type == "user_message" and event.agent in {None, "main"}:
+                content = event.data.get("content")
+                if isinstance(content, str):
+                    evidence["user"] = content
+                    found = True
+            elif event.type == "assistant_message" and event.agent in {None, "main"}:
+                content = event.data.get("content")
+                if isinstance(content, str):
+                    evidence["assistant"] = content
+                    found = True
+            elif event.type == "route_selected":
+                evidence["route"] = event.data.get("route", event.data.get("routes"))
+                found = True
+            elif event.type == "workflow_outcome":
+                summary = event.data.get("summary")
+                if isinstance(summary, str):
+                    evidence["outcome"] = summary
+                    found = True
+        return (evidence,) if found else ()
 
     def _fit(self, context: ReflectionInput) -> ReflectionInput:
         """Fit required evidence by compacting fields, never by dropping trajectory steps."""

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import uuid
+from collections.abc import Callable
 from typing import Any
 
 from gitagent.domain.errors import RoutingError, ValidationError
@@ -14,13 +16,20 @@ from gitagent.domain.models import (
     AgentSpec,
     MainDecision,
     Route,
-    RoutingContext,
+    SessionScope,
     to_plain,
 )
-from gitagent.harness.context import estimate_tokens
+from gitagent.harness.context import (
+    MessageCompactionPlan,
+    assistant_tool_call,
+    canonical_message,
+    fit_messages_with_plan,
+    request_tokens,
+    tool_result_message,
+)
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
-from gitagent.model import Reasoner, structured_request_payload
+from gitagent.model import Reasoner, structured_tools
 from gitagent.prompts import get_prompt_library
 
 _DOMAIN_AGENTS = {"issues", "pull_requests", "repository"}
@@ -92,7 +101,7 @@ _REFLECTION_SCHEMA = {
 }
 
 _MAIN_SYSTEM = """You are GitAgent's Main Agent. One Session is one continuous Main Agent context.
-Understand the user's current request from the Session summary, recent history, working state, and long-term Memory index.
+Understand the user's current request from the native conversation messages and the bounded long-term Memory index below.
 Memory and Experience are non-authoritative context. The current request and current verifiable evidence always win.
 Read a linked Memory item with native.read only when its index summary is relevant but insufficient; use the stated root and relative path.
 Do not invent or manage tasks, runs, workflow lifecycles, approvals, or capability calls.
@@ -136,27 +145,37 @@ _REFLECTION_SPEC = AgentSpec(
 
 
 class MainAgent:
-    def __init__(self, harness: AgentHarness, reasoner: Reasoner) -> None:
+    def __init__(
+        self,
+        harness: AgentHarness,
+        reasoner: Reasoner,
+        *,
+        message_sink: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        compaction_sink: Callable[[MessageCompactionPlan], None] | None = None,
+    ) -> None:
         self.harness = harness
         self.reasoner = reasoner
+        self.message_sink = message_sink
+        self.compaction_sink = compaction_sink
         harness.register(_MAIN_SPEC)
         harness.register(_REFLECTION_SPEC)
 
     def decide(
         self,
-        user_input: str,
+        messages: list[dict[str, Any]],
         *,
         repository: str,
-        context: RoutingContext,
+        scope: SessionScope,
+        tools: list[dict[str, Any]] | None = None,
     ) -> MainDecision:
-        text = user_input.strip()
+        text = str(messages[-1].get("content") or "").strip() if messages else ""
         if not text:
             raise RoutingError("request cannot be empty")
         return self.harness.run(
             "main",
-            session_id=context.scope.session_id,
+            session_id=scope.session_id,
             operation=lambda agent_context: self._semantic_decision(
-                agent_context, text, repository, context
+                agent_context, text, messages, tools
             ),
             repository=repository,
             goal=text,
@@ -166,46 +185,61 @@ class MainAgent:
         self,
         agent_context: AgentContext,
         text: str,
-        repository: str,
-        context: RoutingContext,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
     ) -> MainDecision:
-        observations: list[dict[str, Any]] = []
         for _ in range(4):
-            prompt = self._prompt(text, repository, context, observations=observations)
-            self._ensure_budget(agent_context, prompt)
-            raw = self.reasoner.complete_structured(
-                system=agent_context.system_prompt,
-                prompt=prompt,
-                schema=_MAIN_SCHEMA,
-                tool_name="route_session_turn",
-                tools=self.harness.llm_tools(agent_context),
-            )
+            self._fit_messages(agent_context, messages, tools)
+            before = len(messages)
+            try:
+                raw = self.reasoner.complete_structured_messages(
+                    messages=messages,
+                    schema=_MAIN_SCHEMA,
+                    tool_name="route_session_turn",
+                    tools=tools,
+                )
+            finally:
+                self._persist_external_messages(messages, before)
+            self._append_message(messages, _assistant_message(raw, "route_session_turn"))
             if raw.get("kind") != "capability":
                 return self._validate(raw, text)
-            observations.append(self._read_memory(agent_context, raw))
+            result = self._read_memory(agent_context, raw)
+            self._append_message(
+                messages, tool_result_message(_last_tool_call_id(messages), result)
+            )
         raise RoutingError("Main Agent exceeded the bounded Memory read limit")
 
-    def render_input_context(
-        self, user_input: str, repository: str, context: RoutingContext
-    ) -> str:
-        """Serialize the exact Main Agent request counted by the shared context budget."""
-
+    def provider_tools(
+        self, *, session_id: str, repository: str, goal: str
+    ) -> list[dict[str, Any]] | None:
         probe = self.harness.context(
             "main",
-            context.scope.session_id,
+            session_id,
             repository=repository,
-            goal=user_input,
+            goal=goal,
         )
-        request = structured_request_payload(
-            self.harness.spec("main").system_prompt,
-            self._prompt(user_input, repository, context),
-            schema=_MAIN_SCHEMA,
-            tool_name="route_session_turn",
-            tools=self.harness.llm_tools(probe),
+        return structured_tools(
+            "route_session_turn", _MAIN_SCHEMA, self.harness.llm_tools(probe)
         )
-        return json.dumps(
-            request, ensure_ascii=False, separators=(",", ":"), default=str
+
+    def current_system(
+        self, *, repository: str, memory_index: str = ""
+    ) -> str:
+        bootstrap = {
+            "repository": repository,
+            "routes": self._routes(),
+            "memory_index": memory_index,
+        }
+        return _MAIN_SYSTEM + "\n\nCurrent bootstrap:\n" + json.dumps(
+            bootstrap, ensure_ascii=False, separators=(",", ":")
         )
+
+    def finalize(self, messages: list[dict[str, Any]]) -> str:
+        text = self.reasoner.complete_text_messages(messages=messages).strip()
+        if not text:
+            raise RoutingError("Main Agent returned an empty final response")
+        messages.append(canonical_message({"role": "assistant", "content": text}))
+        return text
 
     def reflect(self, context: ReflectionInput) -> ReflectionChanges:
         """Run the conversation owner's isolated, Memory-read-only learning invocation."""
@@ -242,10 +276,12 @@ class MainAgent:
                     payload, ensure_ascii=False, separators=(",", ":"), default=str
                 ),
             )
-            self._ensure_budget(agent_context, prompt)
-            raw = self.reasoner.complete_structured(
-                system=agent_context.system_prompt,
-                prompt=prompt,
+            self._ensure_auxiliary_budget(agent_context, prompt)
+            raw = self.reasoner.complete_structured_messages(
+                messages=[
+                    {"role": "system", "content": agent_context.system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
                 schema=_REFLECTION_SCHEMA,
                 tool_name="propose_long_term_learning",
                 tools=self.harness.llm_tools(agent_context),
@@ -280,33 +316,6 @@ class MainAgent:
             ),
         )
 
-    def _prompt(
-        self,
-        text: str,
-        repository: str,
-        context: RoutingContext,
-        *,
-        observations: list[dict[str, Any]] | None = None,
-    ) -> str:
-        payload: dict[str, Any] = {
-            "user_input": text,
-            "repository": repository,
-            "routes": self._routes(),
-            "session": {
-                "summary": context.summary,
-                "recent_history": list(context.history_units),
-                "working_state": context.working_state,
-                "memory_index": context.memory_index,
-                "memory_reads": list(observations or ()),
-            },
-        }
-        return (
-            "Decide whether to answer directly or choose one domain agent. "
-            "Only native.read of an indexed Memory item is allowed before the final routing decision. "
-            "Do not select repository capabilities or create lifecycle objects.\n"
-            + json.dumps(payload, ensure_ascii=False)
-        )
-
     def _read_memory(
         self, context: AgentContext, raw: dict[str, Any]
     ) -> dict[str, Any]:
@@ -334,11 +343,49 @@ class MainAgent:
         return {"capability_id": capability_id, "arguments": arguments, "data": result}
 
     @staticmethod
-    def _ensure_budget(context: AgentContext, prompt: str) -> None:
-        if estimate_tokens(prompt) + context.prompt_overhead() > context.context_budget:
+    def _ensure_auxiliary_budget(context: AgentContext, prompt: str) -> None:
+        if request_tokens(
+            [
+                {"role": "system", "content": context.system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+        ) > context.context_budget:
             raise ValidationError(
                 "MainAgent Memory reads exceed the unified context budget"
             )
+
+    def _fit_messages(
+        self,
+        context: AgentContext,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> None:
+        fitted, _, _, plan = fit_messages_with_plan(
+            messages,
+            tools,
+            effective_input_budget=context.context_budget,
+        )
+        if plan.changed and self.compaction_sink is not None:
+            self.compaction_sink(plan)
+        messages[:] = fitted
+
+    def _append_message(
+        self, messages: list[dict[str, Any]], message: dict[str, Any]
+    ) -> dict[str, Any]:
+        safe = canonical_message(message)
+        if self.message_sink is not None:
+            safe = self.message_sink(safe)
+        messages.append(safe)
+        return safe
+
+    def _persist_external_messages(
+        self, messages: list[dict[str, Any]], start: int
+    ) -> None:
+        for index in range(start, len(messages)):
+            safe = canonical_message(messages[index])
+            if self.message_sink is not None:
+                safe = self.message_sink(safe)
+            messages[index] = safe
 
     def _validate(self, raw: dict[str, Any], text: str) -> MainDecision:
         if not isinstance(raw, dict):
@@ -401,3 +448,21 @@ class MainAgent:
                     }
                 )
         return catalog
+
+
+def _assistant_message(raw: dict[str, Any], tool_name: str) -> dict[str, Any]:
+    message = getattr(raw, "assistant_message", None)
+    if isinstance(message, dict) and message.get("tool_calls"):
+        return canonical_message(message)
+    return assistant_tool_call(
+        f"call-{uuid.uuid4().hex}",
+        tool_name,
+        raw,
+    )
+
+
+def _last_tool_call_id(messages: list[dict[str, Any]]) -> str:
+    calls = messages[-1].get("tool_calls") or []
+    if not calls:
+        raise ValidationError("Main capability response has no tool call identity")
+    return str(calls[0]["id"])

@@ -60,9 +60,11 @@ class ApprovalIntentClassifier:
             proposal_context=json.dumps(proposal_context, ensure_ascii=False),
         )
         try:
-            value = self.reasoner.complete_structured(
-                system=_PROMPTS.text("approval.system"),
-                prompt=prompt,
+            value = self.reasoner.complete_structured_messages(
+                messages=[
+                    {"role": "system", "content": _PROMPTS.text("approval.system")},
+                    {"role": "user", "content": prompt},
+                ],
                 schema=_APPROVAL_SCHEMA,
                 tool_name="classify_approval_intent",
             )

@@ -51,9 +51,9 @@ class HarnessActionDispatcher:
                 "message": decision.message,
             },
         )
+        user_content = decision.instruction or decision.message or decision.action.value
+        context.append_message({"role": "user", "content": user_content})
         if context.question:
-            self.observe(context, "assistant", context.question)
-            self.observe(context, "user", decision.instruction or decision.message or "")
             context.question = ""
             return
 
@@ -79,14 +79,28 @@ class HarnessActionDispatcher:
         if action.kind == AgentActionKind.APPLY_REPOSITORY_CHANGE:
             return self._handle_repository_change(context)
         if action.kind == AgentActionKind.CONTINUE:
+            context.complete_control_call(
+                {"status": "accepted", "action": AgentActionKind.CONTINUE.value}
+            )
             return True
         if action.kind == AgentActionKind.ASK:
+            context.complete_control_call(
+                {"status": "accepted", "action": AgentActionKind.ASK.value}
+            )
             context.question = action.question or action.summary
+            context.append_message(
+                {"role": "assistant", "content": context.question}
+            )
             return False
         if action.kind == AgentActionKind.FINISH:
+            context.complete_control_call(
+                {"status": "accepted", "action": AgentActionKind.FINISH.value}
+            )
             context.final_message = action.message or context.final_message
             if context.result_required:
                 context.result = agent.build_result(context)
+            final = context.final_message or action.summary or "任务已完成。"
+            context.append_message({"role": "assistant", "content": final})
             context.finished = True
             return False
         raise ValidationError(f"unknown action kind: {action.kind}")
@@ -96,11 +110,33 @@ class HarnessActionDispatcher:
             raise ValidationError("capability action requires a capability ID")
         arguments = dict(action.arguments)
 
+        expected_name = self.harness.function_name(action.capability_id)
+        open_call = context.open_tool_call()
+        if open_call is not None:
+            function = open_call.get("function") or {}
+            open_name = str(function.get("name") or "") if isinstance(function, dict) else ""
+            if open_name == "decide_action":
+                context.complete_control_call(
+                    {
+                        "status": "accepted",
+                        "action": AgentActionKind.CAPABILITY.value,
+                        "capability_id": action.capability_id,
+                    }
+                )
+            elif open_name != expected_name:
+                raise ValidationError(
+                    f"open tool call {open_name or '<unnamed>'} does not match capability {expected_name}"
+                )
+
+        context.ensure_capability_tool_call(action.capability_id, arguments)
         context.invoke(action.capability_id, **arguments)
         call = context.last_capability_call
         if call is None:
             raise WorkflowError("capability invocation did not record its result")
         if call.result.status == "approval_required":
+            context.append_tool_result(
+                {"status": "approval_required", "capability_id": action.capability_id}
+            )
             call = PlannedCapabilityCall(action.capability_id, arguments)
             approval = self.harness.approvals.create(
                 session_id=context.session_id,
@@ -109,6 +145,12 @@ class HarnessActionDispatcher:
                 calls=[call],
             )
             context.pending = PendingAction(approval.approval_id, approval.summary, [call])
+            context.append_message(
+                {
+                    "role": "assistant",
+                    "content": f"{approval.summary}\n\n请确认是否执行。",
+                }
+            )
             return False
         if call.result.status == "failed":
             error = call.result.error
@@ -124,6 +166,14 @@ class HarnessActionDispatcher:
                     "attempts": call.result.attempts,
                 },
             )
+            context.append_tool_result(
+                {
+                    "status": "failed",
+                    "capability_id": call.result.capability_id,
+                    "error": error.type.value if error is not None else "unknown",
+                    "message": error.message if error is not None else "capability failed",
+                }
+            )
             return True
         payload = {
             "capability_id": action.capability_id,
@@ -135,6 +185,7 @@ class HarnessActionDispatcher:
         if call.covered:
             payload["covered"] = True
         self.observe(context, "capability", payload)
+        context.append_tool_result(call.observation_data)
         return True
 
     def _handle_issue_fix(self, context: Any) -> bool:
@@ -163,6 +214,7 @@ class HarnessActionDispatcher:
         return False
 
     def _queue(self, context: Any, summary: str, calls: list[PlannedCapabilityCall]) -> None:
+        context.complete_control_call({"status": "awaiting_approval"})
         approval = self.harness.approvals.create(
             session_id=context.session_id,
             repository=context.repository,
@@ -170,9 +222,13 @@ class HarnessActionDispatcher:
             calls=calls,
         )
         context.pending = PendingAction(approval.approval_id, approval.summary, calls)
+        context.append_message(
+            {"role": "assistant", "content": f"{approval.summary}\n\n请确认是否执行。"}
+        )
 
     def _execute_pending(self, context: Any, pending: PendingAction) -> None:
         for call in pending.calls:
+            context.ensure_capability_tool_call(call.capability_id, call.arguments)
             result = context.invoke(
                 call.capability_id,
                 approval_id=pending.approval_id,
@@ -198,6 +254,14 @@ class HarnessActionDispatcher:
                         "attempts": invocation.result.attempts,
                     },
                 )
+                context.append_tool_result(
+                    {
+                        "status": "failed",
+                        "capability_id": invocation.result.capability_id,
+                        "error": error.type.value,
+                        "message": error.message,
+                    }
+                )
                 return
             self.observe(
                 context,
@@ -208,6 +272,7 @@ class HarnessActionDispatcher:
                     "data": result,
                 },
             )
+            context.append_tool_result(result)
         if not self.harness.approvals.complete(pending.approval_id):
             raise WorkflowError("approved mutation plan was not fully consumed")
 

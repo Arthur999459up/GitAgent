@@ -61,21 +61,6 @@ class ResolvedReference:
 
 
 @dataclass(frozen=True)
-class RoutingContext:
-    """Ephemeral, untrusted Session projection supplied to MainAgent/domain agents."""
-
-    scope: SessionScope
-    repository_full_name: str
-    working_state: dict[str, Any] = field(default_factory=dict)
-    summary: str = ""
-    history_units: tuple[dict[str, Any], ...] = ()
-    memory_index: str = ""
-    selection_metadata: dict[str, Any] = field(
-        default_factory=dict, compare=False, repr=False
-    )
-
-
-@dataclass(frozen=True)
 class AgentGuidance:
     """Validated, non-authoritative auxiliary data for a domain agent."""
 

@@ -10,8 +10,8 @@ from .chat_client import (
 from .reasoner import (
     LLMReasoner,
     Reasoner,
-    structured_message_contents,
-    structured_request_payload,
+    StructuredValue,
+    structured_tools,
 )
 
 __all__ = [
@@ -21,7 +21,7 @@ __all__ = [
     "LiteLLMChatClient",
     "OpenAIChatClient",
     "Reasoner",
+    "StructuredValue",
     "ToolCall",
-    "structured_message_contents",
-    "structured_request_payload",
+    "structured_tools",
 ]

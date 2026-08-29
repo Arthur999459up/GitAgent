@@ -36,6 +36,8 @@ class AgentHarness:
         self.trace = trace or TraceBus()
         self.context_budget = context_budget
         self._specs: dict[str, AgentSpec] = {}
+        self.message_sink: Callable[[AgentContext, dict[str, Any]], dict[str, Any]] | None = None
+        self.compaction_sink: Callable[[AgentContext, Any], None] | None = None
 
     def register(self, spec: AgentSpec) -> None:
         if spec.name in self._specs:
@@ -186,6 +188,9 @@ class AgentHarness:
             if self._function_name(capability.id) == name:
                 return capability.id
         return name
+
+    def function_name(self, capability_id: str) -> str:
+        return self._function_name(capability_id)
 
     @staticmethod
     def _function_name(capability_id: str) -> str:

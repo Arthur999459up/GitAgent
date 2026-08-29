@@ -12,7 +12,7 @@ AGENT_ACTION_SCHEMA = {
     "properties": {
         "kind": {
             "type": "string",
-            "enum": ["capability", "apply_issue_fix", "ask", "finish"],
+            "enum": ["apply_issue_fix", "ask", "finish"],
         },
         "summary": {"type": "string", "description": "One-line user-facing explanation of the next action."},
         "capability_id": {

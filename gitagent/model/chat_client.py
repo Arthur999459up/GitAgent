@@ -35,10 +35,13 @@ class ChatResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    reasoning_content: str | None = None
 
     @property
     def message(self) -> dict[str, Any]:
         message: dict[str, Any] = {"role": "assistant", "content": self.content or None}
+        if self.reasoning_content is not None:
+            message["reasoning_content"] = self.reasoning_content
         if self.tool_calls:
             message["tool_calls"] = [
                 {
@@ -92,6 +95,7 @@ class OpenAIChatClient:
                 raise ValidationError("缺少 openai 依赖，请重新执行 pip install -e .") from exc
             client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=2)
         self.model = model
+        self.base_url = base_url
         self.client = client
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -112,7 +116,12 @@ class OpenAIChatClient:
     ) -> ChatResponse:
         params: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": _outbound_messages(
+                messages,
+                preserve_reasoning_content=_requires_reasoning_content(
+                    self.model, self.base_url
+                ),
+            ),
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
@@ -127,13 +136,20 @@ class OpenAIChatClient:
 
         message = raw.choices[0].message
         content = _content_text(getattr(message, "content", ""))
+        reasoning_content = _reasoning_content(message)
         calls = _tool_calls(getattr(message, "tool_calls", None))
         prompt_tokens, completion_tokens = _usage_tokens(getattr(raw, "usage", None))
         self.total_prompt_tokens += prompt_tokens
         self.total_completion_tokens += completion_tokens
         if on_token and content:
             on_token(content)
-        return ChatResponse(content, calls, prompt_tokens, completion_tokens)
+        return ChatResponse(
+            content,
+            calls,
+            prompt_tokens,
+            completion_tokens,
+            reasoning_content,
+        )
 
 
 class LiteLLMChatClient:
@@ -177,7 +193,12 @@ class LiteLLMChatClient:
 
         params: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": _outbound_messages(
+                messages,
+                preserve_reasoning_content=_requires_reasoning_content(
+                    self.model, self.base_url
+                ),
+            ),
             "api_key": self.api_key,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
@@ -197,13 +218,61 @@ class LiteLLMChatClient:
 
         message = raw.choices[0].message
         content = _content_text(getattr(message, "content", ""))
+        reasoning_content = _reasoning_content(message)
         calls = _tool_calls(getattr(message, "tool_calls", None))
         prompt_tokens, completion_tokens = _usage_tokens(getattr(raw, "usage", None))
         self.total_prompt_tokens += prompt_tokens
         self.total_completion_tokens += completion_tokens
         if on_token and content:
             on_token(content)
-        return ChatResponse(content, calls, prompt_tokens, completion_tokens)
+        return ChatResponse(
+            content,
+            calls,
+            prompt_tokens,
+            completion_tokens,
+            reasoning_content,
+        )
+
+
+def _requires_reasoning_content(model: str, base_url: str | None) -> bool:
+    """Return whether the provider expects DeepSeek thinking metadata on tool turns."""
+
+    model_name = str(model or "").casefold()
+    endpoint = str(base_url or "").casefold()
+    return "deepseek" in model_name or "deepseek" in endpoint
+
+
+def _outbound_messages(
+    messages: list[dict[str, Any]], *, preserve_reasoning_content: bool
+) -> list[dict[str, Any]]:
+    """Adapt provider metadata without mutating the durable canonical thread."""
+
+    outbound: list[dict[str, Any]] = []
+    for message in messages:
+        projected = dict(message)
+        if projected.get("role") == "assistant":
+            if preserve_reasoning_content:
+                if projected.get("tool_calls") and "reasoning_content" not in projected:
+                    projected["reasoning_content"] = ""
+            else:
+                projected.pop("reasoning_content", None)
+        outbound.append(projected)
+    return outbound
+
+
+def _reasoning_content(message: Any) -> str | None:
+    value = getattr(message, "reasoning_content", None)
+    if value is None and isinstance(message, dict):
+        value = message.get("reasoning_content")
+    if value is None:
+        model_dump = getattr(message, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump()
+            if isinstance(dumped, dict):
+                value = dumped.get("reasoning_content")
+    if value is None:
+        return None
+    return value if isinstance(value, str) else str(value)
 
 
 def _content_text(content: Any) -> str:
@@ -225,12 +294,46 @@ def _content_text(content: Any) -> str:
 def _provider_failure_message(exc: BaseException, *, timeout: float) -> str:
     current: BaseException | None = exc
     seen: set[int] = set()
+    status_code: int | None = None
+    detail = ""
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if "timeout" in type(current).__name__.casefold():
             return f"模型提供方请求超时（单次读取超时 {timeout:g} 秒）"
+        if status_code is None:
+            raw_status = getattr(current, "status_code", None)
+            if not isinstance(raw_status, int):
+                response = getattr(current, "response", None)
+                raw_status = getattr(response, "status_code", None)
+            if isinstance(raw_status, int):
+                status_code = raw_status
+        if not detail:
+            detail = _provider_error_detail(current)
         current = current.__cause__ or current.__context__
-    return "模型提供方请求失败"
+    suffix: list[str] = []
+    if status_code is not None:
+        suffix.append(f"HTTP {status_code}")
+    if detail:
+        suffix.append(detail)
+    return "模型提供方请求失败" + (f"（{'；'.join(suffix)}）" if suffix else "")
+
+
+def _provider_error_detail(exc: BaseException) -> str:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error") if isinstance(body.get("error"), dict) else body
+        message = error.get("message") if isinstance(error, dict) else None
+        error_type = error.get("type") if isinstance(error, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        parts = [str(item).strip() for item in (error_type, code, message) if item]
+        if parts:
+            return _bounded_provider_detail(": ".join(parts))
+    return ""
+
+
+def _bounded_provider_detail(value: str) -> str:
+    compact = " ".join(str(value).split())
+    return compact if len(compact) <= 400 else compact[:397] + "..."
 
 
 def _tool_calls(raw_calls: Any) -> list[ToolCall]:

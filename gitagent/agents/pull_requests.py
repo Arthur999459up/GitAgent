@@ -28,7 +28,6 @@ from gitagent.domain.reviews import canonical_review_event, effective_review_eve
 from gitagent.harness.context import (
     capability_attempted,
     capability_failure_observed,
-    render_context_observations,
 )
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
@@ -257,20 +256,13 @@ class PullRequestAgent:
             )
             return
         try:
-            value = self.reasoner.complete_structured(
-                system=context.system_prompt,
-                prompt=_PROMPTS.render(
-                    "agents.pull_request_decide",
-                    goal=context.goal,
-                    entity=(
-                        f"{context.entity_type} #{context.entity_id}"
-                        if context.entity_id
-                        else "no concrete Pull Request or workflow run selected"
-                    ),
-                    guidance=guidance_section(context.guidance),
-                ),
+            value = context.reason_structured(
+                self.reasoner,
                 schema=_OPERATION_SCHEMA,
                 tool_name="select_pull_request_operation",
+            )
+            context.record_model_response(
+                value, tool_name="select_pull_request_operation"
             )
             operation = PullRequestOperation(str(value.get("operation", "")))
             review_event = str(value.get("review_event", ""))
@@ -292,30 +284,21 @@ class PullRequestAgent:
             review_event = ""
         context.operation = operation.value
         context.requested_outcome = review_event
+        context.complete_control_call(
+            {"operation": operation.value, "review_event": review_event}
+        )
 
     def _llm_decide_after_failure(self, context: AgentContext) -> AgentAction:
         if self.reasoner is None:
             raise WorkflowError("capability failure recovery requires a reasoner")
-        value = self.reasoner.complete_structured(
-            system=context.system_prompt,
-            prompt=_PROMPTS.render(
-                "agents.pull_request_recovery_decide",
-                goal=context.goal,
-                repository=context.repository,
-                entity=(
-                    f"Pull Request #{context.entity_id}"
-                    if context.entity_id
-                    else "no concrete Pull Request selected"
-                ),
-                operation=context.operation or "",
-                budget=str(max(0, context.max_steps - context.steps)),
-                guidance=guidance_section(context.guidance),
-                observations=render_context_observations(context),
-            ),
+        tools = self.harness.llm_tools(context)
+        value = context.reason_structured(
+            self.reasoner,
             schema=AGENT_ACTION_SCHEMA,
             tool_name="decide_action",
-            tools=self.harness.llm_tools(context),
+            tools=tools,
         )
+        context.record_model_response(value, tool_name="decide_action")
         if value.get("kind") == "capability":
             value["capability_id"] = self.harness.resolve_llm_name(
                 str(value.get("capability_id", "")),
@@ -724,8 +707,8 @@ class PullRequestAgent:
         comments = (self._last_capability(context, "github.get_pr_comments") or {}).get("comments", [])
         evidence = {"reviews": reviews, "comments": comments, **self._code_evidence(context)}
         if self.reasoner is not None:
-            value = self.reasoner.complete_structured(
-                system=context.system_prompt,
+            value = context.complete_structured(
+                self.reasoner,
                 prompt=_PROMPTS.render(
                     "agents.pull_request_dialogue",
                     request=context.goal,
@@ -774,8 +757,8 @@ class PullRequestAgent:
             if job.get("log_unavailable")
         ]
         if self.reasoner is not None:
-            value = self.reasoner.complete_structured(
-                system=context.system_prompt,
+            value = context.complete_structured(
+                self.reasoner,
                 prompt=_PROMPTS.render(
                     "agents.pull_request_ci",
                     request=context.goal,
@@ -960,8 +943,8 @@ class PullRequestAgent:
             return "没有找到符合当前条件的 Pull Request。"
         if self.reasoner is not None:
             evidence = [self._bounded_pull_request(item) for item in raw_pull_requests]
-            return self.reasoner.complete_text(
-                system=context.system_prompt,
+            return context.complete_text(
+                self.reasoner,
                 prompt=_PROMPTS.render(
                     "agents.pull_request_list_summarize",
                     request=context.goal,
@@ -986,8 +969,8 @@ class PullRequestAgent:
                 "changed_files": changed_files[:100],
                 "diff": diff[:20_000],
             }
-            return self.reasoner.complete_text(
-                system=context.system_prompt,
+            return context.complete_text(
+                self.reasoner,
                 prompt=_PROMPTS.render(
                     "agents.pull_request_detail_answer",
                     request=context.goal,

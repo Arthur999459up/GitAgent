@@ -20,7 +20,6 @@ from gitagent.domain.models import (
 from gitagent.harness.context import (
     capability_attempted,
     capability_failure_observed,
-    render_context_observations,
 )
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
@@ -274,21 +273,14 @@ class IssueAgent:
         )
 
     def _llm_decide(self, context: AgentContext) -> AgentAction:
-        value = self.reasoner.complete_structured(
-            system=context.system_prompt,
-            prompt=_PROMPTS.render(
-                "agents.issue_decide",
-                goal=context.goal,
-                repository=context.repository,
-                entity=f"Issue #{context.entity_id}" if context.entity_id else "no specific Issue selected",
-                observations=render_context_observations(context),
-                budget=str(max(0, context.max_steps - context.steps)),
-                guidance=guidance_section(context.guidance),
-            ),
+        tools = self.harness.llm_tools(context)
+        value = context.reason_structured(
+            self.reasoner,
             schema=_ISSUE_ACTION_SCHEMA,
             tool_name="decide_action",
-            tools=self.harness.llm_tools(context),
+            tools=tools,
         )
+        context.record_model_response(value, tool_name="decide_action")
         if value.get("kind") == "capability":
             value["capability_id"] = self.harness.resolve_llm_name(
                 str(value.get("capability_id", "")),
@@ -376,8 +368,8 @@ class IssueAgent:
             return "没有找到符合当前条件的 Issue。"
         if self.reasoner:
             evidence = [self._bounded_issue(issue) for issue in raw_issues]
-            return self.reasoner.complete_text(
-                system=context.system_prompt,
+            return context.complete_text(
+                self.reasoner,
                 prompt=_PROMPTS.render(
                     "agents.issue_list_summarize",
                     request=context.goal,
@@ -402,8 +394,8 @@ class IssueAgent:
                 "comments": self._bounded_comments(comments),
                 "repository_evidence": repository_evidence,
             }
-            return self.reasoner.complete_text(
-                system=context.system_prompt,
+            return context.complete_text(
+                self.reasoner,
                 prompt=_PROMPTS.render(
                     "agents.issue_detail_answer",
                     request=context.goal,
@@ -418,13 +410,16 @@ class IssueAgent:
     def _change_request(self, context: AgentContext, issue: dict[str, Any]) -> ChangeRequest:
         raw = issue.get("change_request") or {}
         if not raw and self.reasoner is not None:
-            raw = self.reasoner.complete_structured(
-                system=context.system_prompt,
-                prompt=_PROMPTS.render(
-                    "agents.issue_fix_guide",
-                    issue=json.dumps(self._bounded_issue(issue), ensure_ascii=False),
-                    observations=render_context_observations(context),
-                    guidance=guidance_section(context.guidance),
+            raw = context.complete_structured(
+                self.reasoner,
+                prompt=json.dumps(
+                    {
+                        "task": "Prepare a concrete Issue fix guide.",
+                        "issue": self._bounded_issue(issue),
+                        "evidence": _capability_evidence(context),
+                        "guidance": guidance_section(context.guidance),
+                    },
+                    ensure_ascii=False,
                 ),
                 schema={
                     "type": "object",
@@ -494,13 +489,16 @@ class IssueAgent:
         return ""
 
     def _draft_reply(self, context: AgentContext, reasoner: Reasoner) -> str:
-        return reasoner.complete_text(
-            system=context.system_prompt,
-            prompt=_PROMPTS.render(
-                "agents.issue_reply_draft",
-                request=context.goal,
-                evidence=render_context_observations(context),
-                guidance=guidance_section(context.guidance),
+        return context.complete_text(
+            reasoner,
+            prompt=json.dumps(
+                {
+                    "task": "Draft the requested Issue reply without publishing it.",
+                    "request": context.goal,
+                    "evidence": _capability_evidence(context),
+                    "guidance": guidance_section(context.guidance),
+                },
+                ensure_ascii=False,
             ),
         ).strip()
 
@@ -636,3 +634,11 @@ class IssueAgent:
             }
             for comment in comments[:30]
         ]
+
+
+def _capability_evidence(context: AgentContext) -> list[Any]:
+    return [
+        item.get("payload")
+        for item in context.observations
+        if item.get("kind") in {"capability", "capability_error"}
+    ]

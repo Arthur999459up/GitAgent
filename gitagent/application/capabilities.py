@@ -19,6 +19,7 @@ from gitagent.capability.providers import (
     context7_tool_definitions,
     github_tool_definitions,
 )
+from gitagent.harness.context import assistant_tool_call, tool_result_message
 from gitagent.infra.mcp import Context7Client
 from gitagent.memory import MemoryAccessTracker
 from gitagent.model import Reasoner
@@ -104,7 +105,26 @@ def _subagent_runner(layer: CapabilityLayer, reasoner: Reasoner) -> Any:
     def run(
         task: str, context: InvocationContext, effective: frozenset[str]
     ) -> dict[str, Any]:
-        observations: list[dict[str, Any]] = []
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a restricted coding sub-agent. Work only on the assigned task, use only the supplied "
+                    "capabilities, do not request GitHub mutation, and finish with a concise evidence-based summary. "
+                    "READ actions may execute directly when allowed by runtime policy. "
+                    "WRITE and DESTRUCTIVE actions require explicit user approval enforced by the runtime. "
+                    "After approval, the same agent executes the exact approved capability call. "
+                    "Never claim a mutation succeeded before observing a successful capability result."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"task": task, "repository": context.repository},
+                    ensure_ascii=False,
+                ),
+            },
+        ]
         discovered = [item for item in layer.discover(context) if item.id in effective]
         available_tools = [
             {
@@ -119,29 +139,22 @@ def _subagent_runner(layer: CapabilityLayer, reasoner: Reasoner) -> Any:
             if item.input_schema is not None
         ]
         for step in range(1, 21):
-            value = reasoner.complete_structured(
-                system=(
-                    "You are a restricted coding sub-agent. Work only on the assigned task, use only the supplied "
-                    "capabilities, do not request GitHub mutation, and finish with a concise evidence-based summary. "
-                    "READ actions may execute directly when allowed by runtime policy. "
-                    "WRITE and DESTRUCTIVE actions require explicit user approval enforced by the runtime. "
-                    "After approval, the same agent executes the exact approved capability call. "
-                    "Never claim a mutation succeeded before observing a successful capability result."
-                ),
-                prompt=json.dumps(
-                    {
-                        "task": task,
-                        "repository": context.repository,
-                        "observations": observations[-12:],
-                    },
-                    ensure_ascii=False,
-                    default=str,
-                ),
+            value = reasoner.complete_structured_messages(
+                messages=messages,
                 schema=schema,
                 tool_name="finish_subagent",
                 tools=available_tools,
             )
+            response_message = getattr(value, "assistant_message", None)
+            if not isinstance(response_message, dict):
+                response_message = assistant_tool_call(
+                    f"call-subagent-{step}", "finish_subagent", value
+                )
+            messages.append(response_message)
             if value.get("kind") != "capability":
+                call_id = str((response_message.get("tool_calls") or [{}])[0].get("id") or "")
+                if call_id:
+                    messages.append(tool_result_message(call_id, {"status": "finished"}))
                 return {"summary": str(value.get("message") or ""), "steps": step}
             supplied_id = str(value.get("capability_id") or "")
             capability_id = next(
@@ -154,19 +167,15 @@ def _subagent_runner(layer: CapabilityLayer, reasoner: Reasoner) -> Any:
             )
             arguments = dict(value.get("arguments") or {})
             result = layer.invoke(capability_id, arguments, context)
+            call_id = str((response_message.get("tool_calls") or [{}])[0].get("id") or "")
             if result.status == "success":
-                observations.append(
-                    {
-                        "capability_id": capability_id,
-                        "arguments": arguments,
-                        "content": result.content,
-                    }
-                )
+                messages.append(tool_result_message(call_id, result.content))
             else:
-                observations.append(
-                    {
+                messages.append(
+                    tool_result_message(
+                        call_id,
+                        {
                         "capability_id": capability_id,
-                        "arguments": arguments,
                         "error": result.error.type.value
                         if result.error is not None
                         else result.status,
@@ -177,12 +186,12 @@ def _subagent_runner(layer: CapabilityLayer, reasoner: Reasoner) -> Any:
                         if result.error is not None
                         else None,
                         "attempts": result.attempts,
-                    }
+                        },
+                    )
                 )
         return {
             "summary": "Sub-agent reached its 20-step limit.",
             "steps": 20,
-            "observations": observations[-4:],
         }
 
     return run

@@ -21,6 +21,7 @@ class AgentLoop:
             return context
         if context.waiting:
             raise WorkflowError("agent context is waiting for user input")
+        context.start_message_thread()
         self.dispatcher.emit(context, "started", context.goal)
         self._advance(context, agent)
         return context
@@ -28,6 +29,7 @@ class AgentLoop:
     def resume(self, context: Any, agent: AgentLoopAgent, decision: WorkflowTurnDecision) -> Any:
         if context.finished or context.error:
             raise WorkflowError("agent context is not waiting for user input")
+        context.start_message_thread()
         try:
             self.dispatcher.apply_user_decision(context, decision)
         except Exception as exc:  # noqa: BLE001 - loop boundary records programming failures
@@ -64,10 +66,12 @@ class AgentLoop:
                 return
 
     def _fail(self, context: Any, error: str) -> None:
+        context.complete_control_call({"status": "failed", "reason": str(error)})
         context.pending = None
         context.question = ""
         context.error = str(error)
         context.finished = True
+        context.append_message({"role": "assistant", "content": f"任务失败：{error}"})
         self.dispatcher.emit(context, "failed", str(error))
 
 
