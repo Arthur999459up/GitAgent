@@ -4,9 +4,20 @@ defaults:
 
 agents:
   main:
-    discover: []
+    discover:
+      - native.read
     invoke:
-      allow: []
+      allow:
+        - native.read
+      ask: []
+      deny: []
+
+  main_reflection:
+    discover:
+      - native.read
+    invoke:
+      allow:
+        - native.read
       ask: []
       deny: []
 
@@ -19,6 +30,7 @@ agents:
       - repository.get_file_history
       - context7.*
       - skill.debug
+      - native.read
     invoke:
       allow:
         - repository.get_repo_tree
@@ -28,6 +40,7 @@ agents:
         - repository.get_file_history
         - context7.*
         - skill.debug
+        - native.read
       ask:
         - github.commit_to_default_branch
       deny: []
@@ -50,6 +63,7 @@ agents:
       - github.set_issue_lock
       - context7.*
       - skill.debug
+      - native.read
     invoke:
       allow:
         - github.list_issues
@@ -64,6 +78,7 @@ agents:
         - repository.find_references
         - context7.*
         - skill.debug
+        - native.read
       ask:
         - github.post_comment
         - github.create_issue
@@ -93,6 +108,7 @@ agents:
       - context7.*
       - skill.code-review
       - skill.debug
+      - native.read
     invoke:
       allow:
         - github.list_pull_requests
@@ -108,6 +124,7 @@ agents:
         - context7.*
         - skill.code-review
         - skill.debug
+        - native.read
       ask:
         - github.post_review
         - github.commit

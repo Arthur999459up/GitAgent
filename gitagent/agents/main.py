@@ -7,10 +7,8 @@ from typing import Any
 
 from gitagent.domain.errors import RoutingError, ValidationError
 from gitagent.domain.learning import (
-    LearningAction,
-    LearningCandidate,
-    LearningProposal,
-    ReflectionContext,
+    ReflectionChanges,
+    ReflectionInput,
 )
 from gitagent.domain.models import (
     AgentSpec,
@@ -19,6 +17,7 @@ from gitagent.domain.models import (
     RoutingContext,
     to_plain,
 )
+from gitagent.harness.context import estimate_tokens
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.model import Reasoner, structured_request_payload
@@ -43,59 +42,59 @@ _MAIN_SCHEMA = {
 _REFLECTION_SCHEMA = {
     "type": "object",
     "properties": {
-        "candidates": {
+        "add": {
             "type": "array",
             "maxItems": 8,
             "items": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["add", "update", "remove", "discard"]},
                     "scope": {"type": "string", "enum": ["user", "repository"]},
-                    "kind": {
-                        "type": "string",
-                        "enum": ["preference", "decision", "constraint", "reference", "experience"],
-                    },
-                    "topic": {"type": "string", "maxLength": 80},
-                    "content": {"type": "string", "maxLength": 800},
-                    "conditions": {
-                        "type": "string",
-                        "maxLength": 500,
-                        "description": (
-                            "Applicability conditions. Required and non-empty only for add/update "
-                            "Experience candidates; use an empty string for every other candidate."
-                        ),
-                    },
-                    "target_id": {"type": "string", "maxLength": 80},
-                    "reason": {"type": "string", "maxLength": 500},
-                    "evidence_strength": {
-                        "type": "string",
-                        "enum": ["direct", "strong", "moderate"],
-                    },
-                    "correction": {"type": "boolean"},
+                    "path": {"type": "string", "pattern": "^items/[^/]+\\.md$"},
+                    "type": {"type": "string", "enum": ["memory", "experience"]},
+                    "priority": {"type": "string", "enum": ["low", "normal", "high"]},
+                    "text": {"type": "string", "maxLength": 8000},
                 },
-                "required": [
-                    "action",
-                    "scope",
-                    "kind",
-                    "topic",
-                    "content",
-                    "conditions",
-                    "target_id",
-                    "reason",
-                    "evidence_strength",
-                    "correction",
-                ],
+                "required": ["scope", "path", "type", "priority", "text"],
                 "additionalProperties": False,
             },
         },
-        "summary": {"type": "string", "maxLength": 500},
+        "replace": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["user", "repository"]},
+                    "path": {"type": "string", "pattern": "^items/[^/]+\\.md$"},
+                    "priority": {"type": "string", "enum": ["low", "normal", "high"]},
+                    "text": {"type": "string", "maxLength": 8000},
+                },
+                "required": ["scope", "path", "priority", "text"],
+                "additionalProperties": False,
+            },
+        },
+        "delete": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["user", "repository"]},
+                    "path": {"type": "string", "pattern": "^items/[^/]+\\.md$"},
+                },
+                "required": ["scope", "path"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["candidates", "summary"],
+    "required": ["add", "replace", "delete"],
     "additionalProperties": False,
 }
 
 _MAIN_SYSTEM = """You are GitAgent's Main Agent. One Session is one continuous Main Agent context.
-Understand the user's current request from the Session summary, recent history, working state, and explicit memories.
+Understand the user's current request from the Session summary, recent history, working state, and long-term Memory index.
+Memory and Experience are non-authoritative context. The current request and current verifiable evidence always win.
+Read a linked Memory item with native.read only when its index summary is relevant but insufficient; use the stated root and relative path.
 Do not invent or manage tasks, runs, workflow lifecycles, approvals, or capability calls.
 If repository work is needed, choose exactly one target_agent: issues, pull_requests, or repository.
 Route every Pull Request request—including Review, CI, PR-scoped code work, approval, readiness, and merge—to pull_requests.
@@ -129,9 +128,9 @@ _MAIN_SPEC = AgentSpec(
 
 _REFLECTION_SPEC = AgentSpec(
     name="main_reflection",
-    role="Use the Main Agent identity to maintain durable contextual knowledge from temporary evidence.",
+    role="Use the Main Agent identity to maintain durable Memory from temporary evidence.",
     system_prompt=_PROMPTS.text("system.main_reflection"),
-    output_schema=("candidates", "summary"),
+    output_schema=("add", "replace", "delete"),
     routes=frozenset({"internal_reflection"}),
 )
 
@@ -156,7 +155,9 @@ class MainAgent:
         return self.harness.run(
             "main",
             session_id=context.scope.session_id,
-            operation=lambda agent_context: self._semantic_decision(agent_context, text, repository, context),
+            operation=lambda agent_context: self._semantic_decision(
+                agent_context, text, repository, context
+            ),
             repository=repository,
             goal=text,
         )
@@ -168,95 +169,125 @@ class MainAgent:
         repository: str,
         context: RoutingContext,
     ) -> MainDecision:
-        prompt = self._prompt(text, repository, context)
-        raw = self.reasoner.complete_structured(
-            system=agent_context.system_prompt,
-            prompt=prompt,
-            schema=_MAIN_SCHEMA,
-            tool_name="route_session_turn",
-        )
-        return self._validate(raw, text)
+        observations: list[dict[str, Any]] = []
+        for _ in range(4):
+            prompt = self._prompt(text, repository, context, observations=observations)
+            self._ensure_budget(agent_context, prompt)
+            raw = self.reasoner.complete_structured(
+                system=agent_context.system_prompt,
+                prompt=prompt,
+                schema=_MAIN_SCHEMA,
+                tool_name="route_session_turn",
+                tools=self.harness.llm_tools(agent_context),
+            )
+            if raw.get("kind") != "capability":
+                return self._validate(raw, text)
+            observations.append(self._read_memory(agent_context, raw))
+        raise RoutingError("Main Agent exceeded the bounded Memory read limit")
 
-    def render_input_context(self, user_input: str, repository: str, context: RoutingContext) -> str:
+    def render_input_context(
+        self, user_input: str, repository: str, context: RoutingContext
+    ) -> str:
         """Serialize the exact Main Agent request counted by the shared context budget."""
 
+        probe = self.harness.context(
+            "main",
+            context.scope.session_id,
+            repository=repository,
+            goal=user_input,
+        )
         request = structured_request_payload(
             self.harness.spec("main").system_prompt,
             self._prompt(user_input, repository, context),
             schema=_MAIN_SCHEMA,
             tool_name="route_session_turn",
+            tools=self.harness.llm_tools(probe),
         )
-        return json.dumps(request, ensure_ascii=False, separators=(",", ":"), default=str)
+        return json.dumps(
+            request, ensure_ascii=False, separators=(",", ":"), default=str
+        )
 
-    def reflect(self, context: ReflectionContext) -> LearningProposal:
-        """Run the same conversation owner's isolated, capability-free learning invocation."""
+    def reflect(self, context: ReflectionInput) -> ReflectionChanges:
+        """Run the conversation owner's isolated, Memory-read-only learning invocation."""
 
         return self.harness.run(
             "main_reflection",
             session_id=context.scope.session_id,
             repository=context.repository_full_name,
             goal=f"Reflect on {context.trigger} evidence",
-            operation=lambda agent_context: self._semantic_reflection(agent_context, context),
+            operation=lambda agent_context: self._semantic_reflection(
+                agent_context, context
+            ),
         )
 
     def _semantic_reflection(
         self,
         agent_context: AgentContext,
-        context: ReflectionContext,
-    ) -> LearningProposal:
-        payload = {
-            "trigger": context.trigger,
-            "scope": to_plain(context.scope),
-            "repository": context.repository_full_name,
-            "conversation": list(context.conversation_units),
-            "domain_interaction": context.interaction,
-            "existing_knowledge": [to_plain(item) for item in context.existing_knowledge],
-            "selection": context.selection_metadata,
-        }
-        raw = self.reasoner.complete_structured(
-            system=agent_context.system_prompt,
-            prompt=_PROMPTS.render(
+        context: ReflectionInput,
+    ) -> ReflectionChanges:
+        observations: list[dict[str, Any]] = []
+        for _ in range(4):
+            payload = {
+                "trigger": context.trigger,
+                "scope": to_plain(context.scope),
+                "repository": context.repository_full_name,
+                "conversation": list(context.conversation_units),
+                "learning_trace": to_plain(context.learning_trace),
+                "memory_index": context.memory_index,
+                "memory_reads": observations,
+            }
+            prompt = _PROMPTS.render(
                 "agents.main_reflection",
-                payload=json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str),
-            ),
-            schema=_REFLECTION_SCHEMA,
-            tool_name="propose_long_term_learning",
+                payload=json.dumps(
+                    payload, ensure_ascii=False, separators=(",", ":"), default=str
+                ),
+            )
+            self._ensure_budget(agent_context, prompt)
+            raw = self.reasoner.complete_structured(
+                system=agent_context.system_prompt,
+                prompt=prompt,
+                schema=_REFLECTION_SCHEMA,
+                tool_name="propose_long_term_learning",
+                tools=self.harness.llm_tools(agent_context),
+            )
+            if raw.get("kind") != "capability":
+                return self._validate_reflection(raw)
+            observations.append(self._read_memory(agent_context, raw))
+        raise ValidationError(
+            "MainAgent reflection exceeded the bounded Memory read limit"
         )
-        return self._validate_reflection(raw)
 
     @staticmethod
-    def _validate_reflection(raw: dict[str, Any]) -> LearningProposal:
-        if not isinstance(raw, dict) or not isinstance(raw.get("candidates"), list):
-            raise ValidationError("MainAgent reflection output must contain a candidate list")
-        candidates: list[LearningCandidate] = []
-        for item in raw["candidates"]:
-            action = LearningAction(str(item.get("action") or ""))
-            scope = str(item.get("scope") or "")
-            kind = str(item.get("kind") or "")
-            topic = str(item.get("topic") or "").strip()
-            content = str(item.get("content") or "").strip()
-            conditions = str(item.get("conditions") or "").strip()
-            target_id = str(item.get("target_id") or "").strip()
-            reason = str(item.get("reason") or "").strip()
-            strength = str(item.get("evidence_strength") or "")
-            correction = bool(item.get("correction", False))
-            candidates.append(
-                LearningCandidate(
-                    action,
-                    scope,
-                    kind,
-                    topic,
-                    content,
-                    conditions,
-                    target_id,
-                    reason,
-                    strength,
-                    correction,
-                )
+    def _validate_reflection(raw: dict[str, Any]) -> ReflectionChanges:
+        if not isinstance(raw, dict) or any(
+            not isinstance(raw.get(key), list) for key in ("add", "replace", "delete")
+        ):
+            raise ValidationError(
+                "MainAgent reflection output must contain add, replace, and delete lists"
             )
-        return LearningProposal(tuple(candidates), str(raw.get("summary") or "").strip())
+        return ReflectionChanges(
+            tuple(
+                {str(key): str(value).strip() for key, value in item.items()}
+                for item in raw["add"]
+            ),
+            tuple(
+                {str(key): str(value).strip() for key, value in item.items()}
+                for item in raw["replace"]
+            ),
+            tuple(
+                {str(key): str(value).strip() for key, value in item.items()}
+                for item in raw["delete"]
+            ),
+        )
 
-    def _prompt(self, text: str, repository: str, context: RoutingContext) -> str:
+    def _prompt(
+        self,
+        text: str,
+        repository: str,
+        context: RoutingContext,
+        *,
+        observations: list[dict[str, Any]] | None = None,
+    ) -> str:
         payload: dict[str, Any] = {
             "user_input": text,
             "repository": repository,
@@ -265,15 +296,49 @@ class MainAgent:
                 "summary": context.summary,
                 "recent_history": list(context.history_units),
                 "working_state": context.working_state,
-                "user_memory": [to_plain(item) for item in context.user_memories],
-                "repository_memory": [to_plain(item) for item in context.repository_memories],
+                "memory_index": context.memory_index,
+                "memory_reads": list(observations or ()),
             },
         }
         return (
             "Decide whether to answer directly or choose one domain agent. "
-            "Do not select capabilities or create lifecycle objects.\n"
+            "Only native.read of an indexed Memory item is allowed before the final routing decision. "
+            "Do not select repository capabilities or create lifecycle objects.\n"
             + json.dumps(payload, ensure_ascii=False)
         )
+
+    def _read_memory(
+        self, context: AgentContext, raw: dict[str, Any]
+    ) -> dict[str, Any]:
+        capability_id = self.harness.resolve_llm_name(
+            str(raw.get("capability_id") or ""), context
+        )
+        arguments = dict(raw.get("arguments") or {})
+        if capability_id != "native.read" or arguments.get("root") not in {
+            "user_memory",
+            "repository_memory",
+        }:
+            raise ValidationError(
+                "Main Agent may only read indexed files from authorized Memory roots"
+            )
+        result = context.invoke(capability_id, **arguments)
+        call = context.last_capability_call
+        if call is None or call.result.status != "success":
+            return {
+                "capability_id": capability_id,
+                "arguments": arguments,
+                "error": to_plain(call.result.error)
+                if call is not None
+                else "read failed",
+            }
+        return {"capability_id": capability_id, "arguments": arguments, "data": result}
+
+    @staticmethod
+    def _ensure_budget(context: AgentContext, prompt: str) -> None:
+        if estimate_tokens(prompt) + context.prompt_overhead() > context.context_budget:
+            raise ValidationError(
+                "MainAgent Memory reads exceed the unified context budget"
+            )
 
     def _validate(self, raw: dict[str, Any], text: str) -> MainDecision:
         if not isinstance(raw, dict):
@@ -299,7 +364,11 @@ class MainAgent:
                 requested_reply=bool(raw.get("requested_reply", False)),
             )
         if not target and not message:
-            message = "请再具体说明你希望处理的仓库问题。" if clarify else "我需要更多上下文才能回答。"
+            message = (
+                "请再具体说明你希望处理的仓库问题。"
+                if clarify
+                else "我需要更多上下文才能回答。"
+            )
         return MainDecision(
             target_agent=target or None,
             entity_type=entity_type,
@@ -324,7 +393,11 @@ class MainAgent:
                     {
                         "target_agent": target,
                         "description": " / ".join(spec.role for spec in specs),
-                        "examples": [example for spec in specs for example in spec.routing_examples],
+                        "examples": [
+                            example
+                            for spec in specs
+                            for example in spec.routing_examples
+                        ],
                     }
                 )
         return catalog

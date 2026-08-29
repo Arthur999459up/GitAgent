@@ -51,7 +51,6 @@ class AgentContext:
         self._harness = harness
         self.spec = spec
         self.run_id = f"run-{uuid.uuid4().hex}"
-        self.interaction_id = ""
         self.origin_turn_seq = 0
         self.session_id = session_id
         self.repository = repository
@@ -99,7 +98,9 @@ class AgentContext:
     def context_budget(self) -> int:
         return self._harness.context_budget
 
-    def invoke(self, capability_id: str, *, approval_id: str | None = None, **arguments: Any) -> Any:
+    def invoke(
+        self, capability_id: str, *, approval_id: str | None = None, **arguments: Any
+    ) -> Any:
         self.last_capability_call = None
         try:
             prepared = self.file_reads.prepare(
@@ -109,10 +110,14 @@ class AgentContext:
             )
         except ValidationError:
             prepared = None
-        actual_arguments = prepared.actual_arguments if prepared is not None else dict(arguments)
+        actual_arguments = (
+            prepared.actual_arguments if prepared is not None else dict(arguments)
+        )
         if actual_arguments is None:
             content, observation_data = self.file_reads.complete(prepared, None)
-            result = CapabilityResult(capability_id, "success", "data", content, attempts=0)
+            result = CapabilityResult(
+                capability_id, "success", "data", content, attempts=0
+            )
             self.last_capability_call = CapabilityCallRecord(
                 dict(arguments), observation_data, result, cached=True, covered=True
             )
@@ -123,9 +128,16 @@ class AgentContext:
             None,
         )
         cache_key = json.dumps(
-            [capability_id, actual_arguments], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            [capability_id, actual_arguments],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
-        cacheable = capability is not None and capability.access == AccessLevel.READ and prepared is None
+        cacheable = (
+            capability is not None
+            and capability.access == AccessLevel.READ
+            and prepared is None
+        )
         cached = cacheable and cache_key in self.read_cache
         if cached:
             cached_result = self.read_cache[cache_key]
@@ -156,7 +168,11 @@ class AgentContext:
         else:
             content = raw_result
             observation_data = (
-                {"already_observed": True, "capability_id": capability_id, "arguments": actual_arguments}
+                {
+                    "already_observed": True,
+                    "capability_id": capability_id,
+                    "arguments": actual_arguments,
+                }
                 if cached
                 else raw_result
             )

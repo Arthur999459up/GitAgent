@@ -54,20 +54,6 @@ _AGENT_NAMES = {
     "static_verifier": "Static Verifier",
 }
 
-_KNOWLEDGE_KIND_NAMES = {
-    "preference": "偏好",
-    "decision": "决策",
-    "constraint": "约束",
-    "reference": "参考",
-    "experience": "经验",
-}
-
-_KNOWLEDGE_ACTIONS = {
-    "add": ("+", "新增", "green"),
-    "update": ("~", "更新", "cyan"),
-    "remove": ("-", "移除", "yellow"),
-}
-
 
 class TerminalUI:
     """Small presentation layer: concise by default, complete trace on demand."""
@@ -88,7 +74,14 @@ class TerminalUI:
             )
         )
 
-    def markdown(self, content: str, *, title: str, kind: str = "agent", subtitle: str | None = None) -> None:
+    def markdown(
+        self,
+        content: str,
+        *,
+        title: str,
+        kind: str = "agent",
+        subtitle: str | None = None,
+    ) -> None:
         self.console.print(
             Panel(
                 Markdown(content or "_无内容_"),
@@ -102,7 +95,14 @@ class TerminalUI:
             )
         )
 
-    def text(self, content: str, *, title: str, kind: str = "info", subtitle: str | None = None) -> None:
+    def text(
+        self,
+        content: str,
+        *,
+        title: str,
+        kind: str = "info",
+        subtitle: str | None = None,
+    ) -> None:
         self.console.print(
             Panel(
                 Text(content),
@@ -148,7 +148,10 @@ class TerminalUI:
             return
         if event.category == TraceCategory.CAPABILITY:
             capability_event = str(event.details.get("event") or "")
-            if capability_event and capability_event not in {"call.started", "call.failed"}:
+            if capability_event and capability_event not in {
+                "call.started",
+                "call.failed",
+            }:
                 return
 
         symbol, status_style = _STATUS_STYLES[event.status]
@@ -160,16 +163,22 @@ class TerminalUI:
             }[event.category]
         line = Text("  ")
         line.append(f"{symbol} ", style=f"bold {status_style}")
-        line.append(_display_name(event), style="bold" if event.category == TraceCategory.AGENT else "default")
+        line.append(
+            _display_name(event),
+            style="bold" if event.category == TraceCategory.AGENT else "default",
+        )
 
         if event.status == TraceStatus.STARTED:
             arguments = event.details.get("arguments")
-            if event.category == TraceCategory.CAPABILITY and isinstance(arguments, dict):
+            if event.category == TraceCategory.CAPABILITY and isinstance(
+                arguments, dict
+            ):
                 summary = _compact_arguments(arguments)
                 if summary:
                     line.append(f"  {summary}", style="dim")
         elif event.message and not (
-            event.category == TraceCategory.AGENT and event.status == TraceStatus.WAITING
+            event.category == TraceCategory.AGENT
+            and event.status == TraceStatus.WAITING
         ):
             line.append(f"  {_single_line(event.message, 140)}", style=status_style)
 
@@ -177,15 +186,20 @@ class TerminalUI:
 
     def _learning_result(self, event: TraceEvent) -> None:
         details = event.details
-        changes = details.get("changes")
-        if not isinstance(changes, list):
-            changes = []
-        if not changes:
+        added = details.get("added") if isinstance(details.get("added"), list) else []
+        replaced = (
+            details.get("replaced") if isinstance(details.get("replaced"), list) else []
+        )
+        deleted = (
+            details.get("deleted") if isinstance(details.get("deleted"), list) else []
+        )
+        if not (added or replaced or deleted):
             reason = str(details.get("reason") or "")
-            message = {
-                "no_candidates": "未发现值得保存的长期知识",
-                "all_candidates_skipped": "候选未通过持久化规则，未写入",
-            }.get(reason, "本轮没有写入长期知识")
+            message = (
+                "未发现值得保存的长期内容"
+                if reason == "no_changes"
+                else "本轮没有写入长期 Memory"
+            )
             line = Text("  ")
             line.append("◇ ", style="bold dim")
             line.append("长期学习", style="bold")
@@ -193,15 +207,12 @@ class TerminalUI:
             self.console.print(line)
             return
 
-        added = int(details.get("added") or 0)
-        updated = int(details.get("updated") or 0)
-        removed = int(details.get("removed") or 0)
         counts = " · ".join(
             label
             for count, label in (
-                (added, f"新增 {added}"),
-                (updated, f"更新 {updated}"),
-                (removed, f"移除 {removed}"),
+                (len(added), f"新增 {len(added)}"),
+                (len(replaced), f"替换 {len(replaced)}"),
+                (len(deleted), f"删除 {len(deleted)}"),
             )
             if count
         )
@@ -210,27 +221,17 @@ class TerminalUI:
         header.append("长期学习", style="bold")
         header.append(f"  {counts}", style="green")
         self.console.print(header)
-        for change in changes:
-            if not isinstance(change, dict):
-                continue
-            action = str(change.get("action") or "")
-            symbol, action_name, style = _KNOWLEDGE_ACTIONS.get(action, ("·", "写入", "cyan"))
-            kind = _KNOWLEDGE_KIND_NAMES.get(
-                str(change.get("kind") or ""),
-                str(change.get("kind") or "长期知识"),
-            )
-            topic = _single_line(str(change.get("topic") or ""), 36)
-            content = _single_line(str(change.get("content") or ""), 120)
-            conditions = _single_line(str(change.get("conditions") or ""), 72)
-            line = Text("    ")
-            line.append(f"{symbol} ", style=f"bold {style}")
-            line.append(f"{action_name}{kind}", style=style)
-            if topic:
-                line.append(f" · {topic}", style="dim")
-            line.append(f"：{content}")
-            if conditions:
-                line.append(f"（适用：{conditions}）", style="dim")
-            self.console.print(line)
+        for paths, symbol, action_name, style in (
+            (added, "+", "新增", "green"),
+            (replaced, "~", "替换", "cyan"),
+            (deleted, "-", "删除", "yellow"),
+        ):
+            for path in paths:
+                line = Text("    ")
+                line.append(f"{symbol} ", style=f"bold {style}")
+                line.append(f"{action_name} Memory", style=style)
+                line.append(f"：{_single_line(str(path), 120)}")
+                self.console.print(line)
 
     def trace_history(self, events: list[TraceEvent]) -> None:
         """Render the complete audit-friendly trace, including ids/arguments/durations."""
@@ -250,12 +251,16 @@ class TerminalUI:
         for event in events:
             self._trace_verbose(event)
 
-    def debug_history(self, events: list[TraceEvent], *, session_id: str, agent: str | None = None) -> None:
+    def debug_history(
+        self, events: list[TraceEvent], *, session_id: str, agent: str | None = None
+    ) -> None:
         """Render bounded developer history without feeding it back into any agent context."""
 
         if not events:
             target = f"Agent {agent}" if agent else "当前 Session"
-            self.text(f"{target} 没有可用的进程内 Debug History。", title="Debug", kind="info")
+            self.text(
+                f"{target} 没有可用的进程内 Debug History。", title="Debug", kind="info"
+            )
             return
         suffix = f" · agent={agent}" if agent else ""
         self.console.print(
@@ -271,12 +276,20 @@ class TerminalUI:
         )
         for index, event in enumerate(events, 1):
             payload = _debug_payload(event)
-            timestamp = event.timestamp[11:19] if len(event.timestamp) >= 19 else event.timestamp
+            timestamp = (
+                event.timestamp[11:19]
+                if len(event.timestamp) >= 19
+                else event.timestamp
+            )
             label = _TRACE_LABELS[event.category][0]
             title = f"{index:03d} · {timestamp} · {label} · {event.name} · {event.status.value}"
             self.console.print(
                 Panel(
-                    Syntax(json.dumps(payload, ensure_ascii=False, indent=2), "json", word_wrap=True),
+                    Syntax(
+                        json.dumps(payload, ensure_ascii=False, indent=2),
+                        "json",
+                        word_wrap=True,
+                    ),
                     title=title,
                     title_align="left",
                     border_style="dim",
@@ -317,13 +330,23 @@ def _debug_payload(event: TraceEvent) -> dict[str, Any]:
     if event.duration_ms is not None:
         payload["duration_ms"] = round(event.duration_ms, 2)
     if event.category == TraceCategory.AGENT:
-        for key in ("debug_event", "step", "decision", "context", "result", "error", "output_type"):
+        for key in (
+            "debug_event",
+            "step",
+            "decision",
+            "context",
+            "result",
+            "error",
+            "output_type",
+        ):
             if key in details:
                 payload[key] = details[key]
         return payload
     if event.category == TraceCategory.CAPABILITY:
         payload["agent"] = details.get("agent")
-        payload["arguments"] = details.get("debug_arguments", details.get("arguments", {}))
+        payload["arguments"] = details.get(
+            "debug_arguments", details.get("arguments", {})
+        )
         for key in ("classification", "result", "error"):
             if key in details:
                 payload[key] = details[key]

@@ -10,6 +10,7 @@ from pathlib import Path
 # Capture this before dotenv loading. Repository-controlled .env files must never
 # select the persistent state location.
 _STARTUP_STATE_PATH = os.environ.get("GITAGENT_STATE_PATH")
+_STARTUP_MEMORY_PATH = os.environ.get("GITAGENT_MEMORY_PATH")
 # Same pre-dotenv stance for the prompt directory: a repository-controlled .env
 # must never redirect which prompts are loaded (mirrors prompts/library.py).
 _STARTUP_PROMPTS_DIR = os.environ.get("GITAGENT_PROMPTS_DIR")
@@ -20,6 +21,8 @@ _DEFAULT_REQUEST_TIMEOUT = 30.0
 # fail before it can return a candidate patch.
 _DEFAULT_LLM_TIMEOUT = 300.0
 _DEFAULT_MAX_TOKENS = 16_384
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_MEMORY_PATH = _PROJECT_ROOT / ".gitagent" / "memory"
 
 
 def _load_dotenv() -> None:
@@ -45,6 +48,7 @@ class CLIConfig:
     llm_timeout: float | None = None
     github_timeout: float | None = None
     state_path: str = str(Path.home() / ".gitagent" / "state.db")
+    memory_path: str = str(_DEFAULT_MEMORY_PATH)
     prompts_dir: str | None = None
     context_window_tokens: int = 32768
     context_safety_tokens: int = 2048
@@ -52,7 +56,12 @@ class CLIConfig:
 
     @property
     def effective_input_budget(self) -> int:
-        return self.context_window_tokens - self.max_tokens - self.context_safety_tokens - 512
+        return (
+            self.context_window_tokens
+            - self.max_tokens
+            - self.context_safety_tokens
+            - 512
+        )
 
     @property
     def effective_llm_timeout(self) -> float:
@@ -60,7 +69,9 @@ class CLIConfig:
 
     @property
     def effective_github_timeout(self) -> float:
-        return self.request_timeout if self.github_timeout is None else self.github_timeout
+        return (
+            self.request_timeout if self.github_timeout is None else self.github_timeout
+        )
 
     def validate(self) -> None:
         for name, value in (
@@ -68,9 +79,18 @@ class CLIConfig:
             ("GITAGENT_LLM_TIMEOUT", self.effective_llm_timeout),
             ("GITAGENT_GITHUB_TIMEOUT", self.effective_github_timeout),
         ):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
                 raise ValueError(f"{name} 必须为正数")
-        if not isinstance(self.max_tokens, int) or isinstance(self.max_tokens, bool) or self.max_tokens < 1:
+        if (
+            not isinstance(self.max_tokens, int)
+            or isinstance(self.max_tokens, bool)
+            or self.max_tokens < 1
+        ):
             raise ValueError("GITAGENT_MAX_TOKENS 必须为正整数")
         if (
             not isinstance(self.context_window_tokens, int)
@@ -88,6 +108,8 @@ class CLIConfig:
             )
         if self.prompts_dir is not None and not Path(self.prompts_dir).is_dir():
             raise ValueError(f"GITAGENT_PROMPTS_DIR 不是有效目录: {self.prompts_dir}")
+        if not Path(self.memory_path).expanduser().is_absolute():
+            raise ValueError("GITAGENT_MEMORY_PATH 必须是绝对路径")
         if not isinstance(self.auto_learning, bool):
             raise TypeError("GITAGENT_AUTO_LEARNING 必须为布尔值")
 
@@ -95,7 +117,9 @@ class CLIConfig:
     def from_env(cls) -> CLIConfig:
         _load_dotenv()
         legacy_timeout_is_set = "GITAGENT_REQUEST_TIMEOUT" in os.environ
-        legacy_timeout = float(os.getenv("GITAGENT_REQUEST_TIMEOUT", str(_DEFAULT_REQUEST_TIMEOUT)))
+        legacy_timeout = float(
+            os.getenv("GITAGENT_REQUEST_TIMEOUT", str(_DEFAULT_REQUEST_TIMEOUT))
+        )
         if "GITAGENT_LLM_TIMEOUT" in os.environ:
             llm_timeout = float(os.environ["GITAGENT_LLM_TIMEOUT"])
         elif legacy_timeout_is_set:
@@ -107,23 +131,36 @@ class CLIConfig:
         config = cls(
             model=os.getenv("GITAGENT_MODEL") or "gpt-5.4-mini",
             api_key=(
-                os.getenv("GITAGENT_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or ""
+                os.getenv("GITAGENT_API_KEY")
+                or os.getenv("OPENAI_API_KEY")
+                or os.getenv("DEEPSEEK_API_KEY")
+                or ""
             ),
             base_url=os.getenv("GITAGENT_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
             provider=os.getenv("GITAGENT_PROVIDER") or "openai",
             github_token=os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or "",
-            github_api_url=os.getenv("GITHUB_API_URL", "https://api.github.com").rstrip("/"),
+            github_api_url=os.getenv("GITHUB_API_URL", "https://api.github.com").rstrip(
+                "/"
+            ),
             temperature=float(os.getenv("GITAGENT_TEMPERATURE", "0")),
             max_tokens=int(os.getenv("GITAGENT_MAX_TOKENS", str(_DEFAULT_MAX_TOKENS))),
             request_timeout=legacy_timeout,
             llm_timeout=llm_timeout,
             github_timeout=(
-                float(os.environ["GITAGENT_GITHUB_TIMEOUT"]) if "GITAGENT_GITHUB_TIMEOUT" in os.environ else None
+                float(os.environ["GITAGENT_GITHUB_TIMEOUT"])
+                if "GITAGENT_GITHUB_TIMEOUT" in os.environ
+                else None
             ),
-            state_path=_STARTUP_STATE_PATH or str(Path.home() / ".gitagent" / "state.db"),
+            state_path=_STARTUP_STATE_PATH
+            or str(Path.home() / ".gitagent" / "state.db"),
+            memory_path=_STARTUP_MEMORY_PATH or str(_DEFAULT_MEMORY_PATH),
             prompts_dir=_STARTUP_PROMPTS_DIR,
-            context_window_tokens=int(os.getenv("GITAGENT_CONTEXT_WINDOW_TOKENS", "32768")),
-            context_safety_tokens=int(os.getenv("GITAGENT_CONTEXT_SAFETY_TOKENS", "2048")),
+            context_window_tokens=int(
+                os.getenv("GITAGENT_CONTEXT_WINDOW_TOKENS", "32768")
+            ),
+            context_safety_tokens=int(
+                os.getenv("GITAGENT_CONTEXT_SAFETY_TOKENS", "2048")
+            ),
             auto_learning=_environment_boolean("GITAGENT_AUTO_LEARNING", default=True),
         )
         config.validate()

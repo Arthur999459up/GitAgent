@@ -45,11 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="安全、可审计的个人 GitHub 仓库维护助手。",
     )
     parser.add_argument("-m", "--model", help="模型名称，覆盖 GITAGENT_MODEL")
-    parser.add_argument("--base-url", help="OpenAI 兼容 API 地址，覆盖 GITAGENT_BASE_URL / OPENAI_BASE_URL")
+    parser.add_argument(
+        "--base-url",
+        help="OpenAI 兼容 API 地址，覆盖 GITAGENT_BASE_URL / OPENAI_BASE_URL",
+    )
     parser.add_argument("--api-key", help="模型 API Key；省略时启动后隐藏输入")
     parser.add_argument("--provider", choices=["openai", "litellm"], help="模型后端")
     parser.add_argument("--github-token", help="GitHub Token；省略时启动后隐藏输入")
-    parser.add_argument("--github-api-url", help="GitHub API 地址，GitHub Enterprise 可覆盖")
+    parser.add_argument(
+        "--github-api-url", help="GitHub API 地址，GitHub Enterprise 可覆盖"
+    )
     parser.add_argument("-v", "--version", action="version", version="gitagent 0.1.0")
     return parser
 
@@ -93,14 +98,22 @@ def _config_from_args(args: argparse.Namespace) -> CLIConfig:
 def _collect_credentials(config: CLIConfig) -> bool:
     """缺少凭据时在终端安全读取，不强制用户预先配置环境变量。"""
     if not config.github_token:
-        config.github_token = terminal_prompt("GitHub Token > ", is_password=True).strip()
+        config.github_token = terminal_prompt(
+            "GitHub Token > ", is_password=True
+        ).strip()
     if not config.github_token:
-        ui.text("需要 GitHub Token 才能读取并选择仓库。", title="Credentials", kind="approval")
+        ui.text(
+            "需要 GitHub Token 才能读取并选择仓库。",
+            title="Credentials",
+            kind="approval",
+        )
         return False
     if not config.api_key:
         config.api_key = terminal_prompt("模型 API Key > ", is_password=True).strip()
     if not config.api_key:
-        ui.text("需要模型 API Key 才能启动仓库助手。", title="Credentials", kind="approval")
+        ui.text(
+            "需要模型 API Key 才能启动仓库助手。", title="Credentials", kind="approval"
+        )
         return False
     return True
 
@@ -118,7 +131,9 @@ def _select_startup_session(application: LiveApplication) -> bool:
     while True:
         sessions = application.list_account_sessions(authenticated_user_id)
         _show_sessions(sessions, active_session_id=None, title=f"@{login} Sessions")
-        choice = terminal_prompt("操作：[编号] 恢复  [n] 新建  [d 编号] 删除  [q] 退出\n> ").strip()
+        choice = terminal_prompt(
+            "操作：[编号] 恢复  [n] 新建  [d 编号] 删除  [q] 退出\n> "
+        ).strip()
         normalized = choice.casefold()
         if normalized in {"q", "quit", "exit", "/quit", "/exit"}:
             return False
@@ -129,7 +144,9 @@ def _select_startup_session(application: LiveApplication) -> bool:
         if delete_reference is not None:
             try:
                 target = _session_from_number(sessions, delete_reference)
-                application.delete_account_session(authenticated_user_id, target.session_id)
+                application.delete_account_session(
+                    authenticated_user_id, target.session_id
+                )
                 console.print(f"已删除 Session [cyan]{target.session_id}[/cyan]。")
             except (GitAgentError, ValueError) as exc:
                 console.print(f"[red]Session 删除失败：{exc}[/red]")
@@ -137,7 +154,9 @@ def _select_startup_session(application: LiveApplication) -> bool:
 
         try:
             target = _session_from_number(sessions, choice)
-            resumed = application.resume_session(authenticated_user_id, target.session_id)
+            resumed = application.resume_session(
+                authenticated_user_id, target.session_id
+            )
         except (GitAgentError, ValueError) as exc:
             console.print(f"[yellow]无法恢复 Session：{exc}[/yellow]")
             continue
@@ -149,7 +168,9 @@ def _select_startup_session(application: LiveApplication) -> bool:
         return True
 
 
-def _select_repository(application: LiveApplication, *, account: dict[str, Any] | None = None) -> bool:
+def _select_repository(
+    application: LiveApplication, *, account: dict[str, Any] | None = None
+) -> bool:
     """读取 Token 可访问仓库，并为所选仓库创建一个全新 Session。"""
     previous_repository = application.repository
     with console.status("[cyan]正在读取可访问仓库…"):
@@ -164,7 +185,9 @@ def _select_repository(application: LiveApplication, *, account: dict[str, Any] 
     while True:
         visible = candidates[:20]
         _render_repository_choices(visible, login=login, total=len(candidates))
-        choice = terminal_prompt("选择仓库（序号或名称，输入关键词筛选，quit 退出）> ").strip()
+        choice = terminal_prompt(
+            "选择仓库（序号或名称，输入关键词筛选，quit 退出）> "
+        ).strip()
         if choice.casefold() in {"quit", "exit", "/quit", "/exit"}:
             return False
         if choice.isdigit() and 1 <= int(choice) <= len(visible):
@@ -172,14 +195,20 @@ def _select_repository(application: LiveApplication, *, account: dict[str, Any] 
             break
 
         exact = next(
-            (repository for repository in repositories if repository["full_name"].casefold() == choice.casefold()),
+            (
+                repository
+                for repository in repositories
+                if repository["full_name"].casefold() == choice.casefold()
+            ),
             None,
         )
         if exact:
             selected = exact
             break
         candidates = [
-            repository for repository in repositories if choice.casefold() in repository["full_name"].casefold()
+            repository
+            for repository in repositories
+            if choice.casefold() in repository["full_name"].casefold()
         ]
         if not candidates:
             console.print(f"[yellow]未找到匹配 {choice!r} 的可访问仓库。[/yellow]")
@@ -217,7 +246,9 @@ def _github_numeric_id(value: Any) -> int:
     return result
 
 
-def _render_repository_choices(repositories: list[dict[str, Any]], *, login: str, total: int) -> None:
+def _render_repository_choices(
+    repositories: list[dict[str, Any]], *, login: str, total: int
+) -> None:
     table = Table(title=f"@{login} 可访问的仓库（当前筛选 {total} 个，最多显示 20 个）")
     table.add_column("#", justify="right", style="cyan")
     table.add_column("仓库")
@@ -278,7 +309,10 @@ def _repl(application: LiveApplication) -> int:
                 ui.text(str(exc), title="Error · 命令失败", kind="error")
             continue
         try:
-            application.handle(request, renderer=lambda result: _render_application_output(application, result))
+            application.handle(
+                request,
+                renderer=lambda result: _render_application_output(application, result),
+            )
         except KeyboardInterrupt:
             ui.text("当前请求已中断。", title="Interrupted", kind="approval")
         except Exception as exc:  # noqa: BLE001 - REPL 必须隔离单轮错误并继续服务
@@ -292,7 +326,9 @@ def _run_command(application: LiveApplication, request: str) -> None:
         _show_help()
     elif command == "/repo":
         if argument:
-            console.print("[yellow]/repo 不接受仓库名，请从 Token 可访问仓库列表中选择。[/yellow]")
+            console.print(
+                "[yellow]/repo 不接受仓库名，请从 Token 可访问仓库列表中选择。[/yellow]"
+            )
             return
         try:
             _select_repository(application)
@@ -317,12 +353,16 @@ def _run_command(application: LiveApplication, request: str) -> None:
         if argument:
             console.print("[yellow]用法：/approve[/yellow]")
             return
-        application.approve(renderer=lambda output: _render_application_output(application, output))
+        application.approve(
+            renderer=lambda output: _render_application_output(application, output)
+        )
     elif command == "/reject":
         if argument:
             console.print("[yellow]用法：/reject[/yellow]")
             return
-        application.reject(renderer=lambda output: _render_application_output(application, output))
+        application.reject(
+            renderer=lambda output: _render_application_output(application, output)
+        )
     elif command == "/edit":
         if not argument:
             console.print("[yellow]用法：/edit <修改要求>[/yellow]")
@@ -332,7 +372,9 @@ def _run_command(application: LiveApplication, request: str) -> None:
             renderer=lambda output: _render_application_output(application, output),
         )
     elif command == "/audit":
-        events = application.service.harness.audit.events(argument or application.session_id)
+        events = application.service.harness.audit.events(
+            argument or application.session_id
+        )
         ui.json(to_plain(events), title="Audit Log")
     elif command == "/trace":
         ui.trace_history(application.trace.events(argument or application.session_id))
@@ -343,7 +385,9 @@ def _run_command(application: LiveApplication, request: str) -> None:
             console.print("[yellow]用法：/sessions[/yellow]")
             return
         try:
-            _show_sessions(application.list_sessions(), active_session_id=application.session_id)
+            _show_sessions(
+                application.list_sessions(), active_session_id=application.session_id
+            )
         except (GitAgentError, ValueError) as exc:
             console.print(f"[red]Session 读取失败：{exc}[/red]")
     elif command == "/new":
@@ -365,7 +409,9 @@ def _run_command(application: LiveApplication, request: str) -> None:
             target = _session_from_number(application.list_sessions(), argument)
             application.switch_session(target.session_id)
             if application.session_id == previous_session_id:
-                console.print(f"Session [cyan]{application.session_id}[/cyan] 已是当前 Session；未更改状态。")
+                console.print(
+                    f"Session [cyan]{application.session_id}[/cyan] 已是当前 Session；未更改状态。"
+                )
             else:
                 console.print(f"已切换到 Session [cyan]{application.session_id}[/cyan]")
                 _show_session_safety_note()
@@ -422,12 +468,16 @@ def _run_command(application: LiveApplication, request: str) -> None:
     elif command == "/memory":
         _memory(application, argument)
     elif command == "/forget":
-        if not argument.isdigit() or int(argument) < 1:
-            console.print("[yellow]用法：/forget <编号>[/yellow]")
+        scope_token, _, relative_path = argument.partition(" ")
+        scope = {"user": "user", "repo": "repository"}.get(scope_token.casefold())
+        if scope is None or not relative_path.strip():
+            console.print("[yellow]用法：/forget <user|repo> <相对路径>[/yellow]")
             return
         try:
-            memory = application.forget(int(argument))
-            console.print(f"已忘记记忆 [cyan]#{argument}[/cyan]：{memory.content}")
+            memory = application.forget(scope, relative_path.strip())
+            console.print(
+                f"已忘记记忆 [cyan]{scope_token}:{memory.relative_path}[/cyan]：{memory.text}"
+            )
         except (GitAgentError, ValueError) as exc:
             console.print(f"[red]记忆删除失败：{exc}[/red]")
     else:
@@ -446,7 +496,11 @@ def _render_application_output(application: LiveApplication, output: Any) -> Non
 
 def _render_result(application: LiveApplication, result: ServiceResult) -> None:
     if result.decision.clarify:
-        ui.markdown(str(result.output or result.decision.message), title="需要补充信息", kind="router")
+        ui.markdown(
+            str(result.output or result.decision.message),
+            title="需要补充信息",
+            kind="router",
+        )
         return
     if result.agent is None and isinstance(result.output, str):
         ui.markdown(result.output, title="GitAgent", kind="info")
@@ -486,18 +540,28 @@ def _render_output(application: LiveApplication, output: Any) -> None:
         if operation in {"LIST", "SUMMARIZE"} and visible:
             items = "\n".join(
                 f"- **#{issue.number}** {issue.title}  `{issue.state}`"
-                + (f"  {', '.join(f'`{label}`' for label in issue.labels)}" if issue.labels else "")
+                + (
+                    f"  {', '.join(f'`{label}`' for label in issue.labels)}"
+                    if issue.labels
+                    else ""
+                )
                 for issue in visible
             )
             content = f"{content}\n\n{items}" if content else items
         if truncated:
             content += f"\n\n_仅显示前 {MAX_VISIBLE_ITEMS} 项。_"
-        title = f"Issue #{output.issue_number}" if output.issue_number else f"Issues · {len(output.issues)}"
+        title = (
+            f"Issue #{output.issue_number}"
+            if output.issue_number
+            else f"Issues · {len(output.issues)}"
+        )
         ui.markdown(content, title=title, kind="agent")
         return
     if isinstance(output, PullRequestAgentResult):
         if output.action == DomainAction.CLARIFY:
-            ui.text(output.question, title="需要补充信息 · Pull Requests", kind="router")
+            ui.text(
+                output.question, title="需要补充信息 · Pull Requests", kind="router"
+            )
             return
         visible, truncated = visible_items(output.pull_requests)
         operation = output.operation.value if output.operation else output.action.value
@@ -513,20 +577,36 @@ def _render_output(application: LiveApplication, output: Any) -> None:
         if truncated:
             content += f"\n\n_仅显示前 {MAX_VISIBLE_ITEMS} 项。_"
         if output.changed_files:
-            content += "\n\n**变更文件**  " + ", ".join(f"`{path}`" for path in output.changed_files)
-        title = f"PR #{output.pr_number}" if output.pr_number else f"Pull Requests · {len(output.pull_requests)}"
+            content += "\n\n**变更文件**  " + ", ".join(
+                f"`{path}`" for path in output.changed_files
+            )
+        title = (
+            f"PR #{output.pr_number}"
+            if output.pr_number
+            else f"Pull Requests · {len(output.pull_requests)}"
+        )
         ui.markdown(content, title=title, kind="agent")
         return
     if isinstance(output, RepositoryResult):
         if output.action == DomainAction.CLARIFY:
-            ui.text(output.question or output.answer, title="需要补充信息 · Repository", kind="router")
+            ui.text(
+                output.question or output.answer,
+                title="需要补充信息 · Repository",
+                kind="router",
+            )
             return
         content = output.answer
         if output.files:
-            content += "\n\n---\n**相关文件：** " + ", ".join(f"`{path}`" for path in output.files)
+            content += "\n\n---\n**相关文件：** " + ", ".join(
+                f"`{path}`" for path in output.files
+            )
         if output.symbols:
-            content += "\n\n**相关符号：** " + ", ".join(f"`{symbol}`" for symbol in output.symbols)
-        ui.markdown(content, title=f"Repository · {output.operation.value}", kind="agent")
+            content += "\n\n**相关符号：** " + ", ".join(
+                f"`{symbol}`" for symbol in output.symbols
+            )
+        ui.markdown(
+            content, title=f"Repository · {output.operation.value}", kind="agent"
+        )
         return
     raise ValidationError(f"不支持渲染结果类型：{type(output).__name__}")
 
@@ -566,14 +646,17 @@ def _render_proposal(application: LiveApplication, context: AgentContext) -> Non
             kind="agent",
         )
     elif any(
-        call.capability_id in {"github.create_draft_pr", "github.commit_to_default_branch"}
+        call.capability_id
+        in {"github.create_draft_pr", "github.commit_to_default_branch"}
         for call in calls
     ):
         _render_code_change_proposal(application, context)
     else:
         details = []
         for call in context.pending.calls:
-            arguments = json.dumps(call.arguments, ensure_ascii=False, indent=2, sort_keys=True)
+            arguments = json.dumps(
+                call.arguments, ensure_ascii=False, indent=2, sort_keys=True
+            )
             details.append(f"### `{call.capability_id}`\n```json\n{arguments}\n```")
         payload = "\n\n".join(details) or "（内部操作，无外部写入参数）"
         ui.markdown(
@@ -584,7 +667,9 @@ def _render_proposal(application: LiveApplication, context: AgentContext) -> Non
     _render_approval(application, context.pending.approval_id)
 
 
-def _render_code_change_proposal(application: LiveApplication, context: AgentContext) -> None:
+def _render_code_change_proposal(
+    application: LiveApplication, context: AgentContext
+) -> None:
     candidate = context.code_candidate
     if candidate is None:
         ui.text(context.pending.summary, title="代码变更 · 待批准", kind="agent")
@@ -631,7 +716,10 @@ def _render_code_change_proposal(application: LiveApplication, context: AgentCon
 
 
 def _render_verification(report: VerificationReport) -> None:
-    checks = "\n".join(f"- **{check.name}**: {check.status} — {check.details}" for check in report.checks)
+    checks = "\n".join(
+        f"- **{check.name}**: {check.status} — {check.details}"
+        for check in report.checks
+    )
     skipped = "\n".join(f"- {item}" for item in report.skipped)
     content = checks or "无检查结果"
     if skipped:
@@ -693,7 +781,9 @@ def _show_sessions(
     console.print(table)
 
 
-def _session_from_number(sessions: Sequence[SessionRecord], number: str) -> SessionRecord:
+def _session_from_number(
+    sessions: Sequence[SessionRecord], number: str
+) -> SessionRecord:
     value = number.strip()
     if not value:
         raise ValidationError("请提供 Session 编号")
@@ -734,74 +824,75 @@ def _show_compaction(result: CompactResult) -> None:
 
 
 def _remember(application: LiveApplication, argument: str) -> None:
-    scope_token, _, remainder = argument.partition(" ")
-    scope_token = scope_token.casefold()
-    remainder = remainder.strip()
-    if scope_token == "user":
-        scope = "user"
-        kind = "preference"
-        content = remainder
-    elif scope_token == "repo":
-        kind, _, content = remainder.partition(" ")
-        scope = "repository"
-        kind = kind.casefold()
-        content = content.strip()
-        if kind not in {"decision", "constraint", "reference"}:
-            content = ""
-    else:
-        content = ""
-
+    content = argument.strip()
     if not content:
-        console.print(
-            "[yellow]用法：/remember user <长期协作偏好>\n"
-            "      /remember repo <decision|constraint|reference> <内容>[/yellow]"
-        )
+        console.print("[yellow]用法：/remember <内容>[/yellow]")
         return
     try:
-        memory, created = application.remember(scope, kind, content)
+        memory, created = application.remember(content)
         if created:
-            console.print(f"已保存记忆 [cyan]#{memory.index}[/cyan]")
+            console.print(f"已保存固定记忆 [cyan]{memory.item.relative_path}[/cyan]")
         else:
-            console.print(f"记忆 [cyan]#{memory.index}[/cyan] 已存在；未重复保存。")
+            console.print(
+                f"记忆 [cyan]{memory.item.relative_path}[/cyan] 已存在；未重复保存。"
+            )
     except (GitAgentError, ValueError) as exc:
-        console.print(f"[red]Knowledge 保存失败：{exc}[/red]")
+        console.print(f"[red]Memory 保存失败：{exc}[/red]")
 
 
 def _memory(application: LiveApplication, argument: str) -> None:
     scope_token = argument.casefold()
-    if scope_token not in {"", "user", "repo", "experience"}:
-        console.print("[yellow]用法：/memory [user|repo|experience][/yellow]")
+    if scope_token not in {"", "user", "repo", "experience", "compact", "rebuild"}:
+        console.print(
+            "[yellow]用法：/memory [user|repo|experience|compact|rebuild][/yellow]"
+        )
         return
-    scope = {"": None, "user": "user", "repo": "repository", "experience": None}[scope_token]
-    kind = "experience" if scope_token == "experience" else None
+    if scope_token == "compact":
+        result = application.compact_memory()
+        if result is None:
+            console.print("[yellow]Memory 整理失败；请查看 /debug。[/yellow]")
+        else:
+            console.print(
+                "Memory 整理完成："
+                f"新增 {len(result['added'])}，替换 {len(result['replaced'])}，"
+                f"删除 {len(result['deleted'])}，跳过 {len(result['skipped'])}。"
+            )
+        return
+    if scope_token == "rebuild":
+        scope = application._require_scope()
+        application.memory.rebuild_index(scope.account_key, scope.repository_key)
+        console.print("Memory 索引已重建。")
+        return
+    scope = {"": None, "user": "user", "repo": "repository", "experience": None}[
+        scope_token
+    ]
+    item_type = "experience" if scope_token == "experience" else None
     try:
-        memories = application.indexed_memories(scope=scope, kind=kind)
+        memories = application.indexed_memories(scope=scope, item_type=item_type)
     except (GitAgentError, ValueError) as exc:
-        console.print(f"[red]Knowledge 读取失败：{exc}[/red]")
+        console.print(f"[red]Memory 读取失败：{exc}[/red]")
         return
     if not memories:
-        console.print("[dim]当前作用域没有长期 Knowledge。[/dim]")
+        console.print("[dim]当前作用域没有长期 Memory。[/dim]")
         return
-    table = Table(title="Long-term Knowledge", show_lines=True)
-    table.add_column("编号", style="cyan", justify="right", no_wrap=True)
+    table = Table(title="Long-term Memory", show_lines=True)
     table.add_column("作用域")
     table.add_column("类型")
-    table.add_column("主题")
+    table.add_column("路径", style="cyan")
+    table.add_column("优先级")
     table.add_column("内容")
-    table.add_column("适用条件")
-    table.add_column("来源")
-    table.add_column("更新时间")
+    table.add_column("固定")
+    table.add_column("最后访问")
     for indexed in memories:
-        memory = indexed.record
+        memory = indexed.item
         table.add_row(
-            str(indexed.index),
-            memory.scope,
-            memory.kind,
-            memory.topic,
-            memory.content,
-            memory.conditions,
-            memory.source,
-            memory.updated_at,
+            indexed.scope,
+            memory.type,
+            memory.relative_path,
+            memory.priority,
+            memory.text,
+            "是" if memory.pinned else "否",
+            memory.last_accessed_at,
         )
     console.print(table)
 
@@ -809,7 +900,9 @@ def _memory(application: LiveApplication, argument: str) -> None:
 def _show_debug_history(application: LiveApplication, argument: str) -> None:
     parts = argument.split()
     if len(parts) > 2:
-        console.print("[yellow]用法：/debug [agent] 或 /debug <session_id> [agent][/yellow]")
+        console.print(
+            "[yellow]用法：/debug [agent] 或 /debug <session_id> [agent][/yellow]"
+        )
         return
     session_id = application.session_id
     if session_id is None:
@@ -823,7 +916,9 @@ def _show_debug_history(application: LiveApplication, argument: str) -> None:
     elif len(parts) == 2:
         session_id, agent = parts
         if not session_id.startswith("session-"):
-            console.print("[yellow]用法：/debug [agent] 或 /debug <session_id> [agent][/yellow]")
+            console.print(
+                "[yellow]用法：/debug [agent] 或 /debug <session_id> [agent][/yellow]"
+            )
             return
     events = application.trace.debug_events(session_id, agent)
     ui.debug_history(events, session_id=session_id, agent=agent)
@@ -842,11 +937,9 @@ def _show_help() -> None:
             "  /delete <编号>        删除 Session\n"
             "  /compact              压缩旧 Turn 的 Context 投影\n"
             "  /learning [on|off]    查看或切换机会式长期学习\n"
-            "  /remember user <偏好>  保存 User Memory\n"
-            "  /remember repo <decision|constraint|reference> <内容>\n"
-            "                        保存 Repository Memory\n"
-            "  /memory [user|repo|experience]  查看长期 Knowledge\n"
-            "  /forget <编号>         按 /memory 编号删除记忆\n"
+            "  /memory [user|repo|experience|compact|rebuild]  查看或整理长期 Memory\n"
+            "  /remember <内容>       创建用户级固定 Memory\n"
+            "  /forget <user|repo> <items/*.md>  删除指定 Memory\n"
             "  /model [name]         查看或切换模型\n"
             "  /tokens               查看模型 token 与估算费用\n"
             "  /approve              批准当前 Session 的待执行提案\n"

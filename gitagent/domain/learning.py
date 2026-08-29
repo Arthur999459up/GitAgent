@@ -1,135 +1,78 @@
-"""Domain contracts for reflection, durable knowledge, and learning evidence."""
+"""Small contracts for file-backed memory and isolated reflection."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from .models import SessionScope
 
-
-class LearningAction(str, Enum):
-    """A semantic consolidation decision made by MainAgent reflection."""
-
-    ADD = "add"
-    UPDATE = "update"
-    REMOVE = "remove"
-    DISCARD = "discard"
+MemoryType = Literal["memory", "experience"]
+MemoryPriority = Literal["low", "normal", "high"]
+MemoryScope = Literal["user", "repository"]
 
 
 @dataclass(frozen=True)
-class KnowledgeRecord:
-    """One user-visible item in the durable, non-authoritative knowledge store."""
+class MemoryItem:
+    """One item whose scope is determined by its containing directory."""
 
-    knowledge_id: str
-    account_key: str
-    repository_key: str | None
-    scope: str
-    kind: str
-    topic: str
-    content: str
-    conditions: str
-    source: str
-    confidence: str
-    provenance: tuple[dict[str, Any], ...]
-    created_at: str
-    updated_at: str
+    relative_path: str
+    type: MemoryType
+    text: str
+    priority: MemoryPriority
+    last_accessed_at: str
+    pinned: bool = False
 
 
 @dataclass(frozen=True)
-class DomainInteractionRecord:
-    """High-fidelity Domain workflow evidence kept outside conversation history."""
+class TraceStep:
+    """One causally useful, bounded step from a completed Domain workflow."""
 
-    interaction_id: str
-    account_key: str
-    repository_key: str
-    repository_full_name: str
-    session_id: str
-    origin_turn_seq: int
-    completed_turn_seq: int
-    agent: str
-    entity_type: str | None
-    entity_id: str | None
+    action: str
+    result: str
+
+
+@dataclass(frozen=True)
+class LearningTrace:
+    """Ephemeral evidence used once by reflection and never persisted."""
+
     goal: str
-    evidence: dict[str, Any]
-    reflection_status: str
-    reflection_error: str
-    created_at: str
-    reflected_at: str | None
-
-    @property
-    def scope(self) -> SessionScope:
-        return SessionScope(self.account_key, self.repository_key, self.session_id)
+    outcome: str
+    trajectory: tuple[TraceStep, ...]
 
 
 @dataclass(frozen=True)
-class ReflectionContext:
-    """A temporary working set that never enters MainAgent conversation context."""
+class ReflectionInput:
+    """An isolated learning context, separate from the normal conversation."""
 
     scope: SessionScope
     repository_full_name: str
     trigger: str
+    memory_index: str
     conversation_units: tuple[dict[str, Any], ...] = ()
-    interaction: dict[str, Any] | None = None
-    existing_knowledge: tuple[KnowledgeRecord, ...] = ()
-    selection_metadata: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    learning_trace: LearningTrace | None = None
 
 
 @dataclass(frozen=True)
-class LearningCandidate:
-    """One model-proposed knowledge consolidation operation."""
+class ReflectionChanges:
+    """The only three durable operations that reflection can request."""
 
-    action: LearningAction
-    scope: str
-    kind: str
-    topic: str
-    content: str
-    conditions: str
-    target_id: str
-    reason: str
-    evidence_strength: str
-    correction: bool
-
-
-@dataclass(frozen=True)
-class LearningProposal:
-    """Structured output of one MainAgent reflection invocation."""
-
-    candidates: tuple[LearningCandidate, ...]
-    summary: str
-
-
-@dataclass(frozen=True)
-class KnowledgeChange:
-    """One durable Knowledge mutation produced by consolidation."""
-
-    action: LearningAction
-    record: KnowledgeRecord
-
-
-@dataclass(frozen=True)
-class ConsolidationResult:
-    """Durable effects after validating and consolidating a proposal."""
-
-    added: tuple[str, ...] = ()
-    updated: tuple[str, ...] = ()
-    removed: tuple[str, ...] = ()
-    skipped: tuple[str, ...] = ()
-    changes: tuple[KnowledgeChange, ...] = ()
+    add: tuple[dict[str, str], ...] = ()
+    replace: tuple[dict[str, str], ...] = ()
+    delete: tuple[dict[str, str], ...] = ()
 
     @property
     def changed(self) -> bool:
-        return bool(self.added or self.updated or self.removed)
+        return bool(self.add or self.replace or self.delete)
 
 
 __all__ = [
-    "ConsolidationResult",
-    "DomainInteractionRecord",
-    "KnowledgeChange",
-    "KnowledgeRecord",
-    "LearningAction",
-    "LearningCandidate",
-    "LearningProposal",
-    "ReflectionContext",
+    "LearningTrace",
+    "MemoryItem",
+    "MemoryPriority",
+    "MemoryScope",
+    "MemoryType",
+    "ReflectionChanges",
+    "ReflectionInput",
+    "TraceStep",
 ]

@@ -1,7 +1,5 @@
-"""Local, scoped Session, knowledge, and learning-evidence persistence."""
+"""Local, scoped transactional Session persistence."""
 
-from .interactions import DOMAIN_INTERACTION_LIMIT, DomainEvidenceStore
-from .knowledge import KnowledgeStore
 from .sessions import (
     OPEN_QUESTION_CHARACTER_LIMIT,
     SessionManager,
@@ -16,12 +14,9 @@ from .sessions import (
 from .store import REDACTED, SCHEMA_VERSION, StateStore, truncate_utf8
 
 __all__ = [
-    "DOMAIN_INTERACTION_LIMIT",
     "OPEN_QUESTION_CHARACTER_LIMIT",
     "REDACTED",
     "SCHEMA_VERSION",
-    "DomainEvidenceStore",
-    "KnowledgeStore",
     "SessionManager",
     "SessionRecord",
     "StateStore",

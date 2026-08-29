@@ -20,6 +20,7 @@ from gitagent.capability.providers import (
     github_tool_definitions,
 )
 from gitagent.infra.mcp import Context7Client
+from gitagent.memory import MemoryAccessTracker
 from gitagent.model import Reasoner
 
 
@@ -29,18 +30,30 @@ def build_capability_layer(
     trace: Any | None = None,
     reasoner: Reasoner | None = None,
     workspace_root: str | Path | None = None,
+    memory_roots: dict[str, Path] | None = None,
+    memory_accesses: MemoryAccessTracker | None = None,
 ) -> CapabilityLayer:
     resource_root = _resource_root()
     policy = PermissionPolicy.from_file(resource_root / "capabilities.yaml")
     layer = CapabilityLayer(policy=policy, trace=trace)
-    native = NativeProvider(workspace_root or Path.cwd())
+    native = NativeProvider(
+        workspace_root or Path.cwd(),
+        memory_roots=memory_roots,
+        memory_read_callback=memory_accesses.record
+        if memory_accesses is not None
+        else None,
+    )
     context7 = Context7Client(api_key=os.getenv("CONTEXT7_API_KEY", ""))
     layer.add_provider(native)
     layer.add_provider(
         MCPProvider(
             [
-                MCPServerDefinition("github", "local_adapter", {"inject_repository": True}),
-                MCPServerDefinition("context7", "streamable_http", {"endpoint": context7.endpoint}),
+                MCPServerDefinition(
+                    "github", "local_adapter", {"inject_repository": True}
+                ),
+                MCPServerDefinition(
+                    "context7", "streamable_http", {"endpoint": context7.endpoint}
+                ),
             ],
             [*github_tool_definitions(github), *context7_tool_definitions()],
             clients={"github": github, "context7": context7},
@@ -88,7 +101,9 @@ def _subagent_runner(layer: CapabilityLayer, reasoner: Reasoner) -> Any:
         "additionalProperties": False,
     }
 
-    def run(task: str, context: InvocationContext, effective: frozenset[str]) -> dict[str, Any]:
+    def run(
+        task: str, context: InvocationContext, effective: frozenset[str]
+    ) -> dict[str, Any]:
         observations: list[dict[str, Any]] = []
         discovered = [item for item in layer.discover(context) if item.id in effective]
         available_tools = [
@@ -114,7 +129,11 @@ def _subagent_runner(layer: CapabilityLayer, reasoner: Reasoner) -> Any:
                     "Never claim a mutation succeeded before observing a successful capability result."
                 ),
                 prompt=json.dumps(
-                    {"task": task, "repository": context.repository, "observations": observations[-12:]},
+                    {
+                        "task": task,
+                        "repository": context.repository,
+                        "observations": observations[-12:],
+                    },
                     ensure_ascii=False,
                     default=str,
                 ),
@@ -126,25 +145,45 @@ def _subagent_runner(layer: CapabilityLayer, reasoner: Reasoner) -> Any:
                 return {"summary": str(value.get("message") or ""), "steps": step}
             supplied_id = str(value.get("capability_id") or "")
             capability_id = next(
-                (item.id for item in discovered if _function_name(item.id) == supplied_id),
+                (
+                    item.id
+                    for item in discovered
+                    if _function_name(item.id) == supplied_id
+                ),
                 supplied_id,
             )
             arguments = dict(value.get("arguments") or {})
             result = layer.invoke(capability_id, arguments, context)
             if result.status == "success":
-                observations.append({"capability_id": capability_id, "arguments": arguments, "content": result.content})
+                observations.append(
+                    {
+                        "capability_id": capability_id,
+                        "arguments": arguments,
+                        "content": result.content,
+                    }
+                )
             else:
                 observations.append(
                     {
                         "capability_id": capability_id,
                         "arguments": arguments,
-                        "error": result.error.type.value if result.error is not None else result.status,
-                        "message": result.error.message if result.error is not None else "",
-                        "details": result.error.details if result.error is not None else None,
+                        "error": result.error.type.value
+                        if result.error is not None
+                        else result.status,
+                        "message": result.error.message
+                        if result.error is not None
+                        else "",
+                        "details": result.error.details
+                        if result.error is not None
+                        else None,
                         "attempts": result.attempts,
                     }
                 )
-        return {"summary": "Sub-agent reached its 20-step limit.", "steps": 20, "observations": observations[-4:]}
+        return {
+            "summary": "Sub-agent reached its 20-step limit.",
+            "steps": 20,
+            "observations": observations[-4:],
+        }
 
     return run
 

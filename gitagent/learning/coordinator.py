@@ -1,89 +1,73 @@
-"""Best-effort orchestration of MainAgent reflection and knowledge consolidation."""
+"""Best-effort reflection and file-backed Memory updates."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from gitagent.agents.main import MainAgent
-from gitagent.domain.learning import ConsolidationResult
+from gitagent.domain.learning import LearningTrace, ReflectionChanges
 from gitagent.domain.models import SessionScope
 from gitagent.infra.observability import TraceBus, TraceCategory, TraceStatus
-from gitagent.infra.persistence import (
-    DomainEvidenceStore,
-    KnowledgeStore,
-    SessionManager,
-)
+from gitagent.infra.persistence import SessionManager
+from gitagent.memory import MemoryStore
 
 from .context import ReflectionContextBuilder
 
 
 class LearningCoordinator:
-    """Keep the optional learning path outside the user-request success boundary."""
+    """Keep optional learning outside the already-successful business boundary."""
 
     def __init__(
         self,
         main_agent: MainAgent,
         sessions: SessionManager,
-        knowledge: KnowledgeStore,
-        evidence: DomainEvidenceStore,
+        memory: MemoryStore,
         trace: TraceBus,
         *,
         input_budget_tokens: int,
         enabled: bool = True,
     ) -> None:
         self.main_agent = main_agent
-        self.knowledge = knowledge
-        self.evidence = evidence
+        self.memory = memory
         self.trace = trace
         self.enabled = enabled
         self.contexts = ReflectionContextBuilder(
             sessions,
-            knowledge,
+            memory,
             input_budget_tokens=input_budget_tokens,
         )
 
     def reflect_domain(
         self,
         scope: SessionScope,
-        interaction_id: str,
-    ) -> ConsolidationResult | None:
+        repository_full_name: str,
+        learning_trace: LearningTrace,
+        *,
+        turn_seq: int,
+        accessed_paths: Iterable[tuple[str, str]] = (),
+    ) -> dict[str, tuple[str, ...]] | None:
+        accessed = tuple(accessed_paths)
         if not self.enabled:
-            return None
-        record = self.evidence.get(scope.account_key, scope.repository_key, interaction_id)
-        if record is None or record.reflection_status != "pending":
-            return None
+            return self._touch_only(scope, accessed)
         try:
-            context = self.contexts.for_domain(record)
-            proposal = self.main_agent.reflect(context)
-            result = self.knowledge.consolidate(
+            context = self.contexts.for_domain(
                 scope,
-                proposal,
-                turn_seq=record.completed_turn_seq,
-                interaction=record,
+                repository_full_name,
+                learning_trace,
+                turn_seq=turn_seq,
             )
-            self.evidence.mark_reflected(
-                record,
-                status="reflected" if result.changed else "skipped",
+            changes = self.main_agent.reflect(context)
+            result = self.memory.apply_changes(
+                scope.account_key,
+                scope.repository_key,
+                changes,
+                accessed_paths=accessed,
             )
-            self._emit(
-                scope,
-                TraceStatus.COMPLETED,
-                details=self._result_details(
-                    proposal.candidates,
-                    result,
-                    interaction_id=interaction_id,
-                ),
-            )
+            self._emit(scope, TraceStatus.COMPLETED, result, changes)
             return result
-        except Exception as exc:  # noqa: BLE001 - learning must not change Domain success semantics
-            try:
-                self.evidence.mark_reflected(record, status="reflection_failed", error=str(exc))
-            except Exception:  # noqa: BLE001, S110 - preserve the original learning failure
-                pass
-            self._emit(
-                scope,
-                TraceStatus.FAILED,
-                message=str(exc),
-                details={"interaction_id": interaction_id, "error_type": type(exc).__name__},
-            )
+        except Exception as exc:  # noqa: BLE001 - learning never changes Domain success
+            self._touch_after_failure(scope, accessed)
+            self._emit_failure(scope, exc)
             return None
 
     def reflect_conversation(
@@ -92,91 +76,106 @@ class LearningCoordinator:
         repository_full_name: str,
         *,
         turn_seq: int,
-        user_input: str,
-        assistant_text: str,
-    ) -> ConsolidationResult | None:
+        accessed_paths: Iterable[tuple[str, str]] = (),
+    ) -> dict[str, tuple[str, ...]] | None:
+        accessed = tuple(accessed_paths)
         if not self.enabled:
-            return None
+            return self._touch_only(scope, accessed)
         try:
             context = self.contexts.for_conversation(
                 scope,
                 repository_full_name,
                 turn_seq=turn_seq,
-                user_input=user_input,
-                assistant_text=assistant_text,
             )
-            proposal = self.main_agent.reflect(context)
-            result = self.knowledge.consolidate(scope, proposal, turn_seq=turn_seq)
-            self._emit(
-                scope,
-                TraceStatus.COMPLETED,
-                details=self._result_details(
-                    proposal.candidates,
-                    result,
-                    turn_seq=turn_seq,
-                ),
+            changes = self.main_agent.reflect(context)
+            result = self.memory.apply_changes(
+                scope.account_key,
+                scope.repository_key,
+                changes,
+                accessed_paths=accessed,
             )
+            self._emit(scope, TraceStatus.COMPLETED, result, changes)
             return result
-        except Exception as exc:  # noqa: BLE001 - conversation response is already successful
-            self._emit(
-                scope,
-                TraceStatus.FAILED,
-                message=str(exc),
-                details={"turn_seq": turn_seq, "error_type": type(exc).__name__},
-            )
+        except Exception as exc:  # noqa: BLE001 - response is already durable
+            self._touch_after_failure(scope, accessed)
+            self._emit_failure(scope, exc)
             return None
 
-    @staticmethod
-    def _result_details(
-        candidates: tuple[object, ...],
-        result: ConsolidationResult,
-        **identity: object,
-    ) -> dict[str, object]:
-        details: dict[str, object] = {
-            **identity,
-            "triggered": True,
-            "reason": (
-                "stored"
-                if result.changed
-                else "no_candidates"
-                if not candidates
-                else "all_candidates_skipped"
-            ),
-            "candidates": len(candidates),
-            "added": len(result.added),
-            "updated": len(result.updated),
-            "removed": len(result.removed),
-            "skipped": len(result.skipped),
-            "changes": [
-                {
-                    "action": change.action.value,
-                    "knowledge_id": change.record.knowledge_id,
-                    "scope": change.record.scope,
-                    "kind": change.record.kind,
-                    "topic": change.record.topic,
-                    "content": change.record.content,
-                    "conditions": change.record.conditions,
-                    "source": change.record.source,
-                }
-                for change in result.changes
-            ],
-        }
-        return details
+    def compact(
+        self,
+        scope: SessionScope,
+        repository_full_name: str,
+    ) -> dict[str, tuple[str, ...]] | None:
+        """Run user-requested semantic consolidation over the complete index."""
+
+        try:
+            changes = self.main_agent.reflect(
+                self.contexts.for_compaction(scope, repository_full_name)
+            )
+            result = self.memory.apply_changes(
+                scope.account_key, scope.repository_key, changes
+            )
+            self._emit(scope, TraceStatus.COMPLETED, result, changes)
+            return result
+        except Exception as exc:  # noqa: BLE001 - management command reports through trace/result
+            self._emit_failure(scope, exc)
+            return None
+
+    def _touch_only(
+        self,
+        scope: SessionScope,
+        accessed: tuple[tuple[str, str], ...],
+    ) -> dict[str, tuple[str, ...]]:
+        return self.memory.apply_changes(
+            scope.account_key,
+            scope.repository_key,
+            ReflectionChanges(),
+            accessed_paths=accessed,
+        )
+
+    def _touch_after_failure(
+        self,
+        scope: SessionScope,
+        accessed: tuple[tuple[str, str], ...],
+    ) -> None:
+        try:
+            self._touch_only(scope, accessed)
+        except Exception:  # noqa: BLE001, S110 - keep the original reflection failure
+            pass
 
     def _emit(
         self,
         scope: SessionScope,
         status: TraceStatus,
-        *,
-        message: str = "",
-        details: dict[str, object] | None = None,
+        result: dict[str, tuple[str, ...]],
+        changes: ReflectionChanges,
     ) -> None:
         self.trace.emit(
             session_id=scope.session_id,
             category=TraceCategory.WORKFLOW,
             name="long_term_learning",
             status=status,
-            message=message,
-            details=details,
+            details={
+                "triggered": True,
+                "reason": "stored"
+                if any(result[key] for key in ("added", "replaced", "deleted"))
+                else "no_changes",
+                "proposed": len(changes.add)
+                + len(changes.replace)
+                + len(changes.delete),
+                **{key: list(value) for key, value in result.items()},
+            },
         )
+
+    def _emit_failure(self, scope: SessionScope, error: Exception) -> None:
+        self.trace.emit(
+            session_id=scope.session_id,
+            category=TraceCategory.WORKFLOW,
+            name="long_term_learning",
+            status=TraceStatus.FAILED,
+            message=str(error),
+            details={"error_type": type(error).__name__},
+        )
+
+
 __all__ = ["LearningCoordinator"]

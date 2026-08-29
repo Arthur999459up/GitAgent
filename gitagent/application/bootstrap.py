@@ -9,14 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from gitagent.domain.errors import StateError, ValidationError
-from gitagent.domain.learning import KnowledgeRecord
+from gitagent.domain.learning import MemoryItem
 from gitagent.domain.models import SessionScope
 from gitagent.harness.context import CompactResult, ContextBuilder
 from gitagent.infra.github import GitHubClient
 from gitagent.infra.observability import TraceBus
 from gitagent.infra.persistence import (
-    DomainEvidenceStore,
-    KnowledgeStore,
     SessionManager,
     SessionRecord,
     StateStore,
@@ -24,6 +22,7 @@ from gitagent.infra.persistence import (
     build_repository_key,
     merge_working_state,
 )
+from gitagent.memory import MemoryAccessTracker, MemoryStore
 from gitagent.model import ChatClient, LiteLLMChatClient, LLMReasoner, OpenAIChatClient
 from gitagent.prompts import get_prompt_library
 
@@ -40,7 +39,8 @@ class IndexedMemory:
     """One CLI-visible memory with a short repository-scope index."""
 
     index: int
-    record: KnowledgeRecord
+    scope: str
+    item: MemoryItem
 
 
 @dataclass
@@ -53,8 +53,7 @@ class LiveApplication:
     service: GitAgentService
     store: StateStore
     sessions: SessionManager
-    knowledge: KnowledgeStore
-    evidence: DomainEvidenceStore
+    memory: MemoryStore
     context_builder: ContextBuilder
     repository: str | None = None
     scope: SessionScope | None = None
@@ -74,7 +73,9 @@ class LiveApplication:
         repository_id: int,
         repository_full_name: str,
     ) -> SessionRecord:
-        account_key = build_account_key(self.config.github_api_url, authenticated_user_id)
+        account_key = build_account_key(
+            self.config.github_api_url, authenticated_user_id
+        )
         repository_key = build_repository_key(self.config.github_api_url, repository_id)
         session_id = _new_session_id()
         target_scope = SessionScope(account_key, repository_key, session_id)
@@ -90,12 +91,20 @@ class LiveApplication:
         self._swap_service(staged_service)
         return created
 
-    def list_account_sessions(self, authenticated_user_id: int) -> tuple[SessionRecord, ...]:
-        account_key = build_account_key(self.config.github_api_url, authenticated_user_id)
+    def list_account_sessions(
+        self, authenticated_user_id: int
+    ) -> tuple[SessionRecord, ...]:
+        account_key = build_account_key(
+            self.config.github_api_url, authenticated_user_id
+        )
         return self.sessions.list_account_sessions(account_key)
 
-    def resume_session(self, authenticated_user_id: int, session_id: str) -> SessionRecord:
-        account_key = build_account_key(self.config.github_api_url, authenticated_user_id)
+    def resume_session(
+        self, authenticated_user_id: int, session_id: str
+    ) -> SessionRecord:
+        account_key = build_account_key(
+            self.config.github_api_url, authenticated_user_id
+        )
         target = self.sessions.get_account_session(account_key, session_id)
         if target is None:
             raise StateError("Session not found")
@@ -105,10 +114,16 @@ class LiveApplication:
         self._swap_service(staged)
         return target
 
-    def delete_account_session(self, authenticated_user_id: int, session_id: str) -> SessionRecord:
+    def delete_account_session(
+        self, authenticated_user_id: int, session_id: str
+    ) -> SessionRecord:
         if self.scope is not None:
-            raise StateError("account Session deletion is only available before entering a Session")
-        account_key = build_account_key(self.config.github_api_url, authenticated_user_id)
+            raise StateError(
+                "account Session deletion is only available before entering a Session"
+            )
+        account_key = build_account_key(
+            self.config.github_api_url, authenticated_user_id
+        )
         target = self.sessions.get_account_session(account_key, session_id)
         if target is None:
             raise StateError("Session not found")
@@ -128,8 +143,10 @@ class LiveApplication:
                 scope,
                 repository,
                 text,
-                prompt_renderer=lambda context: self.service.main_agent.render_input_context(
-                    text, repository, context
+                prompt_renderer=lambda context: (
+                    self.service.main_agent.render_input_context(
+                        text, repository, context
+                    )
                 ),
             )
             try:
@@ -144,7 +161,9 @@ class LiveApplication:
                 dispatch_started = self.service.dispatch_started
                 raise
             dispatch_started = self.service.dispatch_started
-            projection = project_service_result(result, turn_seq=turn.seq, text_sanitizer=self.store.text)
+            projection = project_service_result(
+                result, turn_seq=turn.seq, text_sanitizer=self.store.text
+            )
             current = self._session().working_state
             next_state = merge_working_state(current, projection=projection)
             if result.agent is None and not result.decision.clarify:
@@ -153,21 +172,27 @@ class LiveApplication:
                 renderer(result)
                 rendered = True
             self.sessions.complete_turn(
-                scope, turn.seq, assistant_text=projection.assistant_text, history_text=projection.history_text,
-                route_summary=projection.route_summary, entity_manifests=projection.entity_manifests,
+                scope,
+                turn.seq,
+                assistant_text=projection.assistant_text,
+                history_text=projection.history_text,
+                route_summary=projection.route_summary,
+                entity_manifests=projection.entity_manifests,
                 working_state=next_state,
             )
-            if result.agent is None or result.interaction_id is not None:
+            if result.agent is None or result.learning_trace is not None:
                 self.service.reflect_after_turn(
                     turn_seq=turn.seq,
                     user_input=text,
                     assistant_text=projection.assistant_text,
-                    interaction_id=result.interaction_id,
+                    learning_trace=result.learning_trace,
                 )
             return result
         except KeyboardInterrupt as exc:
             self._fail_turn(scope, turn.seq, exc)
-            rebuild_error = self._rebuild_current_service() if dispatch_started else None
+            rebuild_error = (
+                self._rebuild_current_service() if dispatch_started else None
+            )
             if rebuild_error is not None:
                 raise StateError(
                     "本轮已中断；运行时审批已失效，而且新的 Service 无法建立。"
@@ -176,9 +201,13 @@ class LiveApplication:
             raise
         except Exception as exc:
             self._fail_turn(scope, turn.seq, exc)
-            rebuild_error = self._rebuild_current_service() if dispatch_started else None
+            rebuild_error = (
+                self._rebuild_current_service() if dispatch_started else None
+            )
             if rendered:
-                cleanup_note = "；新的 Service 也未能建立" if rebuild_error is not None else ""
+                cleanup_note = (
+                    "；新的 Service 也未能建立" if rebuild_error is not None else ""
+                )
                 raise StateError(
                     "本轮结果已显示但 Turn 未保存；运行时审批已失效"
                     f"{cleanup_note}，请先核对 Session agent context 与外部状态，避免盲目重试"
@@ -199,7 +228,9 @@ class LiveApplication:
     def revise(self, instruction: str, *, renderer: Renderer | None = None) -> Any:
         if not instruction.strip():
             raise ValidationError("revision instruction cannot be empty")
-        return self._run_context_command(lambda: self.service.revise_proposal(instruction), renderer=renderer)
+        return self._run_context_command(
+            lambda: self.service.revise_proposal(instruction), renderer=renderer
+        )
 
     def list_sessions(self) -> tuple[SessionRecord, ...]:
         scope = self._require_scope()
@@ -225,7 +256,9 @@ class LiveApplication:
         scope = self._require_scope()
         if session_id == scope.session_id:
             return self._session()
-        target = self.sessions.get_session(scope.account_key, scope.repository_key, session_id)
+        target = self.sessions.get_session(
+            scope.account_key, scope.repository_key, session_id
+        )
         if target is None:
             raise StateError("Session not found")
         target_scope = target.scope
@@ -243,15 +276,21 @@ class LiveApplication:
 
     def delete_session(self, session_id: str) -> SessionRecord:
         scope = self._require_scope()
-        target = self.sessions.get_session(scope.account_key, scope.repository_key, session_id)
+        target = self.sessions.get_session(
+            scope.account_key, scope.repository_key, session_id
+        )
         if target is None:
             raise StateError("Session not found")
         if session_id != scope.session_id:
             return self.sessions.delete_session(target.scope)
 
-        remaining = [item for item in self.list_sessions() if item.session_id != session_id]
+        remaining = [
+            item for item in self.list_sessions() if item.session_id != session_id
+        ]
         replacement_id = remaining[0].session_id if remaining else _new_session_id()
-        replacement_scope = SessionScope(scope.account_key, scope.repository_key, replacement_id)
+        replacement_scope = SessionScope(
+            scope.account_key, scope.repository_key, replacement_id
+        )
         staged = self._prepare_service(replacement_scope)
         if remaining:
             replacement = remaining[0]
@@ -274,17 +313,17 @@ class LiveApplication:
             self.service.learning.enabled = enabled
         return enabled
 
-    def remember(self, scope: str, kind: str, content: str) -> tuple[IndexedMemory, bool]:
+    def remember(self, content: str) -> tuple[IndexedMemory, bool]:
         current = self._require_scope()
-        record, created = self.knowledge.remember(
+        item, created = self.memory.remember(
             current.account_key,
             current.repository_key,
-            scope=scope,
-            kind=kind,
-            content=content,
+            content,
         )
         indexed = next(
-            item for item in self.indexed_memories() if item.record.knowledge_id == record.knowledge_id
+            indexed
+            for indexed in self.indexed_memories(scope="user")
+            if indexed.item.relative_path == item.relative_path
         )
         return indexed, created
 
@@ -292,72 +331,65 @@ class LiveApplication:
         self,
         *,
         scope: str | None = None,
-        kind: str | None = None,
+        item_type: str | None = None,
     ) -> tuple[IndexedMemory, ...]:
         current = self._require_scope()
-        records = sorted(
-            self.knowledge.list_knowledge(current.account_key, current.repository_key),
-            key=lambda record: (record.created_at, record.knowledge_id),
-        )
-        if scope is None and kind is None:
-            visible_ids = {record.knowledge_id for record in records}
-        else:
-            visible_ids = {
-                record.knowledge_id
-                for record in self.knowledge.list_knowledge(
-                    current.account_key,
-                    current.repository_key,
-                    scope,
-                    kind=kind,
-                )
-            }
+        if scope not in {None, "user", "repository"}:
+            raise ValidationError("Memory scope must be user or repository")
+        scopes = (scope,) if scope is not None else ("user", "repository")
+        pairs = [
+            (selected_scope, item)
+            for selected_scope in scopes
+            for item in self.memory.list_items(
+                current.account_key,
+                current.repository_key,
+                scope=selected_scope,
+                item_type=item_type,
+            )
+        ]
         return tuple(
-            IndexedMemory(index, record)
-            for index, record in enumerate(records, start=1)
-            if record.knowledge_id in visible_ids
+            IndexedMemory(index, selected_scope, item)
+            for index, (selected_scope, item) in enumerate(pairs, start=1)
         )
 
-    def forget(self, index: int) -> KnowledgeRecord:
-        if not isinstance(index, int) or isinstance(index, bool) or index < 1:
-            raise ValidationError("Memory number must be a positive integer")
+    def forget(self, scope: str, relative_path: str) -> MemoryItem:
         current = self._require_scope()
-        indexed = next((item for item in self.indexed_memories() if item.index == index), None)
-        if indexed is None:
-            raise StateError("Memory number not found; run /memory to view current numbers")
-        forgotten = self.knowledge.forget(
+        forgotten = self.memory.forget(
             current.account_key,
             current.repository_key,
-            indexed.record.knowledge_id,
+            scope=scope,
+            relative_path=relative_path,
         )
         if forgotten is None:
             raise StateError("Memory not found")
         return forgotten
 
-    def _run_context_command(self, operation: Callable[[], Any], *, renderer: Renderer | None) -> Any:
+    def compact_memory(self) -> dict[str, tuple[str, ...]] | None:
+        return self.service.compact_memory(self._require_repository())
+
+    def _run_context_command(
+        self, operation: Callable[[], Any], *, renderer: Renderer | None
+    ) -> Any:
         self._require_scope()
         try:
             output = operation()
             project_output(output, text_sanitizer=self.store.text)
             if renderer is not None:
                 renderer(output)
-            interaction_id = self.service.completed_interaction_id
-            if interaction_id:
-                record = self.evidence.get(
-                    self._require_scope().account_key,
-                    self._require_scope().repository_key,
-                    interaction_id,
+            learning_trace = self.service.completed_learning_trace
+            if learning_trace is not None:
+                self.service.reflect_after_turn(
+                    turn_seq=max(1, self.service.completed_learning_turn_seq),
+                    user_input="",
+                    assistant_text="",
+                    learning_trace=learning_trace,
                 )
-                if record is not None:
-                    self.service.reflect_after_turn(
-                        turn_seq=record.completed_turn_seq,
-                        user_input="",
-                        assistant_text="",
-                        interaction_id=interaction_id,
-                    )
             return output
         except BaseException as exc:
             rebuild_error = self._rebuild_current_service()
-            cleanup_note = "；新的 Service 未能建立" if rebuild_error is not None else ""
+            cleanup_note = (
+                "；新的 Service 未能建立" if rebuild_error is not None else ""
+            )
             raise StateError(
                 f"Session agent 操作失败{cleanup_note}；运行时审批已失效，请核对外部状态后再继续"
             ) from exc
@@ -365,13 +397,22 @@ class LiveApplication:
     def _prepare_service(self, scope: SessionScope | None) -> GitAgentService:
         if self._service_factory is not None:
             return self._service_factory(scope)
+        accesses = MemoryAccessTracker()
         return GitAgentService(
-            build_capability_layer(self.github, trace=self.trace, reasoner=self.reasoner),
+            build_capability_layer(
+                self.github,
+                trace=self.trace,
+                reasoner=self.reasoner,
+                memory_roots=self.memory.roots(scope.account_key, scope.repository_key)
+                if scope
+                else None,
+                memory_accesses=accesses,
+            ),
             main_reasoner=self.reasoner,
             agent_reasoner=self.reasoner,
             session_manager=self.sessions,
-            knowledge_store=self.knowledge,
-            evidence_store=self.evidence,
+            memory_store=self.memory,
+            memory_accesses=accesses,
             trace=self.trace,
             session_scope=scope,
             input_budget_tokens=self.config.effective_input_budget,
@@ -401,7 +442,9 @@ class LiveApplication:
 
     def _session(self) -> SessionRecord:
         scope = self._require_scope()
-        session = self.sessions.get_session(scope.account_key, scope.repository_key, scope.session_id)
+        session = self.sessions.get_session(
+            scope.account_key, scope.repository_key, scope.session_id
+        )
         if session is None:
             raise StateError("active Session not found")
         return session
@@ -420,26 +463,35 @@ class LiveApplication:
         message = f"{type(error).__name__}: {error}"
         try:
             self.sessions.fail_turn(scope, seq, message)
-        except Exception:  # noqa: BLE001 - preserve the original failure; startup recovery owns the row
+        except Exception:  # noqa: BLE001, S110 - startup recovery owns the row
             # The original started row remains and startup recovery will interrupt it.
-            return
+            pass
+        finally:
+            self.service.discard_turn_learning()
 
 
 def build_live_application(config: CLIConfig) -> LiveApplication:
     config.validate()
     if not config.api_key:
-        raise ValidationError("未找到模型 API Key；请设置 OPENAI_API_KEY 或 GITAGENT_API_KEY")
+        raise ValidationError(
+            "未找到模型 API Key；请设置 OPENAI_API_KEY 或 GITAGENT_API_KEY"
+        )
     if config.provider not in {"openai", "litellm"}:
         raise ValidationError("GITAGENT_PROVIDER 必须是 openai 或 litellm")
 
     library = get_prompt_library()
     library.validate()
-    if config.prompts_dir is not None and Path(config.prompts_dir).resolve() != library.root:
+    if (
+        config.prompts_dir is not None
+        and Path(config.prompts_dir).resolve() != library.root
+    ):
         raise ValidationError(
             f"GITAGENT_PROMPTS_DIR 指向 {config.prompts_dir!r}，但提示词库加载自 {library.root}"
         )
 
-    client_class = LiteLLMChatClient if config.provider == "litellm" else OpenAIChatClient
+    client_class = (
+        LiteLLMChatClient if config.provider == "litellm" else OpenAIChatClient
+    )
     llm = client_class(
         model=config.model,
         api_key=config.api_key,
@@ -455,24 +507,35 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         api_url=config.github_api_url,
         timeout=config.effective_github_timeout,
     )
-    store = StateStore(config.state_path, secret_values=(config.github_token, config.api_key))
+    store = StateStore(
+        config.state_path, secret_values=(config.github_token, config.api_key)
+    )
     sessions = SessionManager(store)
-    knowledge = KnowledgeStore(store)
-    evidence = DomainEvidenceStore(store)
+    memory = MemoryStore(
+        config.memory_path,
+        text_sanitizer=lambda value: store.text(
+            value,
+            max_characters=8_000,
+            reject_secrets=True,
+        ),
+    )
     context_builder = ContextBuilder(
         sessions,
-        knowledge,
+        memory,
         context_window_tokens=config.context_window_tokens,
         max_output_tokens=config.max_tokens,
         safety_tokens=config.context_safety_tokens,
     )
+    accesses = MemoryAccessTracker()
     stateless_service = GitAgentService(
-        build_capability_layer(github, trace=trace, reasoner=reasoner),
+        build_capability_layer(
+            github, trace=trace, reasoner=reasoner, memory_accesses=accesses
+        ),
         main_reasoner=reasoner,
         agent_reasoner=reasoner,
         session_manager=sessions,
-        knowledge_store=knowledge,
-        evidence_store=evidence,
+        memory_store=memory,
+        memory_accesses=accesses,
         trace=trace,
         input_budget_tokens=config.effective_input_budget,
         auto_learning=config.auto_learning,
@@ -486,8 +549,7 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         service=stateless_service,
         store=store,
         sessions=sessions,
-        knowledge=knowledge,
-        evidence=evidence,
+        memory=memory,
         context_builder=context_builder,
     )
 

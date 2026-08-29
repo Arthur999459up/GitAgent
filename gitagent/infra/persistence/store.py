@@ -1,4 +1,4 @@
-"""Secure single-process SQLite boundary for Session and learning state."""
+"""Secure single-process SQLite boundary for transactional Session state."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Any
 
 from gitagent.domain.errors import StateError, ValidationError
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 REDACTED = "[REDACTED]"
 
 _SECRET_PATTERNS = (
@@ -74,54 +74,6 @@ _TABLE_DEFINITIONS = {
             FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         )
     """,
-    "knowledge": """
-        CREATE TABLE knowledge (
-            knowledge_id TEXT PRIMARY KEY,
-            account_key TEXT NOT NULL,
-            repository_key TEXT,
-            scope TEXT NOT NULL CHECK(scope IN ('user','repository')),
-            kind TEXT NOT NULL CHECK(kind IN ('preference','decision','constraint','reference','experience')),
-            topic TEXT NOT NULL,
-            content TEXT NOT NULL,
-            conditions TEXT NOT NULL DEFAULT '',
-            source TEXT NOT NULL CHECK(source IN (
-                'explicit_user','auto_reflection','user_feedback','domain_experience'
-            )),
-            confidence TEXT NOT NULL CHECK(confidence IN ('direct','strong','moderate')),
-            provenance TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            CHECK(
-                (scope='user' AND kind IN ('preference','experience') AND repository_key IS NULL)
-                OR
-                (scope='repository' AND kind IN ('decision','constraint','reference','experience')
-                    AND repository_key IS NOT NULL)
-            ),
-            CHECK((kind='experience' AND conditions!='') OR (kind!='experience' AND conditions=''))
-        )
-    """,
-    "domain_interactions": """
-        CREATE TABLE domain_interactions (
-            interaction_id TEXT PRIMARY KEY,
-            account_key TEXT NOT NULL,
-            repository_key TEXT NOT NULL,
-            repository_full_name TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            origin_turn_seq INTEGER NOT NULL CHECK(origin_turn_seq >= 1),
-            completed_turn_seq INTEGER NOT NULL CHECK(completed_turn_seq >= origin_turn_seq),
-            agent TEXT NOT NULL,
-            entity_type TEXT,
-            entity_id TEXT,
-            goal TEXT NOT NULL,
-            evidence TEXT NOT NULL,
-            reflection_status TEXT NOT NULL CHECK(reflection_status IN (
-                'pending','reflected','skipped','reflection_failed'
-            )),
-            reflection_error TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            reflected_at TEXT
-        )
-    """,
 }
 
 _INDEX_DEFINITIONS = {
@@ -132,33 +84,31 @@ _INDEX_DEFINITIONS = {
     "sessions_by_account_updated": (
         "CREATE INDEX sessions_by_account_updated ON sessions(account_key, updated_at DESC)"
     ),
-    "knowledge_by_scope_updated": (
-        "CREATE INDEX knowledge_by_scope_updated ON knowledge(account_key, repository_key, scope, updated_at DESC)"
-    ),
-    "knowledge_by_topic_updated": (
-        "CREATE INDEX knowledge_by_topic_updated ON knowledge(account_key, repository_key, topic, updated_at DESC)"
-    ),
-    "interactions_by_scope_created": (
-        "CREATE INDEX interactions_by_scope_created ON domain_interactions(account_key, repository_key, created_at DESC)"
-    ),
-    "interactions_by_reflection": (
-        "CREATE INDEX interactions_by_reflection ON domain_interactions(reflection_status, created_at ASC)"
-    ),
 }
 
 
 class StateStore:
     """Own the database path, schema, transactions, and final redaction boundary."""
 
-    def __init__(self, path: str | os.PathLike[str], *, secret_values: Sequence[str] = ()) -> None:
+    def __init__(
+        self, path: str | os.PathLike[str], *, secret_values: Sequence[str] = ()
+    ) -> None:
         self.path = Path(path).expanduser()
         if not self.path.is_absolute():
             raise ValidationError("GITAGENT_STATE_PATH must be an absolute path")
-        if isinstance(secret_values, (str, bytes)) or not isinstance(secret_values, Sequence):
+        if isinstance(secret_values, (str, bytes)) or not isinstance(
+            secret_values, Sequence
+        ):
             raise ValidationError("secret_values must be a sequence of strings")
         if any(not isinstance(value, str) for value in secret_values):
             raise ValidationError("secret_values must contain only strings")
-        self.secret_values = tuple(sorted({value for value in secret_values if len(value) >= 8}, key=len, reverse=True))
+        self.secret_values = tuple(
+            sorted(
+                {value for value in secret_values if len(value) >= 8},
+                key=len,
+                reverse=True,
+            )
+        )
         self._secure_path()
         self._initialize()
 
@@ -205,7 +155,9 @@ class StateStore:
         if isinstance(value, str):
             redacted, found = self._redact_text(value)
             if reject_secrets and found:
-                raise ValidationError("Memory content appears to contain a credential and was not saved")
+                raise ValidationError(
+                    "Memory content appears to contain a credential and was not saved"
+                )
             return redacted
         if value is None or isinstance(value, (bool, int)):
             return value
@@ -220,16 +172,25 @@ class StateStore:
                     raise ValidationError("state object keys must be strings")
                 safe_key = self.redact(key, reject_secrets=reject_secrets)
                 if safe_key in result:
-                    raise ValidationError("redaction produced duplicate state object keys")
-                if key.strip().casefold() in _SECRET_FIELD_NAMES and _contains_secret_field_value(item):
+                    raise ValidationError(
+                        "redaction produced duplicate state object keys"
+                    )
+                if (
+                    key.strip().casefold() in _SECRET_FIELD_NAMES
+                    and _contains_secret_field_value(item)
+                ):
                     if reject_secrets:
-                        raise ValidationError("Memory content appears to contain a credential and was not saved")
+                        raise ValidationError(
+                            "Memory content appears to contain a credential and was not saved"
+                        )
                     result[safe_key] = REDACTED
                 else:
                     result[safe_key] = self.redact(item, reject_secrets=reject_secrets)
             return result
         if isinstance(value, tuple):
-            return tuple(self.redact(item, reject_secrets=reject_secrets) for item in value)
+            return tuple(
+                self.redact(item, reject_secrets=reject_secrets) for item in value
+            )
         if isinstance(value, list):
             return [self.redact(item, reject_secrets=reject_secrets) for item in value]
         raise ValidationError(f"unsupported state value type: {type(value).__name__}")
@@ -244,15 +205,23 @@ class StateStore:
     ) -> str:
         if not isinstance(value, str):
             raise ValidationError("state text values must be strings")
-        if max_bytes is not None and (isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1):
+        if max_bytes is not None and (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or max_bytes < 1
+        ):
             raise ValidationError("max_bytes must be a positive integer")
         if max_characters is not None and (
-            isinstance(max_characters, bool) or not isinstance(max_characters, int) or max_characters < 0
+            isinstance(max_characters, bool)
+            or not isinstance(max_characters, int)
+            or max_characters < 0
         ):
             raise ValidationError("max_characters must be a non-negative integer")
         text = self.redact(value, reject_secrets=reject_secrets)
         if max_characters is not None and len(text) > max_characters:
-            raise ValidationError(f"text must be at most {max_characters} Unicode characters")
+            raise ValidationError(
+                f"text must be at most {max_characters} Unicode characters"
+            )
         return truncate_utf8(text, max_bytes) if max_bytes is not None else text
 
     def json(
@@ -262,7 +231,11 @@ class StateStore:
         max_bytes: int,
         reject_secrets: bool = False,
     ) -> str:
-        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or max_bytes < 1
+        ):
             raise ValidationError("max_bytes must be a positive integer")
         sanitized = self.redact(value, reject_secrets=reject_secrets)
         _validate_json_value(sanitized)
@@ -275,9 +248,13 @@ class StateStore:
                 allow_nan=False,
             )
         except (TypeError, ValueError) as exc:
-            raise ValidationError("state projection must contain only JSON-compatible values") from exc
+            raise ValidationError(
+                "state projection must contain only JSON-compatible values"
+            ) from exc
         if len(encoded.encode("utf-8")) > max_bytes:
-            raise ValidationError(f"JSON projection exceeds the {max_bytes}-byte storage boundary")
+            raise ValidationError(
+                f"JSON projection exceeds the {max_bytes}-byte storage boundary"
+            )
         return encoded
 
     def _redact_text(self, value: str) -> tuple[str, bool]:
@@ -312,7 +289,9 @@ class StateStore:
                 try:
                     parent.mkdir(mode=0o700, parents=True)
                 except OSError as exc:
-                    raise StateError(f"cannot create state directory: {parent}") from exc
+                    raise StateError(
+                        f"cannot create state directory: {parent}"
+                    ) from exc
             self._reject_symlink(parent, "state directory")
             self._require_owned(parent, "state directory")
             self._enforce_mode(parent, 0o700, "state directory")
@@ -348,7 +327,9 @@ class StateStore:
             os.chmod(path, mode, follow_symlinks=False)
             actual = path.stat(follow_symlinks=False).st_mode & 0o777
         except OSError as exc:
-            raise StateError(f"cannot enforce {mode:04o} permissions on {label}") from exc
+            raise StateError(
+                f"cannot enforce {mode:04o} permissions on {label}"
+            ) from exc
         if actual != mode:
             raise StateError(f"cannot enforce {mode:04o} permissions on {label}")
 
@@ -401,7 +382,9 @@ class StateStore:
                 raise StateError(f"state database integrity check failed: {integrity}")
             tables = {
                 str(row[0])
-                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
                 if not str(row[0]).startswith("sqlite_")
             }
             if not tables:
@@ -430,7 +413,9 @@ class StateStore:
         except (sqlite3.DatabaseError, OSError) as exc:
             if connection.in_transaction:
                 connection.rollback()
-            raise StateError("state database is corrupt or cannot be initialized") from exc
+            raise StateError(
+                "state database is corrupt or cannot be initialized"
+            ) from exc
         except Exception:
             if connection.in_transaction:
                 connection.rollback()
@@ -442,7 +427,9 @@ class StateStore:
     def _validate_schema(connection: sqlite3.Connection) -> None:
         table_rows = {
             str(row[0]): str(row[1])
-            for row in connection.execute("SELECT name,sql FROM sqlite_master WHERE type='table'")
+            for row in connection.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='table'"
+            )
             if not str(row[0]).startswith("sqlite_")
         }
         tables = set(table_rows)
@@ -465,10 +452,14 @@ class StateStore:
             """
         ).fetchall()
         if unexpected_objects:
-            raise StateError("state database schema contains unsupported triggers or views")
+            raise StateError(
+                "state database schema contains unsupported triggers or views"
+            )
         for table, definition in _TABLE_DEFINITIONS.items():
             if _canonical_sql(table_rows[table]) != _canonical_sql(definition):
-                raise StateError(f"state database schema definition for {table} is invalid")
+                raise StateError(
+                    f"state database schema definition for {table} is invalid"
+                )
         index_rows = {
             str(row[0]): str(row[1])
             for row in connection.execute(
@@ -483,8 +474,12 @@ class StateStore:
         for index, definition in _INDEX_DEFINITIONS.items():
             if _canonical_sql(index_rows[index]) != _canonical_sql(definition):
                 raise StateError(f"state database schema index {index} is invalid")
-        metadata = connection.execute("SELECT key,value FROM schema_metadata ORDER BY key").fetchall()
-        if [tuple(row) for row in metadata] != [("schema_version", str(SCHEMA_VERSION))]:
+        metadata = connection.execute(
+            "SELECT key,value FROM schema_metadata ORDER BY key"
+        ).fetchall()
+        if [tuple(row) for row in metadata] != [
+            ("schema_version", str(SCHEMA_VERSION))
+        ]:
             raise StateError("state database schema metadata is invalid")
         foreign_key_error = connection.execute("PRAGMA foreign_key_check").fetchone()
         if foreign_key_error is not None:
@@ -505,7 +500,9 @@ class _SanitizedTransaction:
             raise ValidationError("SQL statements must be strings")
         _, contains_secret = self.__store._redact_text(sql)
         if contains_secret:
-            raise ValidationError("SQL text must not contain credentials; use bound parameters")
+            raise ValidationError(
+                "SQL text must not contain credentials; use bound parameters"
+            )
         cursor = self.__connection.execute(sql, self.__store.redact(parameters))
         return _SanitizedCursor(cursor)
 
@@ -514,7 +511,9 @@ class _SanitizedTransaction:
             raise ValidationError("SQL statements must be strings")
         _, contains_secret = self.__store._redact_text(sql)
         if contains_secret:
-            raise ValidationError("SQL text must not contain credentials; use bound parameters")
+            raise ValidationError(
+                "SQL text must not contain credentials; use bound parameters"
+            )
         if isinstance(parameters, (str, bytes)) or not isinstance(parameters, Sequence):
             raise ValidationError("SQL parameter batches must be a sequence")
         sanitized = [self.__store.redact(item) for item in parameters]
@@ -625,7 +624,11 @@ def truncate_utf8(value: str, max_bytes: int | None) -> str:
         head_budget = available // 2
         tail_budget = available - head_budget
         head = encoded[:head_budget].decode("utf-8", errors="ignore").encode("utf-8")
-        tail = encoded[-tail_budget:].decode("utf-8", errors="ignore").encode("utf-8") if tail_budget else b""
+        tail = (
+            encoded[-tail_budget:].decode("utf-8", errors="ignore").encode("utf-8")
+            if tail_budget
+            else b""
+        )
         actual_removed = len(encoded) - len(head) - len(tail)
         if actual_removed == removed:
             return (head + marker + tail).decode("utf-8")

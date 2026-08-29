@@ -47,19 +47,6 @@ class ResolvedReference:
 
 
 @dataclass(frozen=True)
-class ContextMemory:
-    """A bounded, non-authoritative Knowledge item selected for one invocation."""
-
-    memory_id: str
-    scope: str
-    kind: str
-    content: str
-    topic: str = "general"
-    conditions: str = ""
-    source: str = "explicit_user"
-
-
-@dataclass(frozen=True)
 class RoutingContext:
     """Ephemeral, untrusted Session projection supplied to MainAgent/domain agents."""
 
@@ -68,22 +55,22 @@ class RoutingContext:
     working_state: dict[str, Any] = field(default_factory=dict)
     summary: str = ""
     history_units: tuple[dict[str, Any], ...] = ()
-    user_memories: tuple[ContextMemory, ...] = ()
-    repository_memories: tuple[ContextMemory, ...] = ()
-    selection_metadata: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    memory_index: str = ""
+    selection_metadata: dict[str, Any] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
 
 @dataclass(frozen=True)
 class AgentGuidance:
     """Validated, non-authoritative auxiliary data for a domain agent."""
 
-    user_memories: tuple[ContextMemory, ...] = ()
-    repository_memories: tuple[ContextMemory, ...] = ()
+    memory_index: str = ""
     resolved_references: tuple[ResolvedReference, ...] = ()
 
     @property
     def empty(self) -> bool:
-        return not (self.user_memories or self.repository_memories or self.resolved_references)
+        return not (self.memory_index or self.resolved_references)
 
 
 @dataclass(frozen=True)
