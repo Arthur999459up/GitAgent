@@ -54,6 +54,11 @@ _AGENT_NAMES = {
     "static_verifier": "Static Verifier",
 }
 
+_MEMORY_WORKFLOWS = {
+    "memory_extract": "Memory Extract",
+    "memory_dream": "Memory Dream",
+}
+
 
 class TerminalUI:
     """Small presentation layer: concise by default, complete trace on demand."""
@@ -135,12 +140,8 @@ class TerminalUI:
         hides successful completion echoes, task ids, long agent messages and raw
         argument JSON; `/trace` renders the complete history when needed.
         """
-        if (
-            event.category == TraceCategory.WORKFLOW
-            and event.name == "long_term_learning"
-            and event.status == TraceStatus.COMPLETED
-        ):
-            self._learning_result(event)
+        if event.category == TraceCategory.WORKFLOW and event.name in _MEMORY_WORKFLOWS:
+            self._memory_status(event)
             return
         if event.status == TraceStatus.COMPLETED:
             return
@@ -184,54 +185,26 @@ class TerminalUI:
 
         self.console.print(line)
 
-    def _learning_result(self, event: TraceEvent) -> None:
-        details = event.details
-        added = details.get("added") if isinstance(details.get("added"), list) else []
-        replaced = (
-            details.get("replaced") if isinstance(details.get("replaced"), list) else []
-        )
-        deleted = (
-            details.get("deleted") if isinstance(details.get("deleted"), list) else []
-        )
-        if not (added or replaced or deleted):
-            reason = str(details.get("reason") or "")
-            message = (
-                "未发现值得保存的长期内容"
-                if reason == "no_changes"
-                else "本轮没有写入长期 Memory"
-            )
-            line = Text("  ")
-            line.append("◇ ", style="bold dim")
-            line.append("长期学习", style="bold")
-            line.append(f"  {message}", style="dim")
-            self.console.print(line)
+    def _memory_status(self, event: TraceEvent) -> None:
+        if event.status not in {
+            TraceStatus.STARTED,
+            TraceStatus.COMPLETED,
+            TraceStatus.FAILED,
+        }:
             return
-
-        counts = " · ".join(
-            label
-            for count, label in (
-                (len(added), f"新增 {len(added)}"),
-                (len(replaced), f"替换 {len(replaced)}"),
-                (len(deleted), f"删除 {len(deleted)}"),
-            )
-            if count
-        )
-        header = Text("  ")
-        header.append("✦ ", style="bold green")
-        header.append("长期学习", style="bold")
-        header.append(f"  {counts}", style="green")
-        self.console.print(header)
-        for paths, symbol, action_name, style in (
-            (added, "+", "新增", "green"),
-            (replaced, "~", "替换", "cyan"),
-            (deleted, "-", "删除", "yellow"),
-        ):
-            for path in paths:
-                line = Text("    ")
-                line.append(f"{symbol} ", style=f"bold {style}")
-                line.append(f"{action_name} Memory", style=style)
-                line.append(f"：{_single_line(str(path), 120)}")
-                self.console.print(line)
+        symbol, style = _STATUS_STYLES[event.status]
+        if event.status == TraceStatus.STARTED:
+            symbol = "◆"
+        hint = event.display_message or {
+            TraceStatus.STARTED: "任务已开始。",
+            TraceStatus.COMPLETED: "任务已完成。",
+            TraceStatus.FAILED: "任务失败，请查看 /debug。",
+        }[event.status]
+        line = Text("  ")
+        line.append(f"{symbol} ", style=f"bold {style}")
+        line.append(_MEMORY_WORKFLOWS[event.name], style="bold")
+        line.append(f"  {_single_line(hint, 160)}", style=style)
+        self.console.print(line)
 
     def trace_history(self, events: list[TraceEvent]) -> None:
         """Render the complete audit-friendly trace, including ids/arguments/durations."""

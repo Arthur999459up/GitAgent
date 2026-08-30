@@ -16,7 +16,6 @@ from gitagent.agents import (
 )
 from gitagent.capability import CapabilityLayer
 from gitagent.domain.errors import RoutingError
-from gitagent.domain.learning import LearningTrace, TraceStep
 from gitagent.domain.models import (
     AgentGuidance,
     ApprovalIntent,
@@ -27,7 +26,6 @@ from gitagent.domain.models import (
     PlannedCapabilityCall,
     PullRequestOperation,
     Replacement,
-    RepositoryOperation,
     RepositoryRef,
     ResolvedReference,
     SessionScope,
@@ -47,10 +45,9 @@ from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.file_reads import FileReadLedger
 from gitagent.harness.validation.static import StaticVerifier
-from gitagent.infra.observability import TraceBus, TraceCategory, TraceStatus
+from gitagent.infra.observability import TraceBus
 from gitagent.infra.persistence import SessionManager
-from gitagent.learning import LearningCoordinator
-from gitagent.memory import MemoryAccessTracker, MemoryStore
+from gitagent.memory import MemoryPageStore, MemorySearch, MemoryStopHooks
 from gitagent.model import Reasoner
 
 from .approval_intent import ApprovalIntentClassifier
@@ -64,7 +61,6 @@ class ServiceResult:
     goal: str = ""
     entity_type: str | None = None
     entity_id: str | None = None
-    learning_trace: LearningTrace | None = None
     domain_output: Any = None
     workflow_summary: str = ""
 
@@ -79,12 +75,12 @@ class GitAgentService:
         main_reasoner: Reasoner,
         agent_reasoner: Reasoner | None = None,
         session_manager: SessionManager | None = None,
-        memory_store: MemoryStore | None = None,
-        memory_accesses: MemoryAccessTracker | None = None,
+        memory_store: MemoryPageStore | None = None,
+        memory_search: MemorySearch | None = None,
+        memory_hooks: MemoryStopHooks | None = None,
         trace: TraceBus | None = None,
         session_scope: SessionScope | None = None,
         input_budget_tokens: int = 26_112,
-        auto_learning: bool = True,
     ) -> None:
         self.harness = AgentHarness(
             capabilities, trace=trace, context_budget=input_budget_tokens
@@ -116,24 +112,12 @@ class GitAgentService:
         self.reasoner = agent_reasoner or main_reasoner
         self.session_manager = session_manager
         self.memory_store = memory_store
-        self.memory_accesses = memory_accesses or MemoryAccessTracker()
-        self.session_scope = session_scope
-        self.auto_learning = auto_learning
-        self.learning = (
-            LearningCoordinator(
-                self.main_agent,
-                session_manager,
-                self.memory_store,
-                self.harness.trace,
-                input_budget_tokens=input_budget_tokens,
-                enabled=auto_learning,
-            )
-            if session_manager is not None and self.memory_store is not None
-            else None
+        self.memory_search = memory_search or (
+            MemorySearch(memory_store) if memory_store is not None else None
         )
+        self.memory_hooks = memory_hooks
+        self.session_scope = session_scope
         self.dispatch_started = False
-        self.completed_learning_trace: LearningTrace | None = None
-        self.completed_learning_turn_seq = 0
         self._active_turn_seq = 0
         self._invalidated = False
 
@@ -153,8 +137,6 @@ class GitAgentService:
         if not main_messages or main_messages[-1].get("role") != "user":
             raise RoutingError("GitAgentService requires the current Main message thread")
         self.dispatch_started = False
-        self.completed_learning_trace = None
-        self.completed_learning_turn_seq = 0
         self._active_turn_seq = int(turn_seq or 0)
         if self._active_turn_seq > 0:
             self.harness.trace.bind_turn(
@@ -228,22 +210,15 @@ class GitAgentService:
             main_messages, context, domain_output, decision=decision
         )
 
-    def reflect_after_turn(
+    def memory_after_turn(
         self,
         *,
         turn_seq: int,
-        user_input: str,
-        assistant_text: str,
-        learning_trace: LearningTrace | None,
     ) -> Any:
-        """Run optional learning only after the successful Turn is durable."""
+        """Fire transcript-free stop hooks after the successful Turn is durable."""
 
-        if self.learning is None:
-            self.memory_accesses.clear()
-            self.completed_learning_trace = None
-            self.completed_learning_turn_seq = 0
+        if self.memory_hooks is None:
             return None
-        accessed_paths = self.memory_accesses.snapshot()
         try:
             session = self._require_session_manager().get_session(
                 self._scope().account_key,
@@ -252,35 +227,11 @@ class GitAgentService:
             )
             if session is None:
                 return None
-            del user_input, assistant_text
-            if learning_trace is not None:
-                return self.learning.reflect_domain(
-                    self._scope(),
-                    session.repository_full_name,
-                    learning_trace,
-                    turn_seq=turn_seq,
-                    accessed_paths=accessed_paths,
-                )
-            return self.learning.reflect_conversation(
-                self._scope(),
-                session.repository_full_name,
-                turn_seq=turn_seq,
-                accessed_paths=accessed_paths,
+            self.memory_hooks.handle_turn_stop(
+                self._scope(), session.repository_full_name, through_seq=turn_seq
             )
-        except Exception as exc:  # noqa: BLE001 - the successful Turn is already durable
-            self.harness.trace.emit(
-                session_id=self._scope().session_id,
-                category=TraceCategory.WORKFLOW,
-                name="long_term_learning",
-                status=TraceStatus.FAILED,
-                message=str(exc),
-                details={"error_type": type(exc).__name__},
-            )
+        except Exception:  # noqa: BLE001 - the business Turn is already durable
             return None
-        finally:
-            self.memory_accesses.clear()
-            self.completed_learning_trace = None
-            self.completed_learning_turn_seq = 0
 
     def approve(self) -> Any:
         context = self._require_pending_context()
@@ -290,21 +241,12 @@ class GitAgentService:
             "",
         )
 
-    def compact_memory(
-        self, repository_full_name: str
-    ) -> dict[str, tuple[str, ...]] | None:
-        """Run explicit maintenance without counting management reads as access."""
+    def dream_memory(self) -> dict[str, tuple[str, ...]] | None:
+        """Run one explicit controlled Dream, bypassing only the automatic gate."""
 
-        if self.learning is None:
+        if self.memory_hooks is None:
             return None
-        pending_accesses = self.memory_accesses.snapshot()
-        self.memory_accesses.clear()
-        try:
-            return self.learning.compact(self._scope(), repository_full_name)
-        finally:
-            self.memory_accesses.clear()
-            for root, path in pending_accesses:
-                self.memory_accesses.record(root, path)
+        return self.memory_hooks.dream_now(self._scope())
 
     def reject(self) -> Any:
         context = self._require_pending_context()
@@ -328,15 +270,7 @@ class GitAgentService:
         if self._invalidated:
             return
         self.harness.approvals.invalidate_all()
-        self.discard_turn_learning()
         self._invalidated = True
-
-    def discard_turn_learning(self) -> None:
-        """Drop ephemeral reads and trace evidence for a failed business turn."""
-
-        self.memory_accesses.clear()
-        self.completed_learning_trace = None
-        self.completed_learning_turn_seq = 0
 
     def _start_child(
         self,
@@ -345,7 +279,7 @@ class GitAgentService:
     ) -> tuple[Any, AgentContext]:
         scope = self._scope()
         goal = decision.request.strip()
-        guidance = self._guidance(decision.entity_type, decision.entity_id)
+        guidance = self._guidance(goal, decision.entity_type, decision.entity_id)
         if decision.target_agent == "repository":
             operation = self.repository_agent.operation_for(goal)
             context = self.harness.context(
@@ -357,7 +291,7 @@ class GitAgentService:
                 guidance=guidance,
             )
             self.repository_agent.prepare(context, operation)
-            self._start_learning_trace(context)
+            self._bind_context_turn(context)
             self.loop.start(context, self.repository_agent)
             return self._after_loop(context), context
         context = self.harness.context(
@@ -371,7 +305,7 @@ class GitAgentService:
             guidance=guidance,
         )
         if decision.target_agent == "issues":
-            self._start_learning_trace(context)
+            self._bind_context_turn(context)
             if decision.requested_reply and context.entity_id:
                 context.result_required = False
                 self.loop.start(context, self.issue_agent)
@@ -394,7 +328,7 @@ class GitAgentService:
             self.loop.start(context, self.issue_agent)
             return self._after_loop(context), context
         if decision.target_agent == "pull_requests":
-            self._start_learning_trace(context)
+            self._bind_context_turn(context)
             self.loop.start(context, self.pull_request_agent)
             return self._after_loop(context), context
         raise RoutingError(f"unsupported domain agent: {decision.target_agent}")
@@ -410,7 +344,6 @@ class GitAgentService:
         self._clear_context()
         if context.error:
             return context
-        self._capture_learning_trace(context)
         if context.result is not None:
             return context.result
         return context.final_message or context
@@ -614,7 +547,6 @@ class GitAgentService:
             goal=context.goal,
             entity_type=context.entity_type,
             entity_id=context.entity_id,
-            learning_trace=self.completed_learning_trace,
             domain_output=output,
         )
 
@@ -654,7 +586,6 @@ class GitAgentService:
             goal=context.goal,
             entity_type=context.entity_type,
             entity_id=context.entity_id,
-            learning_trace=self.completed_learning_trace,
             domain_output=domain_output,
             workflow_summary=summary,
         )
@@ -790,12 +721,10 @@ class GitAgentService:
         return context
 
     def _stored_guidance(self, context: AgentContext) -> AgentGuidance | None:
-        scope = self._scope()
+        memory = self._memory_context(context.goal)
         guidance = AgentGuidance(
-            memory_index=self._require_memory_store().read_index(
-                scope.account_key,
-                scope.repository_key,
-            ),
+            persistent_memory_index=memory.index,
+            persistent_memory_pages=MemorySearch.render(memory.selected_pages),
             resolved_references=self._resolved_references(
                 context.entity_type, context.entity_id
             ),
@@ -1027,18 +956,28 @@ class GitAgentService:
         )
 
     def _guidance(
-        self, entity_type: str | None, entity_id: str | None
+        self,
+        query: str,
+        entity_type: str | None,
+        entity_id: str | None,
     ) -> AgentGuidance | None:
-        scope = self._scope()
+        memory = self._memory_context(query)
         guidance = AgentGuidance(
-            memory_index=self._require_memory_store().read_index(
-                scope.account_key, scope.repository_key
-            ),
+            persistent_memory_index=memory.index,
+            persistent_memory_pages=MemorySearch.render(memory.selected_pages),
             resolved_references=self._resolved_references(
                 entity_type, entity_id
             ),
         )
         return None if guidance.empty else guidance
+
+    def _memory_context(self, query: str) -> Any:
+        scope = self._scope()
+        if self.memory_search is None:
+            raise RoutingError("GitAgentService requires a MemorySearch")
+        return self.memory_search.context(
+            scope.account_key, scope.repository_key, query
+        )
 
     @staticmethod
     def _resolved_references(
@@ -1115,9 +1054,9 @@ class GitAgentService:
             raise RoutingError("GitAgentService requires a SessionManager")
         return self.session_manager
 
-    def _require_memory_store(self) -> MemoryStore:
+    def _require_memory_store(self) -> MemoryPageStore:
         if self.memory_store is None:
-            raise RoutingError("GitAgentService requires a MemoryStore")
+            raise RoutingError("GitAgentService requires a MemoryPageStore")
         return self.memory_store
 
     @staticmethod
@@ -1144,30 +1083,8 @@ class GitAgentService:
             }
         )
 
-    def _start_learning_trace(self, context: AgentContext) -> None:
+    def _bind_context_turn(self, context: AgentContext) -> None:
         context.origin_turn_seq = self._active_turn_seq
-
-    def _capture_learning_trace(self, context: AgentContext) -> None:
-        if context.origin_turn_seq < 1:
-            return
-        steps = tuple(
-            step
-            for step in (_trace_step(item) for item in context.observations)
-            if step is not None
-        )
-        outcome = (
-            context.final_message
-            or _trace_result(to_plain(context.result))
-            or "任务成功完成"
-        )
-        self.completed_learning_trace = LearningTrace(
-            goal=context.goal[:1000],
-            outcome=outcome[:1200],
-            trajectory=steps,
-        )
-        self.completed_learning_turn_seq = max(
-            context.origin_turn_seq, self._active_turn_seq
-        )
 
     def _require_live(self) -> None:
         if self._invalidated:
@@ -1185,72 +1102,3 @@ class GitAgentService:
             "issues": "issue",
             "pull_requests": "pull_request",
         }.get(owner, "repository")
-
-
-def _trace_step(observation: Any) -> TraceStep | None:
-    """Project one observation to a short causal step without raw tool output."""
-
-    if not isinstance(observation, dict):
-        return None
-    kind = str(observation.get("kind") or "")
-    payload = observation.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    if kind == "capability":
-        capability_id = str(payload.get("capability_id") or "capability")
-        arguments = payload.get("arguments")
-        identity = _trace_arguments(arguments) if isinstance(arguments, dict) else ""
-        action = f"{capability_id}{identity}"
-        return TraceStep(action[:400], _trace_result(payload.get("data"))[:800])
-    if kind == "capability_error":
-        capability_id = str(payload.get("capability_id") or "capability")
-        message = str(payload.get("message") or payload.get("error") or "调用失败")
-        return TraceStep(f"{capability_id} 失败"[:400], message[:800])
-    if kind in {"user_decision", "rejection"}:
-        action = str(payload.get("action") or kind)
-        result = str(payload.get("instruction") or payload.get("message") or "")
-        return TraceStep(action[:400], result[:800])
-    return None
-
-
-def _trace_arguments(arguments: dict[str, Any]) -> str:
-    keys = ("path", "root", "issue_number", "pull_number", "run_id", "ref")
-    selected = [
-        f"{key}={arguments[key]}"
-        for key in keys
-        if arguments.get(key) not in (None, "")
-    ]
-    return f" ({', '.join(selected)})" if selected else ""
-
-
-def _trace_result(value: Any) -> str:
-    if value is None:
-        return "完成"
-    if isinstance(value, str):
-        return " ".join(value.split())[:800]
-    if isinstance(value, bool):
-        return "成功" if value else "未成功"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, list):
-        return f"返回 {len(value)} 项"
-    if isinstance(value, dict):
-        for key in (
-            "summary",
-            "conclusion",
-            "status",
-            "message",
-            "state",
-            "result",
-            "answer",
-            "path",
-        ):
-            scalar = value.get(key)
-            if isinstance(scalar, (str, int, float, bool)) and str(scalar).strip():
-                return f"{key}: {' '.join(str(scalar).split())}"[:800]
-        for key in ("files", "items", "matches", "checks", "pull_requests", "issues"):
-            items = value.get(key)
-            if isinstance(items, list):
-                return f"{key}: {len(items)} 项"
-        return "成功返回结构化结果"
-    return type(value).__name__

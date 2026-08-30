@@ -12,15 +12,6 @@ agents:
       ask: []
       deny: []
 
-  main_reflection:
-    discover:
-      - native.read
-    invoke:
-      allow:
-        - native.read
-      ask: []
-      deny: []
-
   repository:
     discover:
       - repository.get_repo_tree

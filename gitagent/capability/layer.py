@@ -275,7 +275,11 @@ class CapabilityLayer:
                 call_id,
                 capability_id,
                 "call.succeeded",
-                {"attempts": attempts, "status": "ok", "content": raw},
+                {
+                    "attempts": attempts,
+                    "status": "ok",
+                    "content": _trace_content(capability_id, arguments, raw),
+                },
             )
             return result
         raise CapabilityInternalError("capability recovery loop exceeded its invariant")
@@ -330,3 +334,18 @@ class CapabilityLayer:
             details={"agent": context.agent_id, **details},
             session_id=context.session_id,
         )
+
+
+def _trace_content(
+    capability_id: str, arguments: dict[str, Any], content: Any
+) -> Any:
+    if capability_id == "native.read" and arguments.get("root") in {
+        "private_memory",
+        "project_memory",
+    }:
+        return {
+            "memory_page_loaded": True,
+            "root": arguments.get("root"),
+            "path": arguments.get("path"),
+        }
+    return content

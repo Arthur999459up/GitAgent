@@ -34,6 +34,9 @@ class TraceEvent:
     name: str
     status: TraceStatus
     message: str = ""
+    # UI-only text: SessionEventRecorder intentionally persists message/details,
+    # never this field, so a friendly summary cannot enter durable history.
+    display_message: str = ""
     details: dict[str, Any] = field(default_factory=dict)
     duration_ms: float | None = None
     turn_seq: int | None = None
@@ -71,6 +74,7 @@ class TraceBus:
         name: str,
         status: TraceStatus,
         message: str = "",
+        display_message: str = "",
         details: dict[str, Any] | None = None,
         duration_ms: float | None = None,
         turn_seq: int | None = None,
@@ -84,6 +88,7 @@ class TraceBus:
             name=name,
             status=status,
             message=message,
+            display_message=display_message,
             details=details or {},
             duration_ms=duration_ms,
             turn_seq=effective_turn_seq,

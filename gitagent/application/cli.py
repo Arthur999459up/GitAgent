@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 from prompt_toolkit import prompt as terminal_prompt
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -77,7 +80,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         console.print("\n已取消启动。")
         return 0
 
-    return _repl(application)
+    try:
+        return _repl(application)
+    finally:
+        application.memory_hooks.close()
 
 
 def _config_from_args(args: argparse.Namespace) -> CLIConfig:
@@ -286,13 +292,17 @@ def _repl(application: LiveApplication) -> int:
 
     while True:
         try:
-            request = terminal_prompt(
-                "You › ",
-                history=history,
-                multiline=True,
-                key_bindings=bindings,
-                prompt_continuation="...  ",
-            ).strip()
+            # Memory stop hooks finish on worker threads. StdoutProxy lets their
+            # status lines render above the active input and then redraws the
+            # prompt, instead of splicing output into the user's text.
+            with patch_stdout(raw=True):
+                request = terminal_prompt(
+                    "You › ",
+                    history=history,
+                    multiline=True,
+                    key_bindings=bindings,
+                    prompt_continuation="...  ",
+                ).strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n再见！")
             return 0
@@ -454,29 +464,22 @@ def _run_command(application: LiveApplication, request: str) -> None:
             _show_compaction(application.compact())
         except (GitAgentError, ValueError) as exc:
             console.print(f"[red]Context 压缩失败：{exc}[/red]")
-    elif command == "/learning":
-        state = argument.casefold()
-        if state not in {"", "on", "off"}:
-            console.print("[yellow]用法：/learning [on|off][/yellow]")
-            return
-        if state:
-            application.set_auto_learning(state == "on")
-        label = "已启用" if application.config.auto_learning else "已关闭"
-        console.print(f"自动长期学习：[cyan]{label}[/cyan]")
     elif command == "/remember":
         _remember(application, argument)
     elif command == "/memory":
         _memory(application, argument)
     elif command == "/forget":
-        scope_token, _, relative_path = argument.partition(" ")
-        scope = {"user": "user", "repo": "repository"}.get(scope_token.casefold())
-        if scope is None or not relative_path.strip():
-            console.print("[yellow]用法：/forget <user|repo> <相对路径>[/yellow]")
+        scope_token, _, identifier = argument.partition(" ")
+        scope = {"private": "private", "project": "project"}.get(
+            scope_token.casefold()
+        )
+        if scope is None or not identifier.strip():
+            console.print("[yellow]用法：/forget <private|project> <id|name>[/yellow]")
             return
         try:
-            memory = application.forget(scope, relative_path.strip())
+            memory = application.forget(identifier.strip(), scope=scope)
             console.print(
-                f"已忘记记忆 [cyan]{scope_token}:{memory.relative_path}[/cyan]：{memory.text}"
+                f"已忘记记忆 [cyan]{scope_token}:{memory.name}[/cyan]：{memory.description}"
             )
         except (GitAgentError, ValueError) as exc:
             console.print(f"[red]记忆删除失败：{exc}[/red]")
@@ -824,12 +827,24 @@ def _show_compaction(result: CompactResult) -> None:
 
 
 def _remember(application: LiveApplication, argument: str) -> None:
+    scope = "private"
     content = argument.strip()
+    if content.startswith("--scope "):
+        parts = content.split(maxsplit=2)
+        if len(parts) < 3 or parts[1].casefold() not in {"private", "project"}:
+            console.print(
+                "[yellow]用法：/remember [--scope private|project] <内容>[/yellow]"
+            )
+            return
+        scope = parts[1].casefold()
+        content = parts[2].strip()
     if not content:
-        console.print("[yellow]用法：/remember <内容>[/yellow]")
+        console.print(
+            "[yellow]用法：/remember [--scope private|project] <内容>[/yellow]"
+        )
         return
     try:
-        memory, created = application.remember(content)
+        memory, created = application.remember(content, scope=scope)
         if created:
             console.print(f"已保存固定记忆 [cyan]{memory.item.relative_path}[/cyan]")
         else:
@@ -841,58 +856,116 @@ def _remember(application: LiveApplication, argument: str) -> None:
 
 
 def _memory(application: LiveApplication, argument: str) -> None:
-    scope_token = argument.casefold()
-    if scope_token not in {"", "user", "repo", "experience", "compact", "rebuild"}:
-        console.print(
-            "[yellow]用法：/memory [user|repo|experience|compact|rebuild][/yellow]"
-        )
+    try:
+        parts = shlex.split(argument)
+    except ValueError as exc:
+        console.print(f"[red]Memory 命令解析失败：{exc}[/red]")
         return
-    if scope_token == "compact":
-        result = application.compact_memory()
+    action = parts[0].casefold() if parts else "list"
+    if action == "auto":
+        state = parts[1].casefold() if len(parts) == 2 else ""
+        if len(parts) > 2 or state not in {"", "on", "off"}:
+            console.print("[yellow]用法：/memory auto [on|off][/yellow]")
+            return
+        if state:
+            application.set_memory_automation(state == "on")
+        label = "已启用" if application.config.memory_automation else "已关闭"
+        console.print(f"Memory 自动提取与整理：[cyan]{label}[/cyan]")
+        return
+    if action == "dream":
+        result = application.dream_memory()
         if result is None:
-            console.print("[yellow]Memory 整理失败；请查看 /debug。[/yellow]")
-        else:
-            console.print(
-                "Memory 整理完成："
-                f"新增 {len(result['added'])}，替换 {len(result['replaced'])}，"
-                f"删除 {len(result['deleted'])}，跳过 {len(result['skipped'])}。"
-            )
+            console.print("[yellow]Memory Dream 失败或已有任务正在运行；请查看 /debug。[/yellow]")
         return
-    if scope_token == "rebuild":
+    if action == "rebuild":
         scope = application._require_scope()
         application.memory.rebuild_index(scope.account_key, scope.repository_key)
         console.print("Memory 索引已重建。")
         return
-    scope = {"": None, "user": "user", "repo": "repository", "experience": None}[
-        scope_token
-    ]
-    item_type = "experience" if scope_token == "experience" else None
+    if action == "search":
+        query = " ".join(parts[1:]).strip()
+        if not query:
+            console.print("[yellow]用法：/memory search <query>[/yellow]")
+            return
+        hits = application.search_memories(query)
+        if not hits:
+            console.print("[dim]没有相关的 Persistent Memory。[/dim]")
+            return
+        table = Table(title="Memory Search", show_lines=True)
+        for heading in ("作用域", "类型", "名称", "描述", "重要性", "状态"):
+            table.add_column(heading)
+        for hit in hits:
+            table.add_row(
+                hit.scope,
+                hit.type,
+                hit.name,
+                hit.description,
+                str(hit.importance),
+                "stale" if hit.stale else "active",
+            )
+        console.print(table)
+        return
+    if action == "show":
+        identifier = " ".join(parts[1:]).strip()
+        if not identifier:
+            console.print("[yellow]用法：/memory show <id|name>[/yellow]")
+            return
+        try:
+            page = application.show_memory(identifier)
+        except (GitAgentError, ValueError) as exc:
+            console.print(f"[red]Memory 读取失败：{exc}[/red]")
+            return
+        console.print(
+            Panel(
+                page.body,
+                title=f"{page.scope} · {page.type} · {page.name}",
+                subtitle=f"{page.id} · importance={page.importance} · {page.updated_at}",
+            )
+        )
+        return
+    if action == "forget":
+        identifier = " ".join(parts[1:]).strip()
+        if not identifier:
+            console.print("[yellow]用法：/memory forget <id|name>[/yellow]")
+            return
+        try:
+            page = application.forget(identifier)
+            console.print(f"已忘记 Memory [cyan]{page.scope}:{page.name}[/cyan]。")
+        except (GitAgentError, ValueError) as exc:
+            console.print(f"[red]Memory 删除失败：{exc}[/red]")
+        return
+    if action not in {"list", "private", "project", "all"} or len(parts) > 1:
+        console.print(
+            "[yellow]用法：/memory [private|project|all|search <query>|show <id|name>|"
+            "forget <id|name>|rebuild|dream|auto [on|off]][/yellow]"
+        )
+        return
+    selected_scope = action if action in {"private", "project"} else None
     try:
-        memories = application.indexed_memories(scope=scope, item_type=item_type)
+        memories = application.indexed_memories(
+            scope=selected_scope,
+            include_inactive=action == "all",
+        )
     except (GitAgentError, ValueError) as exc:
         console.print(f"[red]Memory 读取失败：{exc}[/red]")
         return
     if not memories:
         console.print("[dim]当前作用域没有长期 Memory。[/dim]")
         return
-    table = Table(title="Long-term Memory", show_lines=True)
-    table.add_column("作用域")
-    table.add_column("类型")
-    table.add_column("路径", style="cyan")
-    table.add_column("优先级")
-    table.add_column("内容")
-    table.add_column("固定")
-    table.add_column("最后访问")
+    table = Table(title="Persistent Memory Pages", show_lines=True)
+    for heading in ("作用域", "类型", "名称", "描述", "重要性", "更新时间", "状态"):
+        table.add_column(heading)
+    now = datetime.now().astimezone()
     for indexed in memories:
         memory = indexed.item
         table.add_row(
             indexed.scope,
             memory.type,
-            memory.relative_path,
-            memory.priority,
-            memory.text,
-            "是" if memory.pinned else "否",
-            memory.last_accessed_at,
+            memory.name,
+            memory.description,
+            str(memory.importance),
+            memory.updated_at,
+            memory.status(now),
         )
     console.print(table)
 
@@ -936,10 +1009,9 @@ def _show_help() -> None:
             "  /reset                保留 Turn 并建立新 Context 边界\n"
             "  /delete <编号>        删除 Session\n"
             "  /compact              压缩旧 Turn 的 Context 投影\n"
-            "  /learning [on|off]    查看或切换机会式长期学习\n"
-            "  /memory [user|repo|experience|compact|rebuild]  查看或整理长期 Memory\n"
-            "  /remember <内容>       创建用户级固定 Memory\n"
-            "  /forget <user|repo> <items/*.md>  删除指定 Memory\n"
+            "  /memory [private|project|all|search|show|forget|rebuild|dream|auto]  管理 Persistent Memory\n"
+            "  /remember [--scope private|project] <内容>  创建人工 Memory Page\n"
+            "  /forget <private|project> <id|name>  删除指定 Memory Page\n"
             "  /model [name]         查看或切换模型\n"
             "  /tokens               查看模型 token 与估算费用\n"
             "  /approve              批准当前 Session 的待执行提案\n"

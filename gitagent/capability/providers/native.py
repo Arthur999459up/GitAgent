@@ -66,7 +66,6 @@ class NativeProvider:
         permission_resolver: Callable[[InvocationContext], frozenset[str]]
         | None = None,
         memory_roots: Mapping[str, str | Path] | None = None,
-        memory_read_callback: Callable[[str, str], None] | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         if not self.workspace_root.is_dir():
@@ -75,13 +74,12 @@ class NativeProvider:
             )
         self.read_roots = {"workspace": self.workspace_root}
         for name, value in dict(memory_roots or {}).items():
-            if name not in {"user_memory", "repository_memory"}:
+            if name not in {"private_memory", "project_memory"}:
                 raise ValidationError(f"unknown native read root: {name}")
             path = Path(value).resolve()
             if not path.is_dir():
                 raise ValidationError(f"native read root is not a directory: {path}")
             self.read_roots[name] = path
-        self.memory_read_callback = memory_read_callback
         self.subagent_runner = subagent_runner
         self.permission_resolver = permission_resolver
         self._definitions = self._build_definitions()
@@ -128,7 +126,7 @@ class NativeProvider:
                         "path": {"type": "string", "minLength": 1},
                         "root": {
                             "type": "string",
-                            "enum": ["workspace", "user_memory", "repository_memory"],
+                            "enum": ["workspace", "private_memory", "project_memory"],
                         },
                         "offset": {"type": "integer", "minimum": 1},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 4000},
@@ -289,8 +287,6 @@ class NativeProvider:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         selected = lines[offset - 1 : offset - 1 + limit]
         relative = path.relative_to(self.read_roots[root]).as_posix()
-        if root != "workspace" and self.memory_read_callback is not None:
-            self.memory_read_callback(root, relative)
         return {
             "root": root,
             "path": relative,

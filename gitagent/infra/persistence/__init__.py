@@ -8,6 +8,8 @@ from .event_log import (
 )
 from .sessions import (
     OPEN_QUESTION_CHARACTER_LIMIT,
+    MemoryDreamState,
+    MemoryExtractionState,
     SessionManager,
     SessionRecord,
     TurnRecord,
@@ -25,6 +27,8 @@ __all__ = [
     "OPEN_QUESTION_CHARACTER_LIMIT",
     "REDACTED",
     "SCHEMA_VERSION",
+    "MemoryDreamState",
+    "MemoryExtractionState",
     "SessionEventLog",
     "SessionEventRecorder",
     "SessionManager",

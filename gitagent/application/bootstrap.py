@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from gitagent.domain.errors import StateError, ValidationError
-from gitagent.domain.learning import MemoryItem
 from gitagent.domain.models import SessionScope
 from gitagent.harness.context import CompactResult, ContextBuilder
 from gitagent.infra.github import GitHubClient
@@ -24,7 +23,15 @@ from gitagent.infra.persistence import (
     build_repository_key,
     merge_working_state,
 )
-from gitagent.memory import MemoryAccessTracker, MemoryStore
+from gitagent.memory import (
+    AutoDream,
+    MemoryExtractionContextBuilder,
+    MemoryExtractor,
+    MemoryPage,
+    MemoryPageStore,
+    MemorySearch,
+    MemoryStopHooks,
+)
 from gitagent.model import ChatClient, LiteLLMChatClient, LLMReasoner, OpenAIChatClient
 from gitagent.prompts import get_prompt_library
 
@@ -42,7 +49,7 @@ class IndexedMemory:
 
     index: int
     scope: str
-    item: MemoryItem
+    item: MemoryPage
 
 
 @dataclass
@@ -55,7 +62,9 @@ class LiveApplication:
     service: GitAgentService
     store: StateStore
     sessions: SessionManager
-    memory: MemoryStore
+    memory: MemoryPageStore
+    memory_search: MemorySearch
+    memory_hooks: MemoryStopHooks
     context_builder: ContextBuilder
     repository: str | None = None
     scope: SessionScope | None = None
@@ -141,7 +150,9 @@ class LiveApplication:
         dispatch_started = False
         rendered = False
         try:
-            memory_index = self.memory.read_index(scope.account_key, scope.repository_key)
+            memory_context = self.memory_search.context(
+                scope.account_key, scope.repository_key, text
+            )
             main_tools = self.service.main_agent.provider_tools(
                 session_id=scope.session_id,
                 repository=repository,
@@ -153,7 +164,7 @@ class LiveApplication:
                 text,
                 system=self.service.main_agent.current_system(
                     repository=repository,
-                    memory_index=memory_index,
+                    memory_context=memory_context,
                 ),
                 tools=main_tools,
                 turn_seq=turn.seq,
@@ -190,13 +201,7 @@ class LiveApplication:
                 entity_manifests=projection.entity_manifests,
                 working_state=next_state,
             )
-            if result.agent is None or result.learning_trace is not None:
-                self.service.reflect_after_turn(
-                    turn_seq=turn.seq,
-                    user_input=text,
-                    assistant_text=projection.assistant_text,
-                    learning_trace=result.learning_trace,
-                )
+            self.service.memory_after_turn(turn_seq=turn.seq)
             return result
         except KeyboardInterrupt as exc:
             self._fail_turn(scope, turn.seq, exc)
@@ -314,26 +319,27 @@ class LiveApplication:
     def compact(self) -> CompactResult:
         return self.context_builder.compact(self._require_scope())
 
-    def set_auto_learning(self, enabled: bool) -> bool:
+    def set_memory_automation(self, enabled: bool) -> bool:
         if not isinstance(enabled, bool):
-            raise TypeError("auto-learning state must be a boolean")
-        self.config.auto_learning = enabled
-        self.service.auto_learning = enabled
-        if self.service.learning is not None:
-            self.service.learning.enabled = enabled
+            raise TypeError("Memory automation state must be a boolean")
+        self.config.memory_automation = enabled
+        self.memory_hooks.enabled = enabled
         return enabled
 
-    def remember(self, content: str) -> tuple[IndexedMemory, bool]:
+    def remember(
+        self, content: str, *, scope: str = "private"
+    ) -> tuple[IndexedMemory, bool]:
         current = self._require_scope()
-        item, created = self.memory.remember(
+        item, created = self.memory.manual_write(
             current.account_key,
             current.repository_key,
             content,
+            scope=scope,
         )
         indexed = next(
             indexed
-            for indexed in self.indexed_memories(scope="user")
-            if indexed.item.relative_path == item.relative_path
+            for indexed in self.indexed_memories(scope=item.scope, include_inactive=True)
+            if indexed.item.id == item.id
         )
         return indexed, created
 
@@ -341,41 +347,59 @@ class LiveApplication:
         self,
         *,
         scope: str | None = None,
-        item_type: str | None = None,
+        memory_type: str | None = None,
+        include_inactive: bool = False,
     ) -> tuple[IndexedMemory, ...]:
         current = self._require_scope()
-        if scope not in {None, "user", "repository"}:
-            raise ValidationError("Memory scope must be user or repository")
-        scopes = (scope,) if scope is not None else ("user", "repository")
-        pairs = [
-            (selected_scope, item)
-            for selected_scope in scopes
-            for item in self.memory.list_items(
-                current.account_key,
-                current.repository_key,
-                scope=selected_scope,
-                item_type=item_type,
-            )
-        ]
+        pages = self.memory.list_pages(
+            current.account_key,
+            current.repository_key,
+            scope=scope,
+            memory_type=memory_type,
+            include_inactive=include_inactive,
+        )
         return tuple(
-            IndexedMemory(index, selected_scope, item)
-            for index, (selected_scope, item) in enumerate(pairs, start=1)
+            IndexedMemory(index, item.scope, item)
+            for index, item in enumerate(pages, start=1)
         )
 
-    def forget(self, scope: str, relative_path: str) -> MemoryItem:
+    def search_memories(self, query: str) -> tuple[Any, ...]:
+        current = self._require_scope()
+        return self.memory_search.search(
+            current.account_key, current.repository_key, query
+        )
+
+    def show_memory(self, identifier: str) -> MemoryPage:
+        matches = [
+            indexed.item
+            for indexed in self.indexed_memories(include_inactive=True)
+            if identifier in {
+                indexed.item.id,
+                indexed.item.name,
+                indexed.item.relative_path,
+            }
+        ]
+        if len(matches) > 1:
+            raise ValidationError("Memory identifier is ambiguous; include its scope")
+        if not matches:
+            raise StateError("Memory not found")
+        return matches[0]
+
+    def forget(self, identifier: str, *, scope: str | None = None) -> MemoryPage:
         current = self._require_scope()
         forgotten = self.memory.forget(
             current.account_key,
             current.repository_key,
+            identifier=identifier,
             scope=scope,
-            relative_path=relative_path,
         )
         if forgotten is None:
             raise StateError("Memory not found")
         return forgotten
 
-    def compact_memory(self) -> dict[str, tuple[str, ...]] | None:
-        return self.service.compact_memory(self._require_repository())
+    def dream_memory(self) -> dict[str, tuple[str, ...]] | None:
+        self._require_repository()
+        return self.service.dream_memory()
 
     def _run_context_command(
         self, operation: Callable[[], Any], *, renderer: Renderer | None
@@ -386,14 +410,6 @@ class LiveApplication:
             project_output(output, text_sanitizer=self.store.text)
             if renderer is not None:
                 renderer(output)
-            learning_trace = self.service.completed_learning_trace
-            if learning_trace is not None:
-                self.service.reflect_after_turn(
-                    turn_seq=max(1, self.service.completed_learning_turn_seq),
-                    user_input="",
-                    assistant_text="",
-                    learning_trace=learning_trace,
-                )
             return output
         except BaseException as exc:
             rebuild_error = self._rebuild_current_service()
@@ -407,7 +423,6 @@ class LiveApplication:
     def _prepare_service(self, scope: SessionScope | None) -> GitAgentService:
         if self._service_factory is not None:
             return self._service_factory(scope)
-        accesses = MemoryAccessTracker()
         return GitAgentService(
             build_capability_layer(
                 self.github,
@@ -416,17 +431,16 @@ class LiveApplication:
                 memory_roots=self.memory.roots(scope.account_key, scope.repository_key)
                 if scope
                 else None,
-                memory_accesses=accesses,
             ),
             main_reasoner=self.reasoner,
             agent_reasoner=self.reasoner,
             session_manager=self.sessions,
             memory_store=self.memory,
-            memory_accesses=accesses,
+            memory_search=self.memory_search,
+            memory_hooks=self.memory_hooks,
             trace=self.trace,
             session_scope=scope,
             input_budget_tokens=self.config.effective_input_budget,
-            auto_learning=self.config.auto_learning,
         )
 
     def _swap_service(self, service: GitAgentService) -> None:
@@ -434,6 +448,8 @@ class LiveApplication:
         if previous is not service:
             previous.invalidate()
         self.service = service
+        if self.scope is not None and self.repository:
+            self.memory_hooks.resume_pending(self.scope, self.repository)
 
     def _rebuild_current_service(self) -> BaseException | None:
         scope = self._require_scope()
@@ -476,8 +492,6 @@ class LiveApplication:
         except Exception:  # noqa: BLE001, S110 - startup recovery owns the row
             # The original started row remains and startup recovery will interrupt it.
             pass
-        finally:
-            self.service.discard_turn_learning()
 
 
 def build_live_application(config: CLIConfig) -> LiveApplication:
@@ -525,7 +539,7 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
     trace = TraceBus(
         persistent_sink=SessionEventRecorder(event_log, sessions.scope_for_session)
     )
-    memory = MemoryStore(
+    memory = MemoryPageStore(
         config.memory_path,
         text_sanitizer=lambda value: store.text(
             value,
@@ -533,26 +547,40 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
             reject_secrets=True,
         ),
     )
-    context_builder = ContextBuilder(
+    memory_search = MemorySearch(memory)
+    extractor = MemoryExtractor(reasoner, memory)
+    extraction_contexts = MemoryExtractionContextBuilder(
         sessions,
         memory,
+        input_budget_tokens=config.effective_input_budget,
+    )
+    dream = AutoDream(sessions, memory)
+    memory_hooks = MemoryStopHooks(
+        sessions,
+        extractor,
+        extraction_contexts,
+        dream,
+        trace,
+        enabled=config.memory_automation,
+    )
+    context_builder = ContextBuilder(
+        sessions,
         context_window_tokens=config.context_window_tokens,
         max_output_tokens=config.max_tokens,
         safety_tokens=config.context_safety_tokens,
     )
-    accesses = MemoryAccessTracker()
     stateless_service = GitAgentService(
         build_capability_layer(
-            github, trace=trace, reasoner=reasoner, memory_accesses=accesses
+            github, trace=trace, reasoner=reasoner
         ),
         main_reasoner=reasoner,
         agent_reasoner=reasoner,
         session_manager=sessions,
         memory_store=memory,
-        memory_accesses=accesses,
+        memory_search=memory_search,
+        memory_hooks=memory_hooks,
         trace=trace,
         input_budget_tokens=config.effective_input_budget,
-        auto_learning=config.auto_learning,
     )
     return LiveApplication(
         config=config,
@@ -564,6 +592,8 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         store=store,
         sessions=sessions,
         memory=memory,
+        memory_search=memory_search,
+        memory_hooks=memory_hooks,
         context_builder=context_builder,
     )
 

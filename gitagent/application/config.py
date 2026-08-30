@@ -59,7 +59,7 @@ class CLIConfig:
     prompts_dir: str | None = None
     context_window_tokens: int = 32768
     context_safety_tokens: int = 2048
-    auto_learning: bool = True
+    memory_automation: bool = True
 
     @property
     def effective_input_budget(self) -> int:
@@ -128,8 +128,8 @@ class CLIConfig:
             or self.event_retention_days < 0
         ):
             raise ValueError("GITAGENT_EVENT_RETENTION_DAYS 必须是非负整数")
-        if not isinstance(self.auto_learning, bool):
-            raise TypeError("GITAGENT_AUTO_LEARNING 必须为布尔值")
+        if not isinstance(self.memory_automation, bool):
+            raise TypeError("GITAGENT_MEMORY_AUTOMATION 必须为布尔值")
 
     @classmethod
     def from_env(cls) -> CLIConfig:
@@ -184,7 +184,9 @@ class CLIConfig:
             context_safety_tokens=int(
                 os.getenv("GITAGENT_CONTEXT_SAFETY_TOKENS", "2048")
             ),
-            auto_learning=_environment_boolean("GITAGENT_AUTO_LEARNING", default=True),
+            memory_automation=_environment_boolean(
+                "GITAGENT_MEMORY_AUTOMATION", default=True
+            ),
         )
         config.validate()
         return config

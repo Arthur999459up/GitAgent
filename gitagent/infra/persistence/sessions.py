@@ -57,6 +57,23 @@ class TurnRecord:
     completed_at: str | None
 
 
+@dataclass(frozen=True)
+class MemoryExtractionState:
+    session_id: str
+    extracted_through_seq: int = 0
+    pending_through_seq: int = 0
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class MemoryDreamState:
+    account_key: str
+    repository_key: str
+    last_dream_at: str = ""
+    last_dream_session_marker: str = ""
+    updated_at: str = ""
+
+
 def default_working_state() -> dict[str, Any]:
     return {
         "version": 4,
@@ -709,6 +726,194 @@ class SessionManager:
         scope = SessionScope(account_key, repository_key, session_id)
         projection = _event_projection(self.event_log.iter_events(scope))
         return tuple(_turn(item, **projection.get(int(item["seq"]), {})) for item in rows)
+
+    def get_memory_extraction_state(
+        self, scope: SessionScope
+    ) -> MemoryExtractionState:
+        _validate_session_scope(scope)
+        connection = self.store.read()
+        try:
+            self._session_row_tx(
+                connection,
+                scope.account_key,
+                scope.repository_key,
+                scope.session_id,
+            )
+            row = connection.execute(
+                "SELECT * FROM memory_extraction_state WHERE session_id=?",
+                (scope.session_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return MemoryExtractionState(scope.session_id)
+        return MemoryExtractionState(
+            session_id=str(row["session_id"]),
+            extracted_through_seq=int(row["extracted_through_seq"]),
+            pending_through_seq=int(row["pending_through_seq"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def mark_memory_extraction_pending(
+        self, scope: SessionScope, through_seq: int
+    ) -> MemoryExtractionState:
+        _validate_session_scope(scope)
+        _require_positive_integer(through_seq, "Memory extraction target")
+        with self.store.transaction() as connection:
+            self._session_row_tx(
+                connection,
+                scope.account_key,
+                scope.repository_key,
+                scope.session_id,
+            )
+            turn = connection.execute(
+                "SELECT status FROM turns WHERE session_id=? AND seq=?",
+                (scope.session_id, through_seq),
+            ).fetchone()
+            if turn is None or str(turn["status"]) != "completed":
+                raise StateError("Memory extraction target must be a completed Turn")
+            now = _utc_now()
+            connection.execute(
+                """
+                INSERT INTO memory_extraction_state(
+                    session_id,extracted_through_seq,pending_through_seq,updated_at
+                ) VALUES(?,0,?,?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    pending_through_seq=MAX(pending_through_seq,excluded.pending_through_seq),
+                    updated_at=excluded.updated_at
+                """,
+                (scope.session_id, through_seq, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM memory_extraction_state WHERE session_id=?",
+                (scope.session_id,),
+            ).fetchone()
+        return MemoryExtractionState(
+            str(row["session_id"]),
+            int(row["extracted_through_seq"]),
+            int(row["pending_through_seq"]),
+            str(row["updated_at"]),
+        )
+
+    def complete_memory_extraction(
+        self, scope: SessionScope, through_seq: int
+    ) -> MemoryExtractionState:
+        _validate_session_scope(scope)
+        _require_positive_integer(through_seq, "Memory extraction cursor")
+        with self.store.transaction() as connection:
+            self._session_row_tx(
+                connection,
+                scope.account_key,
+                scope.repository_key,
+                scope.session_id,
+            )
+            row = connection.execute(
+                "SELECT * FROM memory_extraction_state WHERE session_id=?",
+                (scope.session_id,),
+            ).fetchone()
+            if row is None or through_seq > int(row["pending_through_seq"]):
+                raise StateError("Memory extraction cursor exceeds its pending target")
+            now = _utc_now()
+            connection.execute(
+                """
+                UPDATE memory_extraction_state
+                SET extracted_through_seq=MAX(extracted_through_seq,?),updated_at=?
+                WHERE session_id=?
+                """,
+                (through_seq, now, scope.session_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM memory_extraction_state WHERE session_id=?",
+                (scope.session_id,),
+            ).fetchone()
+        return MemoryExtractionState(
+            str(row["session_id"]),
+            int(row["extracted_through_seq"]),
+            int(row["pending_through_seq"]),
+            str(row["updated_at"]),
+        )
+
+    def get_memory_dream_state(
+        self, account_key: str, repository_key: str
+    ) -> MemoryDreamState:
+        account_key, repository_key = _validate_scope_keys(account_key, repository_key)
+        connection = self.store.read()
+        try:
+            row = connection.execute(
+                """
+                SELECT * FROM memory_dream_state
+                WHERE account_key=? AND repository_key=?
+                """,
+                (account_key, repository_key),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return MemoryDreamState(account_key, repository_key)
+        return MemoryDreamState(
+            account_key=str(row["account_key"]),
+            repository_key=str(row["repository_key"]),
+            last_dream_at=str(row["last_dream_at"]),
+            last_dream_session_marker=str(row["last_dream_session_marker"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def count_memory_sessions_since(
+        self,
+        account_key: str,
+        repository_key: str,
+        marker: str,
+    ) -> int:
+        account_key, repository_key = _validate_scope_keys(account_key, repository_key)
+        marker = _require_string(marker, "Dream session marker")
+        connection = self.store.read()
+        try:
+            row = connection.execute(
+                """
+                SELECT COUNT(DISTINCT s.session_id)
+                FROM sessions AS s
+                JOIN turns AS t ON t.session_id=s.session_id
+                WHERE s.account_key=? AND s.repository_key=?
+                  AND t.status='completed' AND (?='' OR t.completed_at>?)
+                """,
+                (account_key, repository_key, marker, marker),
+            ).fetchone()
+        finally:
+            connection.close()
+        return int(row[0]) if row is not None else 0
+
+    def complete_memory_dream(
+        self,
+        account_key: str,
+        repository_key: str,
+        *,
+        completed_at: str,
+        session_marker: str,
+    ) -> MemoryDreamState:
+        account_key, repository_key = _validate_scope_keys(account_key, repository_key)
+        completed_at = _require_string(completed_at, "Dream completion time", allow_empty=False)
+        session_marker = _require_string(session_marker, "Dream session marker", allow_empty=False)
+        try:
+            if datetime.fromisoformat(completed_at).tzinfo is None or datetime.fromisoformat(session_marker).tzinfo is None:
+                raise ValueError
+        except ValueError as exc:
+            raise ValidationError("Dream timestamps must be timezone-aware ISO-8601 values") from exc
+        with self.store.transaction() as connection:
+            now = _utc_now()
+            connection.execute(
+                """
+                INSERT INTO memory_dream_state(
+                    account_key,repository_key,last_dream_at,
+                    last_dream_session_marker,updated_at
+                ) VALUES(?,?,?,?,?)
+                ON CONFLICT(account_key,repository_key) DO UPDATE SET
+                    last_dream_at=excluded.last_dream_at,
+                    last_dream_session_marker=excluded.last_dream_session_marker,
+                    updated_at=excluded.updated_at
+                """,
+                (account_key, repository_key, completed_at, session_marker, now),
+            )
+        return self.get_memory_dream_state(account_key, repository_key)
 
     def _insert_session_tx(
         self,

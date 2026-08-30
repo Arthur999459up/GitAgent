@@ -64,12 +64,17 @@ class ResolvedReference:
 class AgentGuidance:
     """Validated, non-authoritative auxiliary data for a domain agent."""
 
-    memory_index: str = ""
+    persistent_memory_index: str = ""
+    persistent_memory_pages: str = ""
     resolved_references: tuple[ResolvedReference, ...] = ()
 
     @property
     def empty(self) -> bool:
-        return not (self.memory_index or self.resolved_references)
+        return not (
+            self.persistent_memory_index
+            or self.persistent_memory_pages
+            or self.resolved_references
+        )
 
 
 @dataclass(frozen=True)

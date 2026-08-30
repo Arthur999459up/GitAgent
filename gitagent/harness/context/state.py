@@ -23,9 +23,12 @@ from gitagent.harness.context.messages import (
     tool_result_message,
 )
 from gitagent.harness.file_reads import FileReadLedger
+from gitagent.prompts import get_prompt_library
 
 if TYPE_CHECKING:
     from gitagent.harness.execution import AgentHarness
+
+_PROMPTS = get_prompt_library()
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,7 @@ class AgentContext:
         self.repository_history_path = ""
         self.result_required = True
         self.read_cache: dict[str, Any] = {}
+        self._ephemeral_memory_reads: list[dict[str, str]] = []
         self.file_reads = FileReadLedger()
         self.last_capability_call: CapabilityCallRecord | None = None
         self.error: str | None = None
@@ -143,6 +147,7 @@ class AgentContext:
             capability is not None
             and capability.access == AccessLevel.READ
             and prepared is None
+            and not _memory_read(capability_id, actual_arguments)
         )
         cached = cacheable and cache_key in self.read_cache
         if cached:
@@ -169,6 +174,21 @@ class AgentContext:
         if invocation_result.status != "success":
             observation_data = None
             content: Any = invocation_result
+        elif _memory_read(capability_id, actual_arguments):
+            root = str(actual_arguments.get("root") or "")
+            path = str(actual_arguments.get("path") or "")
+            memory_content = (
+                str(raw_result.get("content") or "")
+                if isinstance(raw_result, dict)
+                else str(raw_result or "")
+            )
+            self._record_ephemeral_memory_read(root, path, memory_content)
+            content = raw_result
+            observation_data = {
+                "memory_page_loaded": True,
+                "root": root,
+                "path": path,
+            }
         elif prepared is not None:
             content, observation_data = self.file_reads.complete(prepared, raw_result)
         else:
@@ -200,7 +220,6 @@ class AgentContext:
             "repository": self.repository,
             "entity_type": self.entity_type,
             "entity_id": self.entity_id,
-            "guidance": asdict(self.guidance) if self.guidance is not None else None,
         }
         self.append_message(
             {
@@ -223,8 +242,9 @@ class AgentContext:
         self, tools: list[dict[str, Any]] | None = None
     ) -> list[dict[str, Any]]:
         self.start_message_thread()
+        request = self._ephemeral_messages()
         fitted, _, _, plan = fit_messages_with_plan(
-            self.messages,
+            request,
             tools,
             effective_input_budget=self.context_budget,
         )
@@ -232,8 +252,11 @@ class AgentContext:
             sink = self._harness.compaction_sink
             if sink is not None and self.origin_turn_seq > 0:
                 sink(self, plan)
-            self.messages[:] = fitted
-        return self.messages
+            durable = [dict(message) for message in fitted]
+            if durable and durable[0].get("role") == "system":
+                durable[0] = {"role": "system", "content": self.system_prompt}
+            self.messages[:] = durable
+        return fitted
 
     def reason_structured(
         self,
@@ -255,15 +278,13 @@ class AgentContext:
                 tools=tools,
             )
         finally:
-            self._persist_external_messages(before)
+            self._persist_external_messages(request, before)
 
-    def _persist_external_messages(self, start: int) -> None:
-        for index in range(start, len(self.messages)):
-            safe = canonical_message(self.messages[index])
-            sink = self._harness.message_sink
-            if sink is not None and self.origin_turn_seq > 0:
-                safe = sink(self, safe)
-            self.messages[index] = safe
+    def _persist_external_messages(
+        self, request: list[dict[str, Any]], start: int
+    ) -> None:
+        for message in request[start:]:
+            self.append_message(message)
 
     def record_model_response(
         self,
@@ -360,3 +381,52 @@ class AgentContext:
         ).strip()
         self.append_message({"role": "assistant", "content": content})
         return content
+
+    def _ephemeral_messages(self) -> list[dict[str, Any]]:
+        messages = [dict(message) for message in self.messages]
+        has_guidance = self.guidance is not None and not self.guidance.empty
+        if (not has_guidance and not self._ephemeral_memory_reads) or not messages:
+            return messages
+        payload = json.dumps(
+            {
+                "guidance": asdict(self.guidance) if has_guidance else None,
+                "additional_memory_reads": list(self._ephemeral_memory_reads),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        policy = "\n\n" + _PROMPTS.render(
+            "agents.guidance_section", payload=payload
+        )
+        first = dict(messages[0])
+        first["content"] = str(first.get("content") or "") + policy
+        messages[0] = first
+        return messages
+
+    def _record_ephemeral_memory_read(
+        self, root: str, path: str, content: str
+    ) -> None:
+        identity = (root, path)
+        if any(
+            (item["root"], item["path"]) == identity
+            for item in self._ephemeral_memory_reads
+        ):
+            return
+        remaining = 20_000 - sum(
+            len(item["content"].encode()) for item in self._ephemeral_memory_reads
+        )
+        if remaining <= 0 or len(self._ephemeral_memory_reads) >= 5:
+            return
+        encoded = content.encode()
+        clipped = encoded[:remaining].decode("utf-8", errors="ignore")
+        self._ephemeral_memory_reads.append(
+            {"root": root, "path": path, "content": clipped}
+        )
+
+
+def _memory_read(capability_id: str, arguments: dict[str, Any]) -> bool:
+    return capability_id == "native.read" and arguments.get("root") in {
+        "private_memory",
+        "project_memory",
+    }

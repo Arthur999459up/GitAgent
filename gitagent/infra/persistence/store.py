@@ -14,7 +14,7 @@ from typing import Any
 
 from gitagent.domain.errors import StateError, ValidationError
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 REDACTED = "[REDACTED]"
 
 _SECRET_PATTERNS = (
@@ -67,6 +67,25 @@ _TABLE_DEFINITIONS = {
             completed_at TEXT,
             PRIMARY KEY(session_id, seq),
             FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        )
+    """,
+    "memory_extraction_state": """
+        CREATE TABLE memory_extraction_state (
+            session_id TEXT PRIMARY KEY,
+            extracted_through_seq INTEGER NOT NULL DEFAULT 0 CHECK(extracted_through_seq >= 0),
+            pending_through_seq INTEGER NOT NULL DEFAULT 0 CHECK(pending_through_seq >= extracted_through_seq),
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        )
+    """,
+    "memory_dream_state": """
+        CREATE TABLE memory_dream_state (
+            account_key TEXT NOT NULL,
+            repository_key TEXT NOT NULL,
+            last_dream_at TEXT NOT NULL DEFAULT '',
+            last_dream_session_marker TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(account_key, repository_key)
         )
     """,
 }
@@ -398,7 +417,9 @@ class StateStore:
                 row = connection.execute(
                     "SELECT value FROM schema_metadata WHERE key='schema_version'"
                 ).fetchone()
-                if row is None or str(row[0]) != str(SCHEMA_VERSION):
+                if row is not None and str(row[0]) == "8":
+                    self._migrate_v8(connection, tables)
+                elif row is None or str(row[0]) != str(SCHEMA_VERSION):
                     raise StateError(
                         "state database schema is incompatible with this GitAgent version; recreate the state database"
                     )
@@ -417,6 +438,32 @@ class StateStore:
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _migrate_v8(connection: sqlite3.Connection, tables: set[str]) -> None:
+        """Add Memory coordinator state without discarding existing Sessions."""
+
+        legacy_tables = {"schema_metadata", "sessions", "turns"}
+        if tables != legacy_tables:
+            raise StateError("state database v8 schema contains unexpected tables")
+        indexes = {
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type='index' AND name NOT LIKE 'sqlite_autoindex_%'
+                """
+            )
+        }
+        if indexes != set(_INDEX_DEFINITIONS):
+            raise StateError("state database v8 schema indexes are invalid")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(_TABLE_DEFINITIONS["memory_extraction_state"])
+        connection.execute(_TABLE_DEFINITIONS["memory_dream_state"])
+        connection.execute(
+            "UPDATE schema_metadata SET value=? WHERE key='schema_version'",
+            (str(SCHEMA_VERSION),),
+        )
 
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:

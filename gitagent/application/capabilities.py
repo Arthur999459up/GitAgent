@@ -21,7 +21,6 @@ from gitagent.capability.providers import (
 )
 from gitagent.harness.context import assistant_tool_call, tool_result_message
 from gitagent.infra.mcp import Context7Client
-from gitagent.memory import MemoryAccessTracker
 from gitagent.model import Reasoner
 
 
@@ -32,7 +31,6 @@ def build_capability_layer(
     reasoner: Reasoner | None = None,
     workspace_root: str | Path | None = None,
     memory_roots: dict[str, Path] | None = None,
-    memory_accesses: MemoryAccessTracker | None = None,
 ) -> CapabilityLayer:
     resource_root = _resource_root()
     policy = PermissionPolicy.from_file(resource_root / "capabilities.yaml")
@@ -40,9 +38,6 @@ def build_capability_layer(
     native = NativeProvider(
         workspace_root or Path.cwd(),
         memory_roots=memory_roots,
-        memory_read_callback=memory_accesses.record
-        if memory_accesses is not None
-        else None,
     )
     context7 = Context7Client(api_key=os.getenv("CONTEXT7_API_KEY", ""))
     layer.add_provider(native)

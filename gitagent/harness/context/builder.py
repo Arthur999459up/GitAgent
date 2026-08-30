@@ -8,7 +8,6 @@ from typing import Any
 
 from gitagent.domain.models import SessionScope
 from gitagent.infra.persistence import SessionManager
-from gitagent.memory import MemoryStore
 
 from .budget import (
     EMERGENCY_THRESHOLD,
@@ -73,7 +72,6 @@ class ContextBuilder:
     def __init__(
         self,
         session_manager: SessionManager,
-        memory_store: MemoryStore,
         *,
         context_window_tokens: int = 32768,
         max_output_tokens: int = 16_384,
@@ -81,7 +79,6 @@ class ContextBuilder:
         retry_reserve_tokens: int = RETRY_RESERVE_TOKENS,
     ) -> None:
         self.session_manager = session_manager
-        self.memory_store = memory_store
         self.context_window_tokens = _integer(
             context_window_tokens, "context_window_tokens", positive=True
         )
