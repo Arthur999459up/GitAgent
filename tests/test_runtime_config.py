@@ -16,7 +16,6 @@ def _config(**overrides: object) -> dict[str, object]:
         "model": "test-model",
         "api_key": "model-secret",
         "base_url": None,
-        "provider": "openai",
         "github_token": "github-secret",
         "github_api_url": "https://api.github.com",
         "temperature": 0.0,

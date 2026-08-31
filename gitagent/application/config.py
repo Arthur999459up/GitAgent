@@ -27,7 +27,6 @@ class RuntimeConfig:
     model: str
     api_key: str
     base_url: str | None
-    provider: str
     github_token: str
     github_api_url: str
     temperature: float
@@ -92,9 +91,6 @@ class RuntimeConfig:
         _string(self.api_key, "api_key")
         if self.base_url is not None:
             _nonempty_string(self.base_url, "base_url")
-        _nonempty_string(self.provider, "provider")
-        if self.provider not in {"openai", "litellm"}:
-            raise ValueError("provider 必须是 openai 或 litellm")
         _string(self.github_token, "github_token")
         _nonempty_string(self.github_api_url, "github_api_url")
         _number(self.temperature, "temperature")

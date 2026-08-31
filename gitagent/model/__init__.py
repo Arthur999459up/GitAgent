@@ -3,7 +3,6 @@
 from .chat_client import (
     ChatClient,
     ChatResponse,
-    LiteLLMChatClient,
     OpenAIChatClient,
     ToolCall,
 )
@@ -18,7 +17,6 @@ __all__ = [
     "ChatClient",
     "ChatResponse",
     "LLMReasoner",
-    "LiteLLMChatClient",
     "OpenAIChatClient",
     "Reasoner",
     "StructuredValue",

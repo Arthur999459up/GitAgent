@@ -21,6 +21,12 @@
 {{errors}}
 </errors>
 
+## Additional evidence
+
+<evidence>
+{{evidence}}
+</evidence>
+
 ## Constraints
 
 - Correct the reported findings while preserving the requested behavior and locked path/action.

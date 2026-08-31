@@ -45,7 +45,6 @@ from gitagent.infra.observability import (
 )
 from gitagent.model import (
     ChatResponse,
-    LiteLLMChatClient,
     LLMReasoner,
     OpenAIChatClient,
 )
@@ -80,7 +79,6 @@ __all__ = [
     "IssueOperation",
     "IssueSummary",
     "LLMReasoner",
-    "LiteLLMChatClient",
     "MainDecision",
     "MutationRejectedResult",
     "OpenAIChatClient",

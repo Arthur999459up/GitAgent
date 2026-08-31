@@ -7,6 +7,7 @@ import json
 import re
 from typing import Any
 
+from gitagent.capability import AccessLevel
 from gitagent.domain.errors import LLMProviderError, ValidationError, WorkflowError
 from gitagent.domain.models import (
     AgentGuidance,
@@ -19,6 +20,7 @@ from gitagent.domain.models import (
     CodeReviewResult,
     Recommendation,
 )
+from gitagent.domain.reviews import canonical_review_event
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.file_access import safe_repository_path
@@ -41,13 +43,8 @@ _CHANGE_PLAN_SCHEMA = {
                 "properties": {
                     "action": {"type": "string", "enum": ["ADD", "MODIFY", "DELETE"]},
                     "path": {"type": "string", "minLength": 1, "maxLength": 500},
-                    "evidence_queries": {
-                        "type": "array",
-                        "maxItems": 3,
-                        "items": {"type": "string", "minLength": 1, "maxLength": 120},
-                    },
                 },
-                "required": ["action", "path", "evidence_queries"],
+                "required": ["action", "path"],
                 "additionalProperties": False,
             },
         },
@@ -67,7 +64,12 @@ _EXPLANATION_SCHEMA = {
         "call_relationships": {"type": "array", "items": {"type": "string"}},
         "impact_scope": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["behavior_changes", "key_symbols", "call_relationships", "impact_scope"],
+    "required": [
+        "behavior_changes",
+        "key_symbols",
+        "call_relationships",
+        "impact_scope",
+    ],
     "additionalProperties": False,
 }
 
@@ -84,7 +86,10 @@ _REVIEW_SCHEMA = {
             "type": "string",
             "enum": ["APPROVE", "REQUEST_CHANGES", "NEEDS_HUMAN_REVIEW"],
         },
-        "goal_alignment": {"type": "string", "enum": ["ALIGNED", "PARTIAL", "MISMATCH", "UNKNOWN"]},
+        "goal_alignment": {
+            "type": "string",
+            "enum": ["ALIGNED", "PARTIAL", "MISMATCH", "UNKNOWN"],
+        },
     },
     "required": [
         "summary",
@@ -111,15 +116,64 @@ _PLAN_SCHEMA = {
     "additionalProperties": False,
 }
 
+_DIALOGUE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "resolved": {"type": "array", "items": {"type": "string"}},
+        "explained": {"type": "array", "items": {"type": "string"}},
+        "needs_changes": {"type": "array", "items": {"type": "string"}},
+        "discussion": {"type": "array", "items": {"type": "string"}},
+        "conflicts": {"type": "array", "items": {"type": "string"}},
+        "reply_draft": {"type": "string"},
+    },
+    "required": [
+        "resolved",
+        "explained",
+        "needs_changes",
+        "discussion",
+        "conflicts",
+        "reply_draft",
+    ],
+    "additionalProperties": False,
+}
+
+_CI_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "facts": {"type": "array", "items": {"type": "string"}},
+        "suspected_causes": {"type": "array", "items": {"type": "string"}},
+        "related_changes": {"type": "array", "items": {"type": "string"}},
+        "actions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["facts", "suspected_causes", "related_changes", "actions"],
+    "additionalProperties": False,
+}
+
+_EVIDENCE_READY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {"type": "string", "enum": ["finish"]},
+        "summary": {"type": "string"},
+    },
+    "required": ["kind", "summary"],
+    "additionalProperties": False,
+}
+
+
 class _CodingCapabilityFailure(Exception):
     def __init__(self, payload: dict[str, Any]) -> None:
-        super().__init__(str(payload.get("message") or payload.get("error") or "capability failed"))
+        super().__init__(
+            str(payload.get("message") or payload.get("error") or "capability failed")
+        )
         self.payload = payload
 
 
 CODING_SPEC = AgentSpec(
     name="coding",
-    role="Explain, review, plan, or prepare a minimal candidate patch from targeted repository evidence.",
+    role=(
+        "Produce typed explanation, review, plan, PR dialogue, or CI analysis, or prepare "
+        "a minimal candidate patch from targeted evidence."
+    ),
     system_prompt=_PROMPTS.text("system.coding"),
     output_schema=(),
     routes=frozenset({"coding"}),
@@ -149,7 +203,9 @@ class CodingAgent:
         return self.harness.run(
             "coding",
             session_id=session_id,
-            operation=lambda context: self._explain(context, request, evidence, guidance),
+            operation=lambda context: self._explain(
+                context, request, evidence, guidance
+            ),
             repository=repository,
             goal=request,
             guidance=guidance,
@@ -167,7 +223,9 @@ class CodingAgent:
         return self.harness.run(
             "coding",
             session_id=session_id,
-            operation=lambda context: self._review(context, request, evidence, guidance),
+            operation=lambda context: self._review(
+                context, request, evidence, guidance
+            ),
             repository=repository,
             goal=request,
             guidance=guidance,
@@ -191,6 +249,46 @@ class CodingAgent:
             guidance=guidance,
         )
 
+    def summarize_review_dialogue(
+        self,
+        repository: str,
+        request: str,
+        evidence: dict[str, Any],
+        *,
+        session_id: str,
+        guidance: AgentGuidance | None = None,
+    ) -> dict[str, Any]:
+        return self.harness.run(
+            "coding",
+            session_id=session_id,
+            operation=lambda context: self._summarize_review_dialogue(
+                context, request, evidence, guidance
+            ),
+            repository=repository,
+            goal=request,
+            guidance=guidance,
+        )
+
+    def analyze_ci(
+        self,
+        repository: str,
+        request: str,
+        evidence: dict[str, Any],
+        *,
+        session_id: str,
+        guidance: AgentGuidance | None = None,
+    ) -> dict[str, Any]:
+        return self.harness.run(
+            "coding",
+            session_id=session_id,
+            operation=lambda context: self._analyze_ci(
+                context, request, evidence, guidance
+            ),
+            repository=repository,
+            goal=request,
+            guidance=guidance,
+        )
+
     def create_candidate(
         self,
         request: ChangeRequest,
@@ -202,7 +300,9 @@ class CodingAgent:
             try:
                 return self._create(context, request, guidance)
             except _CodingCapabilityFailure as failure:
-                return CandidatePreparationResult(None, capability_error=failure.payload)
+                return CandidatePreparationResult(
+                    None, capability_error=failure.payload
+                )
 
         return self.harness.run(
             "coding",
@@ -211,7 +311,9 @@ class CodingAgent:
             repository=request.repository,
             goal=request.description,
             entity_type="issue" if request.issue_number is not None else None,
-            entity_id=str(request.issue_number) if request.issue_number is not None else None,
+            entity_id=str(request.issue_number)
+            if request.issue_number is not None
+            else None,
             guidance=guidance,
         )
 
@@ -231,7 +333,9 @@ class CodingAgent:
             try:
                 return self._repair(context, request, candidate, errors, guidance)
             except _CodingCapabilityFailure as failure:
-                return CandidatePreparationResult(None, capability_error=failure.payload)
+                return CandidatePreparationResult(
+                    None, capability_error=failure.payload
+                )
 
         return self.harness.run(
             "coding",
@@ -240,7 +344,9 @@ class CodingAgent:
             repository=request.repository,
             goal=f"Repair candidate: {request.description}",
             entity_type="issue" if request.issue_number is not None else None,
-            entity_id=str(request.issue_number) if request.issue_number is not None else None,
+            entity_id=str(request.issue_number)
+            if request.issue_number is not None
+            else None,
             guidance=guidance,
         )
 
@@ -259,8 +365,8 @@ class CodingAgent:
                 call_relationships=[],
                 impact_scope=changed,
             )
-        value = context.complete_structured(
-            self.reasoner,
+        value = self._complete_structured_task(
+            context,
             prompt=_PROMPTS.render(
                 "agents.coding_explain",
                 request=request,
@@ -273,7 +379,9 @@ class CodingAgent:
         return CodeExplanationResult(
             behavior_changes=[str(item) for item in value.get("behavior_changes", [])],
             key_symbols=[str(item) for item in value.get("key_symbols", [])],
-            call_relationships=[str(item) for item in value.get("call_relationships", [])],
+            call_relationships=[
+                str(item) for item in value.get("call_relationships", [])
+            ],
             impact_scope=[str(item) for item in value.get("impact_scope", [])],
         )
 
@@ -301,8 +409,8 @@ class CodingAgent:
                 recommendation=Recommendation.NEEDS_HUMAN_REVIEW,
                 goal_alignment="UNKNOWN",
             )
-        value = context.complete_structured(
-            self.reasoner,
+        value = self._complete_structured_task(
+            context,
             prompt=_PROMPTS.render(
                 "agents.pr_review",
                 request=request,
@@ -312,7 +420,9 @@ class CodingAgent:
             schema=_REVIEW_SCHEMA,
             tool_name="review_code_change",
         )
-        recommendation = Recommendation(str(value.get("recommendation", "NEEDS_HUMAN_REVIEW")))
+        recommendation = Recommendation(
+            str(value.get("recommendation", "NEEDS_HUMAN_REVIEW"))
+        )
         blocking_issues = (
             [str(item) for item in value.get("blocking_issues", [])]
             if recommendation == Recommendation.REQUEST_CHANGES
@@ -344,8 +454,8 @@ class CodingAgent:
                 tradeoffs=["需要结合运行时行为确认具体取舍。"],
                 tests=["运行受影响模块的项目测试。"],
             )
-        value = context.complete_structured(
-            self.reasoner,
+        value = self._complete_structured_task(
+            context,
             prompt=_PROMPTS.render(
                 "agents.coding_plan",
                 request=request,
@@ -362,23 +472,244 @@ class CodingAgent:
             tests=[str(item) for item in value.get("tests", [])],
         )
 
+    def _summarize_review_dialogue(
+        self,
+        context: AgentContext,
+        request: str,
+        evidence: dict[str, Any],
+        guidance: AgentGuidance | None,
+    ) -> dict[str, Any]:
+        reviews = [
+            item for item in evidence.get("reviews", []) if isinstance(item, dict)
+        ]
+        comments = [
+            item for item in evidence.get("comments", []) if isinstance(item, dict)
+        ]
+        if self.reasoner is None:
+            return {
+                "resolved": [
+                    str(item.get("body") or "已批准")
+                    for item in reviews
+                    if canonical_review_event(item) == "APPROVE"
+                ],
+                "explained": [],
+                "needs_changes": [
+                    str(item.get("body") or "Review 要求修改")
+                    for item in reviews
+                    if canonical_review_event(item) == "REQUEST_CHANGES"
+                ],
+                "discussion": [
+                    str(item.get("body") or "")
+                    for item in [*reviews, *comments]
+                    if item.get("body")
+                ],
+                "conflicts": [],
+                "reply_draft": "已查看现有 Review；请确认待处理意见后再发布回复。",
+            }
+        value = self._complete_structured_task(
+            context,
+            prompt=_PROMPTS.render(
+                "agents.pull_request_dialogue",
+                request=request,
+                evidence=json.dumps(evidence, ensure_ascii=False),
+                guidance=guidance_section(guidance),
+            ),
+            schema=_DIALOGUE_SCHEMA,
+            tool_name="summarize_review_dialogue",
+        )
+        return {
+            "resolved": [str(item) for item in value.get("resolved", [])],
+            "explained": [str(item) for item in value.get("explained", [])],
+            "needs_changes": [str(item) for item in value.get("needs_changes", [])],
+            "discussion": [str(item) for item in value.get("discussion", [])],
+            "conflicts": [str(item) for item in value.get("conflicts", [])],
+            "reply_draft": str(value.get("reply_draft", "")),
+        }
+
+    def _analyze_ci(
+        self,
+        context: AgentContext,
+        request: str,
+        evidence: dict[str, Any],
+        guidance: AgentGuidance | None,
+    ) -> dict[str, Any]:
+        runs = [
+            item for item in evidence.get("workflow_runs", []) if isinstance(item, dict)
+        ]
+        job_results = [
+            item for item in evidence.get("job_logs", []) if isinstance(item, dict)
+        ]
+        jobs = [
+            job
+            for result in job_results
+            for job in result.get("jobs", [])
+            if isinstance(job, dict)
+        ]
+        run_facts = [
+            f"workflow run #{run.get('id', '?')}：{run.get('conclusion') or run.get('status') or 'unknown'}"
+            for run in runs
+        ]
+        unavailable_facts = [
+            f"job {job.get('name', job.get('id', '?'))}："
+            f"{job.get('conclusion') or job.get('status') or 'unknown'}，日志暂不可用。"
+            for job in jobs
+            if job.get("log_unavailable")
+        ]
+        if self.reasoner is not None:
+            value = self._complete_structured_task(
+                context,
+                prompt=_PROMPTS.render(
+                    "agents.pull_request_ci",
+                    request=request,
+                    evidence=json.dumps(evidence, ensure_ascii=False),
+                    guidance=guidance_section(guidance),
+                ),
+                schema=_CI_SCHEMA,
+                tool_name="analyze_pull_request_ci",
+            )
+            analysis = {
+                key: [str(item) for item in value.get(key, [])]
+                for key in _CI_SCHEMA["required"]
+            }
+            analysis["facts"].extend(
+                fact
+                for fact in [*run_facts, *unavailable_facts]
+                if fact not in analysis["facts"]
+            )
+            return analysis
+        facts = list(run_facts)
+        for job in jobs:
+            if not job.get("log_unavailable"):
+                facts.append(
+                    f"job {job.get('name', job.get('id', '?'))}："
+                    f"{str(job.get('log') or '').strip()}"
+                )
+        facts.extend(unavailable_facts)
+        changed = [str(path) for path in evidence.get("changed_files", [])]
+        return {
+            "facts": facts or ["没有找到符合条件的 workflow run。"],
+            "suspected_causes": ["需要结合失败日志与本次 Diff 验证根因。"]
+            if facts
+            else [],
+            "related_changes": changed,
+            "actions": ["针对失败 job 运行对应检查，并验证相关变更文件。"]
+            if facts
+            else [],
+        }
+
+    def _complete_structured_task(
+        self,
+        context: AgentContext,
+        *,
+        prompt: str,
+        schema: dict[str, Any],
+        tool_name: str,
+        max_steps: int = 8,
+    ) -> dict[str, Any]:
+        """Allow bounded read-only tool use before one typed Coding result."""
+
+        if self.reasoner is None:
+            raise WorkflowError("autonomous Coding task requires a reasoner")
+        context.start_message_thread()
+        context.append_message({"role": "user", "content": prompt})
+        tools = self.harness.llm_tools(context, read_only=True)
+        allowed = {
+            capability.id
+            for capability in self.harness.discover(context)
+            if capability.access == AccessLevel.READ
+            and capability.input_schema is not None
+        }
+        previous_signature = ""
+        repeated = 0
+        for _ in range(max_steps):
+            value = context.reason_structured(
+                self.reasoner,
+                schema=schema,
+                tool_name=tool_name,
+                tools=tools,
+            )
+            context.record_model_response(value, tool_name=tool_name)
+            if value.get("kind") != "capability":
+                context.complete_control_call({"status": "accepted", "result": value})
+                return value
+            capability_id = self.harness.resolve_llm_name(
+                str(value.get("capability_id") or ""), context
+            )
+            if capability_id not in allowed:
+                context.append_tool_result(
+                    {
+                        "status": "failed",
+                        "capability_id": capability_id,
+                        "error": "permission_denied",
+                        "message": "Coding evidence gathering is read-only.",
+                    }
+                )
+                continue
+            arguments = dict(value.get("arguments") or {})
+            signature = json.dumps(
+                [capability_id, arguments],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            repeated = repeated + 1 if signature == previous_signature else 0
+            previous_signature = signature
+            if repeated:
+                context.append_tool_result(
+                    {
+                        "status": "failed",
+                        "capability_id": capability_id,
+                        "error": "duplicate_call",
+                        "message": "The identical read was just attempted; choose another action.",
+                    }
+                )
+                if repeated > 1:
+                    raise WorkflowError(
+                        "CodingAgent repeated an identical capability call"
+                    )
+                continue
+            try:
+                self._invoke_capability(context, capability_id, **arguments)
+            except _CodingCapabilityFailure:
+                continue
+        raise WorkflowError(f"CodingAgent exceeded the {max_steps}-step evidence limit")
+
     @staticmethod
-    def _invoke_capability(context: AgentContext, capability_id: str, **arguments: Any) -> Any:
+    def _invoke_capability(
+        context: AgentContext, capability_id: str, **arguments: Any
+    ) -> Any:
         context.ensure_capability_tool_call(capability_id, arguments)
         content = context.invoke(capability_id, **arguments)
         call = context.last_capability_call
         if call is None:
-            raise WorkflowError("Coding capability invocation did not record its result")
+            raise WorkflowError(
+                "Coding capability invocation did not record its result"
+            )
         if call.result.status == "failed":
             error = call.result.error
             if error is None:
-                raise WorkflowError("Coding capability failed without a structured error")
+                raise WorkflowError(
+                    "Coding capability failed without a structured error"
+                )
             context.append_tool_result(
                 {
                     "status": "failed",
                     "capability_id": call.result.capability_id,
                     "error": error.type.value,
                     "message": error.message,
+                }
+            )
+            context.observations.append(
+                {
+                    "kind": "capability_error",
+                    "payload": {
+                        "capability_id": call.result.capability_id,
+                        "arguments": dict(arguments),
+                        "error": error.type.value,
+                        "message": error.message,
+                        "details": error.details,
+                        "attempts": call.result.attempts,
+                    },
                 }
             )
             raise _CodingCapabilityFailure(
@@ -392,8 +723,20 @@ class CodingAgent:
                 }
             )
         if call.result.status != "success":
-            raise WorkflowError(f"Coding capability returned unsupported status: {call.result.status}")
+            raise WorkflowError(
+                f"Coding capability returned unsupported status: {call.result.status}"
+            )
         context.append_tool_result(call.observation_data)
+        context.observations.append(
+            {
+                "kind": "capability",
+                "payload": {
+                    "capability_id": capability_id,
+                    "arguments": dict(arguments),
+                    "data": call.observation_data,
+                },
+            }
+        )
         return content
 
     def _create(
@@ -402,30 +745,27 @@ class CodingAgent:
         request: ChangeRequest,
         guidance: AgentGuidance | None,
     ) -> CandidatePreparationResult:
-        context.phase = "discovering_targets"
         if request.source_ref is None:
             default = self._invoke_capability(context, "repository.get_default_branch")
             request.base_branch = str(default["branch"])
             request.source_ref = str(default["commit_sha"])
-        tree = self._invoke_capability(
-            context,
-            "repository.get_repo_tree",
-            depth=8,
-            max_entries=500,
-            ref=request.source_ref,
+        explicit_request = bool(
+            request.proposed_files or request.replacements or request.deleted_files
         )
-        tree_paths = [str(path) for path in tree["entries"]]
-        explicit_request = bool(request.proposed_files or request.replacements or request.deleted_files)
         if explicit_request:
             explicit_paths = list(
                 dict.fromkeys(
-                    [*request.proposed_files, *[item.path for item in request.replacements], *request.deleted_files]
+                    [
+                        *request.proposed_files,
+                        *[item.path for item in request.replacements],
+                        *request.deleted_files,
+                    ]
                 )
             )
             existing_files = self._existing_files(context, request, explicit_paths)
             planned_changes = self._explicit_change_plan(request, existing_files)
         elif self.reasoner is not None:
-            planned_changes = self._reasoned_change_plan(context, request, tree_paths, guidance)
+            planned_changes = self._reasoned_change_plan(context, request, guidance)
             existing_files = self._existing_files(
                 context,
                 request,
@@ -438,8 +778,9 @@ class CodingAgent:
         self._validate_change_plan(planned_changes, existing_files)
 
         request.target_files = [change["path"] for change in planned_changes]
-        existing_paths = [change["path"] for change in planned_changes if change["action"] != "ADD"]
-        context.phase = "reading_targets"
+        existing_paths = [
+            change["path"] for change in planned_changes if change["action"] != "ADD"
+        ]
         fetched = (
             self._invoke_capability(
                 context,
@@ -451,43 +792,45 @@ class CodingAgent:
             else []
         )
         if any(item.get("truncated") for item in fetched):
-            raise WorkflowError("a target file exceeds the safe fetch bound; refusing to risk a truncated overwrite")
+            raise WorkflowError(
+                "a target file exceeds the safe fetch bound; refusing to risk a truncated overwrite"
+            )
         originals = {item["path"]: item["content"] for item in fetched}
 
-        deleted_files = [change["path"] for change in planned_changes if change["action"] == "DELETE"]
+        deleted_files = [
+            change["path"] for change in planned_changes if change["action"] == "DELETE"
+        ]
         if explicit_request:
             new_files = dict(request.proposed_files)
             for replacement in request.replacements:
                 if replacement.path not in originals:
-                    raise WorkflowError(f"replacement target was not fetched: {replacement.path}")
+                    raise WorkflowError(
+                        f"replacement target was not fetched: {replacement.path}"
+                    )
                 content = new_files.get(replacement.path, originals[replacement.path])
                 count = content.count(replacement.old)
                 if count != 1:
                     raise WorkflowError(
                         f"replacement anchor in {replacement.path} must match exactly once; found {count}"
                     )
-                new_files[replacement.path] = content.replace(replacement.old, replacement.new, 1)
+                new_files[replacement.path] = content.replace(
+                    replacement.old, replacement.new, 1
+                )
         else:
             planned_operations = [
                 {
                     "id": f"change-{index}",
                     "action": change["action"],
                     "path": change["path"],
-                    "evidence_queries": change["evidence_queries"],
                 }
                 for index, change in enumerate(planned_changes, start=1)
             ]
             writable_operations = [
-                operation for operation in planned_operations if operation["action"] in {"ADD", "MODIFY"}
+                operation
+                for operation in planned_operations
+                if operation["action"] in {"ADD", "MODIFY"}
             ]
-            evidence = self._collect_operation_evidence(
-                context,
-                request,
-                writable_operations,
-                existing_paths=set(originals),
-            )
-            evidence_by_id = {item["operation_id"]: item for item in evidence}
-            context.phase = "generating_candidate"
+            evidence = self._capability_evidence(context)
             new_files = {}
             for operation in writable_operations:
                 try:
@@ -499,7 +842,7 @@ class CodingAgent:
                             description=request.description,
                             operation=json.dumps(operation, ensure_ascii=False),
                             current_content=originals.get(operation["path"], ""),
-                            evidence=json.dumps(evidence_by_id[operation["id"]], ensure_ascii=False),
+                            evidence=json.dumps(evidence, ensure_ascii=False),
                             guidance=guidance_section(guidance),
                         ),
                     )
@@ -531,7 +874,6 @@ class CodingAgent:
         self,
         context: AgentContext,
         request: ChangeRequest,
-        tree_paths: list[str],
         guidance: AgentGuidance | None,
     ) -> list[dict[str, Any]]:
         if self.reasoner is None:
@@ -542,23 +884,18 @@ class CodingAgent:
                 + _EXPLICIT_PATH.findall(request.description)
             )
         )
-        mentioned.extend(path for path in tree_paths if path in request.description and path not in mentioned)
-        context.phase = "planning_changes"
-        value = context.complete_structured(
-            self.reasoner,
+        value = self._complete_structured_task(
+            context,
             prompt=json.dumps(
                 {
                     "request": request.description,
-                    "repository_tree": tree_paths,
+                    "source_ref": request.source_ref,
                     "mentioned_paths": mentioned,
                     "guidance": guidance_section(guidance),
                     "instruction": (
-                        "Return every requested file operation in one plan. ADD is only when the user requests "
-                        "a new path; MODIFY and DELETE target existing files. repository_tree is bounded, so keep "
-                        "an explicitly mentioned path even when it is not listed there; path status is validated next. "
-                        "For each ADD or MODIFY operation, return one to three short, independent literal "
-                        "evidence_queries likely to occur in repository source. Each query must concern only that "
-                        "operation; never combine unrelated requested topics in one query. DELETE uses an empty list."
+                        "Use the available read-only capabilities autonomously until you can return every requested "
+                        "file operation in one plan. ADD is only for a new path; MODIFY and DELETE target existing "
+                        "files. Keep explicitly supplied paths; path existence is validated deterministically next."
                     ),
                 },
                 ensure_ascii=False,
@@ -572,26 +909,31 @@ class CodingAgent:
             path = safe_repository_path(str(raw.get("path") or ""))
             action = str(raw.get("action") or "")
             if path in seen:
-                raise ValidationError(f"repository change plan contains duplicate path: {path}")
+                raise ValidationError(
+                    f"repository change plan contains duplicate path: {path}"
+                )
             seen.add(path)
             changes.append(
                 {
                     "action": action,
                     "path": path,
-                    "evidence_queries": [str(item) for item in raw["evidence_queries"]],
                 }
             )
         return changes
 
     @staticmethod
-    def _explicit_change_plan(request: ChangeRequest, existing_files: set[str]) -> list[dict[str, str]]:
+    def _explicit_change_plan(
+        request: ChangeRequest, existing_files: set[str]
+    ) -> list[dict[str, str]]:
         actions: dict[str, str] = {}
 
         def add(path: str, action: str) -> None:
             safe = safe_repository_path(path)
             previous = actions.get(safe)
             if previous is not None and previous != action:
-                raise ValidationError(f"conflicting repository operations for {safe}: {previous} and {action}")
+                raise ValidationError(
+                    f"conflicting repository operations for {safe}: {previous} and {action}"
+                )
             actions[safe] = action
 
         for path in request.proposed_files:
@@ -617,59 +959,28 @@ class CodingAgent:
         return {str(path) for path in status.get("existing_files", [])}
 
     @staticmethod
-    def _validate_change_plan(changes: list[dict[str, Any]], existing_files: set[str]) -> None:
+    def _validate_change_plan(
+        changes: list[dict[str, Any]], existing_files: set[str]
+    ) -> None:
         for change in changes:
             action = change["action"]
             path = change["path"]
             if action == "ADD" and path in existing_files:
-                raise ValidationError(f"repository change plan cannot add an existing file: {path}")
+                raise ValidationError(
+                    f"repository change plan cannot add an existing file: {path}"
+                )
             if action in {"MODIFY", "DELETE"} and path not in existing_files:
-                raise ValidationError(f"repository change plan cannot {action.casefold()} a missing file: {path}")
+                raise ValidationError(
+                    f"repository change plan cannot {action.casefold()} a missing file: {path}"
+                )
 
     @staticmethod
-    def _collect_operation_evidence(
-        context: AgentContext,
-        request: ChangeRequest,
-        operations: list[dict[str, Any]],
-        *,
-        existing_paths: set[str],
-    ) -> list[dict[str, Any]]:
-        context.phase = "collecting_evidence"
-        evidence: list[dict[str, Any]] = []
-        for operation in operations:
-            selected: dict[str, int] = {}
-            queries = [str(query) for query in operation["evidence_queries"]]
-            for query in queries:
-                result = CodingAgent._invoke_capability(
-                    context,
-                    "repository.search_code",
-                    query=query,
-                    max_results=5,
-                )
-                for hit in result["results"]:
-                    path = str(hit["path"])
-                    if path not in existing_paths and path not in selected:
-                        selected[path] = int(hit["line"])
-                        break
-            requests = [{"path": path, "start_line": max(1, line - 40), "limit": 81} for path, line in selected.items()]
-            sources = (
-                CodingAgent._invoke_capability(
-                    context,
-                    "repository.read_files",
-                    requests=requests,
-                    ref=request.source_ref,
-                )["files"]
-                if requests
-                else []
-            )
-            evidence.append(
-                {
-                    "operation_id": operation["id"],
-                    "queries": queries,
-                    "sources": sources,
-                }
-            )
-        return evidence
+    def _capability_evidence(context: AgentContext) -> list[dict[str, Any]]:
+        return [
+            dict(observation.get("payload") or {})
+            for observation in context.observations
+            if observation.get("kind") in {"capability", "capability_error"}
+        ][-40:]
 
     def _repair(
         self,
@@ -679,6 +990,25 @@ class CodingAgent:
         errors: list[str],
         guidance: AgentGuidance | None,
     ) -> CandidatePreparationResult:
+        self._complete_structured_task(
+            context,
+            prompt=json.dumps(
+                {
+                    "task": (
+                        "Inspect any additional read-only repository, RAG, Context7, or Skill evidence needed "
+                        "to repair this verified candidate. Finish when the reported errors can be addressed."
+                    ),
+                    "request": request.description,
+                    "changed_files": candidate.changed_files,
+                    "verification_errors": errors,
+                },
+                ensure_ascii=False,
+            ),
+            schema=_EVIDENCE_READY_SCHEMA,
+            tool_name="finish_repair_evidence",
+            max_steps=6,
+        )
+        evidence = self._capability_evidence(context)
         writable_operations = [
             {
                 "id": f"change-{index}",
@@ -701,6 +1031,7 @@ class CodingAgent:
                     ),
                     current_content=operation["content"],
                     errors=json.dumps(errors, ensure_ascii=False),
+                    evidence=json.dumps(evidence, ensure_ascii=False),
                     guidance=guidance_section(guidance),
                 ),
             )
@@ -725,7 +1056,9 @@ class CodingAgent:
             else []
         )
         if any(item.get("truncated") for item in fetched):
-            raise WorkflowError("a target file exceeds the safe fetch bound; refusing a truncated repair")
+            raise WorkflowError(
+                "a target file exceeds the safe fetch bound; refusing a truncated repair"
+            )
         originals = {item["path"]: item["content"] for item in fetched}
         return CandidatePreparationResult(
             self._candidate(
@@ -753,17 +1086,29 @@ class CodingAgent:
         deleted = sorted(set(deleted_files))
         missing_deletions = set(deleted) - set(originals)
         if missing_deletions:
-            raise WorkflowError(f"deletion target was not fetched: {', '.join(sorted(missing_deletions))}")
+            raise WorkflowError(
+                f"deletion target was not fetched: {', '.join(sorted(missing_deletions))}"
+            )
         overlap = set(proposed) & set(deleted)
         if overlap:
-            raise ValidationError(f"candidate cannot write and delete the same file: {', '.join(sorted(overlap))}")
+            raise ValidationError(
+                f"candidate cannot write and delete the same file: {', '.join(sorted(overlap))}"
+            )
         added = sorted(path for path in proposed if path not in originals)
         modified = sorted(
-            path for path, content in proposed.items() if path in originals and originals[path] != content
+            path
+            for path, content in proposed.items()
+            if path in originals and originals[path] != content
         )
-        unchanged = sorted(path for path in proposed if path in originals and originals[path] == proposed[path])
+        unchanged = sorted(
+            path
+            for path in proposed
+            if path in originals and originals[path] == proposed[path]
+        )
         if unchanged:
-            raise WorkflowError(f"candidate does not modify the requested file(s): {', '.join(unchanged)}")
+            raise WorkflowError(
+                f"candidate does not modify the requested file(s): {', '.join(unchanged)}"
+            )
         if not (added or modified or deleted):
             raise WorkflowError("candidate patch does not change any file")
         chunks = []
@@ -802,12 +1147,14 @@ class CodingAgent:
     def _is_test_path(path: str) -> bool:
         lowered = path.casefold()
         segments = lowered.split("/")
-        return any(segment in {"test", "tests", "spec", "specs"} for segment in segments[:-1]) or any(
-            marker in segments[-1] for marker in ("_test.", ".test.", ".spec.")
-        )
+        return any(
+            segment in {"test", "tests", "spec", "specs"} for segment in segments[:-1]
+        ) or any(marker in segments[-1] for marker in ("_test.", ".test.", ".spec."))
 
 
-def record_candidate_capability_error(context: AgentContext, prepared: CandidatePreparationResult) -> bool:
+def record_candidate_capability_error(
+    context: AgentContext, prepared: CandidatePreparationResult
+) -> bool:
     payload = prepared.capability_error
     if payload is None:
         return False
@@ -830,7 +1177,9 @@ def prepare_verified_candidate(
     check passes. One repair attempt is allowed, matching the previous
     workflow's ``MAX_REPAIR_ATTEMPTS``.
     """
-    prepared = coding.create_candidate(request, session_id=session_id, guidance=guidance)
+    prepared = coding.create_candidate(
+        request, session_id=session_id, guidance=guidance
+    )
     if prepared.candidate is None:
         return prepared
     candidate = prepared.candidate
@@ -839,7 +1188,9 @@ def prepare_verified_candidate(
         if report.passed:
             return CandidatePreparationResult(candidate, report)
         if attempt <= max_repair_attempts:
-            failures = [check.details for check in report.checks if check.status == "FAIL"]
+            failures = [
+                check.details for check in report.checks if check.status == "FAIL"
+            ]
             prepared = coding.repair_candidate(
                 request,
                 candidate,

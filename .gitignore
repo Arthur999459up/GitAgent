@@ -7,3 +7,5 @@ dist/
 *.egg-info/
 .venv/
 .gitagent/
+config.json
+config.json

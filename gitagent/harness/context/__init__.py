@@ -18,7 +18,6 @@ from .builder import (
 )
 from .capability_history import (
     capability_attempted,
-    capability_failure_observed,
     find_capability_observation,
 )
 from .messages import (
@@ -40,7 +39,6 @@ __all__ = [
     "assistant_tool_call",
     "canonical_message",
     "capability_attempted",
-    "capability_failure_observed",
     "context_pressure",
     "derive_domain_messages",
     "derive_main_messages",

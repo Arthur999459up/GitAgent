@@ -31,7 +31,7 @@ from gitagent.memory import (
     MemorySearch,
     MemoryStopHooks,
 )
-from gitagent.model import ChatClient, LiteLLMChatClient, LLMReasoner, OpenAIChatClient
+from gitagent.model import ChatClient, LLMReasoner, OpenAIChatClient
 from gitagent.prompts import get_prompt_library
 
 from .capabilities import build_capability_layer
@@ -507,10 +507,7 @@ def build_live_application(config: RuntimeConfig) -> LiveApplication:
     library = get_prompt_library()
     library.validate()
 
-    client_class = (
-        LiteLLMChatClient if config.provider == "litellm" else OpenAIChatClient
-    )
-    llm = client_class(
+    llm = OpenAIChatClient(
         model=config.model,
         api_key=config.api_key,
         base_url=config.base_url,

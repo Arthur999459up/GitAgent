@@ -17,7 +17,10 @@ def find_capability_observation(
         if observation.get("kind") not in {"capability", "capability_error"}:
             continue
         payload = observation.get("payload") or {}
-        if not isinstance(payload, dict) or payload.get("capability_id") != capability_id:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("capability_id") != capability_id
+        ):
             continue
         if arguments is not None and payload.get("arguments") != arguments:
             continue
@@ -33,17 +36,13 @@ def capability_attempted(
 ) -> bool:
     """Whether the matching capability call has already produced an observation."""
 
-    return find_capability_observation(context, capability_id, arguments=arguments) is not None
-
-
-def capability_failure_observed(context: Any) -> bool:
-    """Whether this agent run has observed at least one capability failure."""
-
-    return any(observation.get("kind") == "capability_error" for observation in context.observations)
+    return (
+        find_capability_observation(context, capability_id, arguments=arguments)
+        is not None
+    )
 
 
 __all__ = [
     "capability_attempted",
-    "capability_failure_observed",
     "find_capability_observation",
 ]

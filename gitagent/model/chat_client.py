@@ -1,8 +1,7 @@
 """项目内置的模型客户端。
 
-默认客户端调用 OpenAI-compatible Chat Completions API；可选客户端通过
-LiteLLM 接入其他提供商。该模块只负责传输、响应归一化和 token 统计，
-不会接触仓库或绕过 Agent Harness。
+客户端调用 OpenAI-compatible Chat Completions API。该模块只负责传输、
+响应归一化和 token 统计，不会接触仓库或绕过 Agent Harness。
 """
 
 from __future__ import annotations
@@ -153,108 +152,6 @@ class OpenAIChatClient:
             params["tools"] = tools
         try:
             raw = self.client.chat.completions.create(**params)
-        except Exception as exc:
-            raise LLMProviderError(_provider_failure_message(exc, timeout=self.timeout)) from exc
-        if not getattr(raw, "choices", None):
-            raise StructuredOutputError("模型响应不包含 choices")
-
-        message = raw.choices[0].message
-        content = _content_text(getattr(message, "content", ""))
-        reasoning_content = _reasoning_content(message)
-        calls = _tool_calls(getattr(message, "tool_calls", None))
-        prompt_tokens, completion_tokens = _usage_tokens(getattr(raw, "usage", None))
-        self.total_prompt_tokens += prompt_tokens
-        self.total_completion_tokens += completion_tokens
-        if on_token and content:
-            on_token(content)
-        return ChatResponse(
-            content,
-            calls,
-            prompt_tokens,
-            completion_tokens,
-            reasoning_content,
-        )
-
-
-class LiteLLMChatClient:
-    """可选的 LiteLLM 客户端，用于非 OpenAI-compatible 提供商。"""
-
-    def __init__(
-        self,
-        model: str,
-        api_key: str,
-        base_url: str | None = None,
-        *,
-        temperature: float = 0.0,
-        max_output_tokens: int = 16_384,
-        context_window_tokens: int = 32_768,
-        timeout: float = 30.0,
-    ) -> None:
-        if not api_key:
-            raise ValidationError("模型 API Key 不能为空")
-        self.model = model
-        self.api_key = api_key
-        self.base_url = base_url
-        self.temperature = temperature
-        self.max_output_tokens = _positive_integer(
-            max_output_tokens, "max_output_tokens"
-        )
-        self.context_window_tokens = _positive_integer(
-            context_window_tokens, "context_window_tokens"
-        )
-        self.timeout = timeout
-        self.total_prompt_tokens = 0
-        self.total_completion_tokens = 0
-
-    @property
-    def estimated_cost(self) -> None:
-        return None
-
-    def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        on_token: Any | None = None,
-        *,
-        context_window_tokens: int | None = None,
-    ) -> ChatResponse:
-        try:
-            import litellm
-        except ImportError as exc:
-            raise ValidationError('LiteLLM 后端未安装，请执行 pip install -e ".[litellm]"') from exc
-
-        outbound_messages = _outbound_messages(
-            messages,
-            preserve_reasoning_content=_requires_reasoning_content(
-                self.model, self.base_url
-            ),
-        )
-        actual_max_output_tokens = _actual_max_output_tokens(
-            outbound_messages,
-            tools,
-            context_window_tokens=(
-                self.context_window_tokens
-                if context_window_tokens is None
-                else context_window_tokens
-            ),
-            configured_max_output_tokens=self.max_output_tokens,
-        )
-        params: dict[str, Any] = {
-            "model": self.model,
-            "messages": outbound_messages,
-            "api_key": self.api_key,
-            "temperature": self.temperature,
-            "max_tokens": actual_max_output_tokens,
-            "timeout": self.timeout,
-            "drop_params": True,
-            "parallel_tool_calls": False,
-        }
-        if self.base_url:
-            params["api_base"] = self.base_url
-        if tools:
-            params["tools"] = tools
-        try:
-            raw = litellm.completion(**params)
         except Exception as exc:
             raise LLMProviderError(_provider_failure_message(exc, timeout=self.timeout)) from exc
         if not getattr(raw, "choices", None):

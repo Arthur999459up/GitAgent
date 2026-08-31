@@ -11,9 +11,10 @@ from gitagent.domain.models import PlannedCapabilityCall
 
 class AgentActionKind(str, Enum):
     CAPABILITY = "capability"
+    COMPLETE_ANALYSIS = "complete_analysis"
+    PREPARE_CODE_CHANGE = "prepare_code_change"
     APPLY_ISSUE_FIX = "apply_issue_fix"
     APPLY_REPOSITORY_CHANGE = "apply_repository_change"
-    CONTINUE = "continue"
     ASK = "ask"
     FINISH = "finish"
 

@@ -16,7 +16,7 @@ from gitagent.agents import (
     RepositoryAgent,
 )
 from gitagent.capability import CapabilityLayer
-from gitagent.domain.errors import RoutingError
+from gitagent.domain.errors import RoutingError, WorkflowError
 from gitagent.domain.models import (
     AgentGuidance,
     ApprovalIntent,
@@ -46,6 +46,11 @@ from gitagent.harness.context import (
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.file_reads import FileReadLedger
+from gitagent.harness.mutation_plans import (
+    code_change_review_package,
+    issue_fix_mutation_plan,
+    repository_change_mutation_plan,
+)
 from gitagent.harness.validation.static import StaticVerifier
 from gitagent.infra.observability import TraceBus
 from gitagent.infra.persistence import SessionManager
@@ -142,7 +147,9 @@ class GitAgentService:
         self._require_scope(session_scope)
         repository = self._repository(repository)
         if not main_messages or main_messages[-1].get("role") != "user":
-            raise RoutingError("GitAgentService requires the current Main message thread")
+            raise RoutingError(
+                "GitAgentService requires the current Main message thread"
+            )
         self.dispatch_started = False
         self._active_turn_seq = int(turn_seq or 0)
         if self._active_turn_seq > 0:
@@ -161,9 +168,7 @@ class GitAgentService:
                 self._append_resume_delegation(main_messages, current)
                 self.dispatch_started = True
                 domain_output = self._continue_draft(current, user_input)
-                return self._finish_domain_turn(
-                    main_messages, current, domain_output
-                )
+                return self._finish_domain_turn(main_messages, current, domain_output)
             if current.pending is not None:
                 self._append_resume_delegation(main_messages, current)
                 self.dispatch_started = True
@@ -172,9 +177,7 @@ class GitAgentService:
                     proposal_context=self._context_description(current),
                 )
                 domain_output = self._continue_approval(current, decision, user_input)
-                return self._finish_domain_turn(
-                    main_messages, current, domain_output
-                )
+                return self._finish_domain_turn(main_messages, current, domain_output)
             if current.question and (
                 current.agent != "pull_requests"
                 or self.pull_request_agent.accept_question_reply(current, user_input)
@@ -189,9 +192,7 @@ class GitAgentService:
                     ),
                 )
                 domain_output = self._after_loop(current)
-                return self._finish_domain_turn(
-                    main_messages, current, domain_output
-                )
+                return self._finish_domain_turn(main_messages, current, domain_output)
             self._clear_context()
 
         decision = self.main_agent.decide(
@@ -288,7 +289,6 @@ class GitAgentService:
         goal = decision.request.strip()
         guidance = self._guidance(goal, decision.entity_type, decision.entity_id)
         if decision.target_agent == "repository":
-            operation = self.repository_agent.operation_for(goal)
             context = self.harness.context(
                 "repository",
                 scope.session_id,
@@ -297,7 +297,6 @@ class GitAgentService:
                 entity_type="repository",
                 guidance=guidance,
             )
-            self.repository_agent.prepare(context, operation)
             self._bind_context_turn(context)
             self.loop.start(context, self.repository_agent)
             return self._after_loop(context), context
@@ -460,7 +459,9 @@ class GitAgentService:
                     "repository modification revision has no change request"
                 )
             instruction = decision.instruction.strip() or user_input.strip()
-            revised_description = f"{request.description}\n\nUser revision: {instruction}"
+            revised_description = (
+                f"{request.description}\n\nUser revision: {instruction}"
+            )
             request.description = revised_description
             context.goal = revised_description
             context.code_candidate = None
@@ -473,6 +474,9 @@ class GitAgentService:
         if (
             context.agent == "pull_requests"
             and decision.action == ApprovalIntent.REVISE
+            and context.pending is not None
+            and len(context.pending.calls) == 1
+            and context.pending.calls[0].capability_id == "github.post_review"
         ):
             self._observe_service_decision(context, decision, user_input)
             return self._revise_pr_review(
@@ -869,13 +873,7 @@ class GitAgentService:
                 )
                 for item in pending.get("calls", [])
             ]
-            if agent == "repository" and (
-                len(calls) != 1
-                or calls[0].capability_id != "github.commit_to_default_branch"
-            ):
-                raise RoutingError(
-                    "stored RepositoryAgent proposal contains an invalid mutation plan"
-                )
+            self._validate_restored_mutation_plan(context, calls)
             if any(
                 "repository" in call.arguments
                 and str(call.arguments["repository"]) != repository
@@ -903,6 +901,117 @@ class GitAgentService:
                 finally:
                     context.origin_turn_seq = origin_turn_seq
         return context
+
+    def _validate_restored_mutation_plan(
+        self,
+        context: AgentContext,
+        calls: list[PlannedCapabilityCall],
+    ) -> None:
+        if context.agent == "repository":
+            if (
+                context.change_request is None
+                or context.code_candidate is None
+                or context.verification is None
+                or not context.verification.passed
+            ):
+                raise RoutingError(
+                    "stored RepositoryAgent proposal lacks reviewed change artifacts"
+                )
+            expected = repository_change_mutation_plan(
+                context.change_request,
+                context.code_candidate,
+            )
+            if calls != expected:
+                raise RoutingError(
+                    "stored RepositoryAgent proposal contains an invalid mutation plan"
+                )
+            return
+        if context.agent == "issues":
+            code_capabilities = {
+                "github.create_branch",
+                "github.commit",
+                "github.push",
+                "github.create_draft_pr",
+            }
+            if any(call.capability_id in code_capabilities for call in calls):
+                if (
+                    context.change_request is None
+                    or context.code_candidate is None
+                    or context.verification is None
+                    or not context.verification.passed
+                ):
+                    raise RoutingError(
+                        "stored Issue code proposal lacks a verified CandidatePatch"
+                    )
+                review = code_change_review_package(
+                    context.change_request,
+                    context.code_candidate,
+                    context.verification,
+                )
+                expected = issue_fix_mutation_plan(
+                    context.session_id,
+                    context.change_request,
+                    context.code_candidate,
+                    review,
+                )
+                if calls != expected:
+                    raise RoutingError(
+                        "stored Issue code proposal contains an invalid mutation plan"
+                    )
+                return
+            allowed = {
+                "github.post_comment",
+                "github.create_issue",
+                "github.update_issue",
+                "github.set_issue_lock",
+            }
+            if len(calls) != 1 or calls[0].capability_id not in allowed:
+                raise RoutingError(
+                    "stored Issue proposal contains an invalid mutation plan"
+                )
+            return
+        if context.agent == "pull_requests":
+            if len(calls) != 1 or calls[0].capability_id not in {
+                "github.post_review",
+                "github.commit",
+                "github.merge",
+            }:
+                raise RoutingError(
+                    "stored PullRequestAgent proposal contains an invalid mutation plan"
+                )
+            call = calls[0]
+            expected_operations = {
+                "github.post_review": {PullRequestOperation.POST_REVIEW.value},
+                "github.commit": {
+                    PullRequestOperation.MODIFY.value,
+                    PullRequestOperation.CI_FIX.value,
+                },
+                "github.merge": {PullRequestOperation.MERGE.value},
+            }
+            if context.operation not in expected_operations[call.capability_id]:
+                raise RoutingError(
+                    "stored PullRequestAgent proposal does not match its selected operation"
+                )
+            if call.capability_id == "github.post_review" and (
+                context.entity_id is None
+                or not str(context.entity_id).isdigit()
+                or call.arguments.get("pr_number") != int(context.entity_id)
+                or str(call.arguments.get("event") or "") != context.requested_outcome
+            ):
+                raise RoutingError(
+                    "stored PullRequestAgent Review proposal changed its target or event"
+                )
+            if call.capability_id in {"github.commit", "github.merge"}:
+                try:
+                    self.loop.dispatcher.validate_protected_capability(
+                        context,
+                        call.capability_id,
+                        call.arguments,
+                    )
+                except WorkflowError as exc:
+                    raise RoutingError(
+                        "stored PullRequestAgent proposal violates a protected mutation boundary"
+                    ) from exc
 
     @staticmethod
     def _restore_candidate(raw: Any) -> CandidatePatch | None:
@@ -990,9 +1099,7 @@ class GitAgentService:
         guidance = AgentGuidance(
             persistent_memory_index=memory.index,
             persistent_memory_pages=MemorySearch.render(memory.selected_pages),
-            resolved_references=self._resolved_references(
-                entity_type, entity_id
-            ),
+            resolved_references=self._resolved_references(entity_type, entity_id),
         )
         return None if guidance.empty else guidance
 
@@ -1094,7 +1201,10 @@ class GitAgentService:
         context.append_message(
             {
                 "role": "user",
-                "content": user_input or decision.instruction or decision.message or decision.action.value,
+                "content": user_input
+                or decision.instruction
+                or decision.message
+                or decision.action.value,
             }
         )
         context.observations.append(

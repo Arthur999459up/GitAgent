@@ -7,7 +7,12 @@ from dataclasses import asdict
 from time import perf_counter
 from typing import Any, TypeVar
 
-from gitagent.capability import CapabilityLayer, CapabilityResult, InvocationContext
+from gitagent.capability import (
+    AccessLevel,
+    CapabilityLayer,
+    CapabilityResult,
+    InvocationContext,
+)
 from gitagent.domain.errors import ValidationError
 from gitagent.domain.models import AgentGuidance, AgentSpec, VerificationReport
 from gitagent.harness.context.state import AgentContext
@@ -39,14 +44,18 @@ class AgentHarness:
             not isinstance(value, int) or isinstance(value, bool) or value < 1
             for value in windows.values()
         ):
-            raise ValueError("every context_window_tokens value must be a positive integer")
+            raise ValueError(
+                "every context_window_tokens value must be a positive integer"
+            )
         self._capabilities = capabilities
         self.approvals = capabilities.policy.approvals
         self.audit = audit or AuditLog()
         self.trace = trace or TraceBus()
         self.context_window_tokens = windows
         self._specs: dict[str, AgentSpec] = {}
-        self.message_sink: Callable[[AgentContext, dict[str, Any]], dict[str, Any]] | None = None
+        self.message_sink: (
+            Callable[[AgentContext, dict[str, Any]], dict[str, Any]] | None
+        ) = None
         self.compaction_sink: Callable[[AgentContext, Any], None] | None = None
 
     def context_window_for(self, agent_name: str) -> int:
@@ -157,7 +166,9 @@ class AgentHarness:
         approval_id: str | None = None,
     ) -> CapabilityResult:
         invocation = self.invocation_context(context, approval_id=approval_id)
-        visible = next((item for item in self.discover(context) if item.id == capability_id), None)
+        visible = next(
+            (item for item in self.discover(context) if item.id == capability_id), None
+        )
         result = self._capabilities.invoke(capability_id, arguments, invocation)
         audit_result = (
             "OK"
@@ -166,7 +177,10 @@ class AgentHarness:
             if result.status == "approval_required"
             else "FAILED"
         )
-        details: dict[str, Any] = {"argument_keys": sorted(arguments), "attempts": result.attempts}
+        details: dict[str, Any] = {
+            "argument_keys": sorted(arguments),
+            "attempts": result.attempts,
+        }
         if result.error is not None:
             details["error"] = result.error.type.value
         self.audit.record(
@@ -184,7 +198,12 @@ class AgentHarness:
     def discover(self, context: AgentContext) -> tuple[Any, ...]:
         return self._capabilities.discover(self.invocation_context(context))
 
-    def llm_tools(self, context: AgentContext) -> list[dict[str, Any]]:
+    def llm_tools(
+        self,
+        context: AgentContext,
+        *,
+        read_only: bool = False,
+    ) -> list[dict[str, Any]]:
         return [
             {
                 "type": "function",
@@ -196,6 +215,7 @@ class AgentHarness:
             }
             for capability in self.discover(context)
             if capability.input_schema is not None
+            and (not read_only or capability.access == AccessLevel.READ)
         ]
 
     def resolve_llm_name(self, name: str, context: AgentContext) -> str:
@@ -212,7 +232,9 @@ class AgentHarness:
         return "capability__" + capability_id.replace(".", "__").replace("-", "_")
 
     @staticmethod
-    def invocation_context(context: AgentContext, *, approval_id: str | None = None) -> InvocationContext:
+    def invocation_context(
+        context: AgentContext, *, approval_id: str | None = None
+    ) -> InvocationContext:
         return InvocationContext(
             run_id=context.run_id,
             session_id=context.session_id,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,7 +14,6 @@ from gitagent.harness.context import fit_messages, request_tokens
 from gitagent.harness.context.state import AgentContext
 from gitagent.model import (
     ChatResponse,
-    LiteLLMChatClient,
     LLMReasoner,
     OpenAIChatClient,
     ToolCall,
@@ -251,33 +249,6 @@ def test_client_rejects_edge_request_before_provider_call() -> None:
     assert transport.chat.completions.calls == []
     assert raised.value.requested_output_tokens == 100
     assert raised.value.remaining_tokens == 0
-
-
-def test_litellm_request_shrinks_output_and_disables_parallel_tools(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[dict[str, Any]] = []
-
-    def completion(**params: Any) -> Any:
-        calls.append(params)
-        return _raw_response()
-
-    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
-    messages = [{"role": "user", "content": "edge"}]
-    tools = structured_tools("respond", SCHEMA)
-    remaining = 9
-    client = LiteLLMChatClient(
-        "test",
-        "key",
-        max_output_tokens=100,
-        context_window_tokens=request_tokens(messages, tools) + remaining,
-    )
-
-    client.chat(messages, tools)
-
-    assert calls[0]["tools"] is tools
-    assert calls[0]["parallel_tool_calls"] is False
-    assert calls[0]["max_tokens"] == remaining
 
 
 def test_structured_failure_does_not_mutate_caller_messages() -> None:

@@ -16,8 +16,10 @@ agents:
     discover:
       - repository.get_repo_tree
       - repository.search_code
+      - repository.read_file
       - repository.read_files
       - repository.find_symbol
+      - repository.find_references
       - repository.get_file_history
       - context7.*
       - rag.*
@@ -27,8 +29,10 @@ agents:
       allow:
         - repository.get_repo_tree
         - repository.search_code
+        - repository.read_file
         - repository.read_files
         - repository.find_symbol
+        - repository.find_references
         - repository.get_file_history
         - context7.*
         - rag.*
@@ -94,7 +98,11 @@ agents:
       - github.get_workflow_runs
       - github.get_job_logs
       - repository.get_repo_tree
+      - repository.search_code
+      - repository.read_file
       - repository.read_files
+      - repository.find_symbol
+      - repository.find_references
       - repository.get_pr_diff
       - repository.get_changed_files
       - github.post_review
@@ -114,7 +122,11 @@ agents:
         - github.get_workflow_runs
         - github.get_job_logs
         - repository.get_repo_tree
+        - repository.search_code
+        - repository.read_file
         - repository.read_files
+        - repository.find_symbol
+        - repository.find_references
         - repository.get_pr_diff
         - repository.get_changed_files
         - context7.*

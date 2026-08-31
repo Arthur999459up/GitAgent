@@ -69,7 +69,6 @@ class AgentContext:
         self.guidance = guidance
         self.operation = ""
         self.requested_outcome = ""
-        self.phase = ""
         self.steps = 0
         self.max_steps = max_steps
         self.delegation_depth = 0
@@ -83,8 +82,6 @@ class AgentContext:
         self.change_request: ChangeRequest | None = None
         self.verification: VerificationReport | None = None
         self.reply_draft: str | None = None
-        self.repository_search_plan: dict[str, Any] | None = None
-        self.repository_history_path = ""
         self.result_required = True
         self.read_cache: dict[str, Any] = {}
         self._ephemeral_memory_reads: list[dict[str, str]] = []
@@ -92,6 +89,7 @@ class AgentContext:
         self.last_capability_call: CapabilityCallRecord | None = None
         self.error: str | None = None
         self.finished = False
+        self.structured_retry_instruction = ""
 
     @property
     def agent(self) -> str:
@@ -109,8 +107,28 @@ class AgentContext:
     def context_window_tokens(self) -> int:
         return self._harness.context_window_for(self.agent)
 
-    def invoke(
-        self, capability_id: str, *, approval_id: str | None = None, **arguments: Any
+    def invoke(self, capability_id: str, **arguments: Any) -> Any:
+        """Invoke without approval; model-authored arguments can never supply approval authority."""
+
+        return self._invoke(capability_id, arguments, approval_id=None)
+
+    def invoke_approved(
+        self,
+        capability_id: str,
+        arguments: dict[str, Any],
+        *,
+        approval_id: str,
+    ) -> Any:
+        """Invoke one exact Harness-owned call after an explicit approval decision."""
+
+        return self._invoke(capability_id, dict(arguments), approval_id=approval_id)
+
+    def _invoke(
+        self,
+        capability_id: str,
+        arguments: dict[str, Any],
+        *,
+        approval_id: str | None,
     ) -> Any:
         self.last_capability_call = None
         try:
@@ -285,11 +303,10 @@ class AgentContext:
         *,
         tool_name: str,
     ) -> dict[str, Any]:
+        self.structured_retry_instruction = ""
         message = getattr(value, "assistant_message", None)
         if not isinstance(message, dict):
-            message = assistant_tool_call(
-                f"call-{uuid.uuid4().hex}", tool_name, value
-            )
+            message = assistant_tool_call(f"call-{uuid.uuid4().hex}", tool_name, value)
         return self.append_message(message)
 
     def ensure_capability_tool_call(
@@ -299,7 +316,9 @@ class AgentContext:
         open_call = self.open_tool_call()
         if open_call is not None:
             function = open_call.get("function") or {}
-            actual_name = str(function.get("name") or "") if isinstance(function, dict) else ""
+            actual_name = (
+                str(function.get("name") or "") if isinstance(function, dict) else ""
+            )
             if actual_name != expected_name:
                 raise ValidationError(
                     f"open tool call {actual_name or '<unnamed>'} does not match capability {expected_name}"
@@ -379,7 +398,11 @@ class AgentContext:
     def _ephemeral_messages(self) -> list[dict[str, Any]]:
         messages = [dict(message) for message in self.messages]
         has_guidance = self.guidance is not None and not self.guidance.empty
-        if (not has_guidance and not self._ephemeral_memory_reads) or not messages:
+        if (
+            not has_guidance
+            and not self._ephemeral_memory_reads
+            and not self.structured_retry_instruction
+        ) or not messages:
             return messages
         payload = json.dumps(
             {
@@ -390,17 +413,15 @@ class AgentContext:
             separators=(",", ":"),
             default=str,
         )
-        policy = "\n\n" + _PROMPTS.render(
-            "agents.guidance_section", payload=payload
-        )
+        policy = "\n\n" + _PROMPTS.render("agents.guidance_section", payload=payload)
+        if self.structured_retry_instruction:
+            policy += "\n\n## Required correction\n" + self.structured_retry_instruction
         first = dict(messages[0])
         first["content"] = str(first.get("content") or "") + policy
         messages[0] = first
         return messages
 
-    def _record_ephemeral_memory_read(
-        self, root: str, path: str, content: str
-    ) -> None:
+    def _record_ephemeral_memory_read(self, root: str, path: str, content: str) -> None:
         identity = (root, path)
         if any(
             (item["root"], item["path"]) == identity

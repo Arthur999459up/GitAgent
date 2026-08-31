@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from gitagent.agent_loop import AgentAction, AgentActionKind, rejection_feedback
-from gitagent.domain.errors import LLMProviderError, ValidationError, WorkflowError
+from gitagent.domain.errors import WorkflowError
 from gitagent.domain.models import (
     AgentSpec,
     ChangeRequest,
@@ -17,15 +17,10 @@ from gitagent.domain.models import (
     Replacement,
     Route,
 )
-from gitagent.harness.context import (
-    capability_attempted,
-    capability_failure_observed,
-)
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.mutation_plans import code_change_review_package
 from gitagent.harness.validation.static import StaticVerifier
-from gitagent.infra.observability.trace import TraceCategory, TraceStatus
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
 
@@ -34,25 +29,10 @@ from .coding import (
     prepare_verified_candidate,
     record_candidate_capability_error,
 )
-from .decide import AGENT_ACTION_SCHEMA, parse_action
+from .decide import decide_action
 from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
-_ISSUE_ACTION_SCHEMA = {
-    **AGENT_ACTION_SCHEMA,
-    "properties": {
-        **AGENT_ACTION_SCHEMA["properties"],
-        "awaiting_user_confirmation": {
-            "type": "boolean",
-            "description": (
-                "True only when repository evidence supports a code change but the agent must wait for the user's "
-                "confirmation before preparing it."
-            ),
-        },
-    },
-    "required": [*AGENT_ACTION_SCHEMA["required"], "awaiting_user_confirmation"],
-}
-
 ISSUE_AGENT_SPEC = AgentSpec(
     name="issues",
     role=(
@@ -60,7 +40,14 @@ ISSUE_AGENT_SPEC = AgentSpec(
         "Every GitHub write is proposed to the loop and requires explicit user approval before execution."
     ),
     system_prompt=_PROMPTS.text("system.issues"),
-    output_schema=("action", "operation", "answer", "issues", "issue_number", "question"),
+    output_schema=(
+        "action",
+        "operation",
+        "answer",
+        "issues",
+        "issue_number",
+        "question",
+    ),
     routes=frozenset({Route.ISSUE}),
     required_context=("repository",),
     routing_examples=(
@@ -93,14 +80,16 @@ class IssueAgent:
         harness.register(ISSUE_AGENT_SPEC)
 
     def decide(self, context: AgentContext) -> AgentAction:
-        if self.reasoner is not None and capability_failure_observed(context):
-            return self._llm_decide(context)
         if context.reply_draft is not None:
             return self._publish_draft_decide(context)
         draft_pr = self._last_capability(context, "github.create_draft_pr")
         if draft_pr is not None:
             issue_number = self._entity_number(context)
-            if issue_number is not None and context.code_candidate is not None and context.verification is not None:
+            if (
+                issue_number is not None
+                and context.code_candidate is not None
+                and context.verification is not None
+            ):
                 context.reply_draft = self._code_change_issue_report(context, draft_pr)
                 return self._publish_draft_decide(context)
             return AgentAction(
@@ -108,28 +97,42 @@ class IssueAgent:
                 summary="代码修复已发布为 Draft PR",
                 message=f"已创建修复 Draft PR #{draft_pr.get('number')}。",
             )
-        if context.code_candidate is not None:
-            if rejection_feedback(context) is not None and not rejection_feedback(context):
+        feedback = rejection_feedback(context)
+        if feedback is not None:
+            if not feedback:
                 return self._abandon()
+            if context.code_candidate is not None:
+                context.goal += f"\n\nUser revision: {feedback}"
+                context.change_request = None
+                context.code_candidate = None
+                context.verification = None
+
+        completed_write = self._last_capability_id(
+            context,
+            {
+                "github.create_issue",
+                "github.update_issue",
+                "github.set_issue_lock",
+                "github.post_comment",
+            },
+        )
+        if completed_write is not None:
             return AgentAction(
-                AgentActionKind.APPLY_ISSUE_FIX,
-                summary="提交 Coding Agent 生成并验证的候选补丁供你审阅",
+                AgentActionKind.FINISH,
+                summary="Issue 操作已完成",
+                message="Issue 操作已成功执行。",
             )
-        required = self._required_entity_evidence(context)
-        if required is not None:
-            return required
-        if self.reasoner is not None:
-            try:
-                return self._llm_decide(context)
-            except (LLMProviderError, ValidationError) as exc:
-                self.harness.trace.emit(
-                    session_id=context.session_id,
-                    category=TraceCategory.AGENT,
-                    name="issues.decide",
-                    status=TraceStatus.PROGRESS,
-                    message=f"LLM decide failed; using minimal fallback ({type(exc).__name__}: {exc})",
-                )
-        return self._fallback_decide(context)
+        if self.reasoner is None:
+            return self._fallback_decide(context)
+        action = decide_action(
+            context,
+            self.harness,
+            self.reasoner,
+            protected_kinds=(AgentActionKind.PREPARE_CODE_CHANGE,),
+        )
+        if action.kind == AgentActionKind.PREPARE_CODE_CHANGE:
+            return self._prepare_code_change_action(context)
+        return action
 
     def build_result(self, context: AgentContext) -> IssueAgentResult:
         draft_pr = self._last_capability(context, "github.create_draft_pr")
@@ -138,7 +141,8 @@ class IssueAgent:
             return IssueAgentResult(
                 action=DomainAction.ANSWER,
                 operation=IssueOperation.GET,
-                answer=context.final_message or f"已创建修复 Draft PR #{draft_pr.get('number')}。",
+                answer=context.final_message
+                or f"已创建修复 Draft PR #{draft_pr.get('number')}。",
                 issues=[],
                 issue_number=issue_number,
             )
@@ -153,23 +157,38 @@ class IssueAgent:
         issue = self._last_capability(context, "github.get_issue")
         latest_view = self._last_capability_id(
             context,
-            {"github.post_comment", "github.list_issues", "github.get_issue", "github.get_issue_comments"},
+            {
+                "github.post_comment",
+                "github.list_issues",
+                "github.get_issue",
+                "github.get_issue_comments",
+            },
         )
         if latest_view == "github.post_comment" and posted is not None:
             return IssueAgentResult(
                 action=DomainAction.ANSWER,
                 operation=None,
                 answer=context.final_message
-                or (f"已发布回复到 Issue #{issue_number}。" if issue_number is not None else "Issue 回复已发布。"),
+                or (
+                    f"已发布回复到 Issue #{issue_number}。"
+                    if issue_number is not None
+                    else "Issue 回复已发布。"
+                ),
                 issues=[],
                 issue_number=issue_number,
             )
-        if latest_view in {"github.get_issue", "github.get_issue_comments"} and issue is not None:
-            comments = (self._last_capability(context, "github.get_issue_comments") or {}).get("comments", [])
+        if (
+            latest_view in {"github.get_issue", "github.get_issue_comments"}
+            and issue is not None
+        ):
+            comments = (
+                self._last_capability(context, "github.get_issue_comments") or {}
+            ).get("comments", [])
             return IssueAgentResult(
                 action=DomainAction.ANSWER,
                 operation=IssueOperation.GET,
-                answer=context.final_message or self._detail_answer(context, issue, comments),
+                answer=context.final_message
+                or self._detail_answer(context, issue, comments),
                 issues=[self._summary(issue)],
                 issue_number=int(issue.get("number", 0)),
             )
@@ -178,15 +197,19 @@ class IssueAgent:
             return IssueAgentResult(
                 action=DomainAction.ANSWER,
                 operation=IssueOperation.LIST,
-                answer=context.final_message or self._list_answer(context, raw_issues.get("issues", []), issues),
+                answer=context.final_message
+                or self._list_answer(context, raw_issues.get("issues", []), issues),
                 issues=issues,
             )
         if issue is not None:
-            comments = (self._last_capability(context, "github.get_issue_comments") or {}).get("comments", [])
+            comments = (
+                self._last_capability(context, "github.get_issue_comments") or {}
+            ).get("comments", [])
             return IssueAgentResult(
                 action=DomainAction.ANSWER,
                 operation=IssueOperation.GET,
-                answer=context.final_message or self._detail_answer(context, issue, comments),
+                answer=context.final_message
+                or self._detail_answer(context, issue, comments),
                 issues=[self._summary(issue)],
                 issue_number=int(issue.get("number", 0)),
             )
@@ -206,7 +229,9 @@ class IssueAgent:
     def _publish_draft_decide(self, context: AgentContext) -> AgentAction:
         issue_number = self._entity_number(context)
         if issue_number is None:
-            return AgentAction(AgentActionKind.ASK, question="发布回复前需要明确的 Issue 编号。")
+            return AgentAction(
+                AgentActionKind.ASK, question="发布回复前需要明确的 Issue 编号。"
+            )
         if self._last_capability(context, "github.post_comment") is not None:
             draft_pr = self._last_capability(context, "github.create_draft_pr")
             if draft_pr is not None:
@@ -237,9 +262,17 @@ class IssueAgent:
         )
 
     @staticmethod
-    def _code_change_issue_report(context: AgentContext, draft_pr: dict[str, Any]) -> str:
-        if context.change_request is None or context.code_candidate is None or context.verification is None:
-            raise WorkflowError("Issue modification report requires the reviewed code-change artifacts")
+    def _code_change_issue_report(
+        context: AgentContext, draft_pr: dict[str, Any]
+    ) -> str:
+        if (
+            context.change_request is None
+            or context.code_candidate is None
+            or context.verification is None
+        ):
+            raise WorkflowError(
+                "Issue modification report requires the reviewed code-change artifacts"
+            )
         review = code_change_review_package(
             context.change_request,
             context.code_candidate,
@@ -256,9 +289,14 @@ class IssueAgent:
             )
             or "- 未记录静态检查"
         )
-        risks = "\n".join(f"- {risk}" for risk in review.potential_risks) or "- 未发现明确的静态风险"
+        risks = (
+            "\n".join(f"- {risk}" for risk in review.potential_risks)
+            or "- 未发现明确的静态风险"
+        )
         follow_up = (
-            "\n".join(f"- {item}" for item in context.code_candidate.verification_required)
+            "\n".join(
+                f"- {item}" for item in context.code_candidate.verification_required
+            )
             or "- 运行仓库测试并完成人工审阅"
         )
         return (
@@ -272,72 +310,6 @@ class IssueAgent:
             "该 PR 当前仍为 Draft，合并前仍需人工审阅并运行仓库测试。"
         )
 
-    def _llm_decide(self, context: AgentContext) -> AgentAction:
-        tools = self.harness.llm_tools(context)
-        value = context.reason_structured(
-            self.reasoner,
-            schema=_ISSUE_ACTION_SCHEMA,
-            tool_name="decide_action",
-            tools=tools,
-        )
-        context.record_model_response(value, tool_name="decide_action")
-        if value.get("kind") == "capability":
-            value["capability_id"] = self.harness.resolve_llm_name(
-                str(value.get("capability_id", "")),
-                context,
-            )
-        if bool(value.get("awaiting_user_confirmation")):
-            question = str(value.get("question") or value.get("message") or "").strip()
-            if not question:
-                raise ValidationError("Issue confirmation state requires a question")
-            return AgentAction(
-                AgentActionKind.ASK,
-                summary=str(value.get("summary") or "等待用户确认是否继续修改"),
-                question=question,
-            )
-        if value.get("kind") == AgentActionKind.FINISH.value and str(value.get("question") or "").strip():
-            return AgentAction(
-                AgentActionKind.ASK,
-                summary=str(value.get("summary") or "等待用户补充信息"),
-                question=str(value["question"]).strip(),
-            )
-        if value.get("kind") == AgentActionKind.APPLY_ISSUE_FIX.value:
-            if context.code_candidate is None:
-                try:
-                    preparation = self._prepare_code_change(context)
-                except (LLMProviderError, ValidationError) as exc:
-                    raise WorkflowError(f"code candidate preparation failed: {exc}") from exc
-                if isinstance(preparation, AgentAction):
-                    return preparation
-                if preparation:
-                    return AgentAction(
-                        AgentActionKind.FINISH,
-                        summary="模型未生成文件内容",
-                        message=preparation,
-                    )
-            return AgentAction(
-                AgentActionKind.APPLY_ISSUE_FIX,
-                summary=str(value.get("summary") or "提交 Coding Agent 生成并验证的候选补丁供你审阅"),
-            )
-        action = parse_action(value, requires_candidate=False)
-        return action
-
-    def _required_entity_evidence(self, context: AgentContext) -> AgentAction | None:
-        issue_number = self._entity_number(context)
-        arguments = {"issue_number": issue_number} if issue_number is not None else None
-        if issue_number is not None and not capability_attempted(
-            context,
-            "github.get_issue",
-            arguments=arguments,
-        ):
-            return AgentAction(
-                AgentActionKind.CAPABILITY,
-                capability_id="github.get_issue",
-                arguments=arguments,
-                summary="读取 Issue",
-            )
-        return None
-
     def _fallback_decide(self, context: AgentContext) -> AgentAction:
         issue_number = self._entity_number(context)
         if issue_number is not None:
@@ -348,7 +320,9 @@ class IssueAgent:
                     arguments={"issue_number": issue_number},
                     summary="读取 Issue",
                 )
-            return AgentAction(AgentActionKind.FINISH, summary="Issue 已读取", message="")
+            return AgentAction(
+                AgentActionKind.FINISH, summary="Issue 已读取", message=""
+            )
         if self._last_capability(context, "github.list_issues") is None:
             return AgentAction(
                 AgentActionKind.CAPABILITY,
@@ -379,15 +353,20 @@ class IssueAgent:
             )
         return f"找到 {len(issues)} 个符合条件的 Issue。"
 
-    def _detail_answer(self, context: AgentContext, issue: dict[str, Any], comments: list[dict[str, Any]]) -> str:
+    def _detail_answer(
+        self,
+        context: AgentContext,
+        issue: dict[str, Any],
+        comments: list[dict[str, Any]],
+    ) -> str:
         if self.reasoner:
             repository_evidence = [
                 observation["payload"]
                 for observation in context.observations
                 if observation.get("kind") == "capability"
-                and str((observation.get("payload") or {}).get("capability_id") or "").startswith(
-                    "repository."
-                )
+                and str(
+                    (observation.get("payload") or {}).get("capability_id") or ""
+                ).startswith("repository.")
             ][-12:]
             evidence = {
                 "issue": self._bounded_issue(issue),
@@ -405,9 +384,13 @@ class IssueAgent:
             )
         body = str(issue.get("body") or "暂无正文").strip()
         suffix = f"\n\n共有 {len(comments)} 条评论。" if comments else ""
-        return f"#{issue.get('number')} {issue.get('title', '')}\n\n{body[:4000]}{suffix}"
+        return (
+            f"#{issue.get('number')} {issue.get('title', '')}\n\n{body[:4000]}{suffix}"
+        )
 
-    def _change_request(self, context: AgentContext, issue: dict[str, Any]) -> ChangeRequest:
+    def _change_request(
+        self, context: AgentContext, issue: dict[str, Any]
+    ) -> ChangeRequest:
         raw = issue.get("change_request") or {}
         if not raw and self.reasoner is not None:
             raw = context.complete_structured(
@@ -433,14 +416,22 @@ class IssueAgent:
                 tool_name="prepare_fix_guide",
             )
         replacements = [
-            Replacement(path=str(item["path"]), old=str(item["old"]), new=str(item["new"]))
+            Replacement(
+                path=str(item["path"]), old=str(item["old"]), new=str(item["new"])
+            )
             for item in raw.get("replacements", [])
         ]
         target_files = [str(path) for path in raw.get("target_files", [])]
-        proposed_files = {str(path): str(content) for path, content in raw.get("proposed_files", {}).items()}
+        proposed_files = {
+            str(path): str(content)
+            for path, content in raw.get("proposed_files", {}).items()
+        }
         return ChangeRequest(
             repository=context.repository,
-            description=str(raw.get("description") or f"Resolve issue #{issue.get('number')}: {issue.get('title', '')}"),
+            description=str(
+                raw.get("description")
+                or f"Resolve issue #{issue.get('number')}: {issue.get('title', '')}"
+            ),
             base_branch=str(raw.get("base_branch") or "main"),
             target_files=target_files,
             replacements=replacements,
@@ -449,7 +440,7 @@ class IssueAgent:
             suggested_title=raw.get("suggested_title"),
         )
 
-    def _prepare_code_change(self, context: AgentContext) -> str | AgentAction:
+    def _prepare_code_change_action(self, context: AgentContext) -> AgentAction:
         issue = self._last_capability(context, "github.get_issue")
         if issue is None:
             raise WorkflowError("code repair requires Issue evidence")
@@ -462,12 +453,37 @@ class IssueAgent:
             guidance=context.guidance,
         )
         if record_candidate_capability_error(context, prepared):
-            return AgentAction(
-                AgentActionKind.CONTINUE,
-                summary="Coding capability 失败，重新评估下一步",
+            context.complete_control_call(
+                {"status": "failed", "capability_error": prepared.capability_error}
             )
+            if self.reasoner is None:
+                return AgentAction(
+                    AgentActionKind.FINISH,
+                    summary="候选补丁准备失败",
+                    message=str(
+                        (prepared.capability_error or {}).get("message")
+                        or "候选补丁准备失败。"
+                    ),
+                )
+            action = decide_action(
+                context,
+                self.harness,
+                self.reasoner,
+                protected_kinds=(AgentActionKind.PREPARE_CODE_CHANGE,),
+            )
+            if action.kind == AgentActionKind.PREPARE_CODE_CHANGE:
+                return AgentAction(
+                    AgentActionKind.FINISH,
+                    summary="候选补丁准备失败",
+                    message="Coding capability 失败后不能在没有新证据时立即重复相同候选生成。",
+                )
+            return action
         if prepared.candidate is None:
-            return prepared.message
+            return AgentAction(
+                AgentActionKind.FINISH,
+                summary="模型未生成文件内容",
+                message=prepared.message,
+            )
         candidate = prepared.candidate
         report = prepared.verification
         if report is None or not report.passed:
@@ -486,7 +502,10 @@ class IssueAgent:
                 },
             }
         )
-        return ""
+        return AgentAction(
+            AgentActionKind.APPLY_ISSUE_FIX,
+            summary="提交 Coding Agent 生成并验证的候选补丁供你审阅",
+        )
 
     def _draft_reply(self, context: AgentContext, reasoner: Reasoner) -> str:
         return context.complete_text(
@@ -519,7 +538,9 @@ class IssueAgent:
         return None
 
     @staticmethod
-    def _last_capability_id(context: AgentContext, capability_ids: set[str]) -> str | None:
+    def _last_capability_id(
+        context: AgentContext, capability_ids: set[str]
+    ) -> str | None:
         for observation in reversed(context.observations):
             if observation["kind"] != "capability":
                 continue
@@ -542,7 +563,10 @@ class IssueAgent:
             else IssueOperation.UPDATE
         )
         if capability_id == "github.set_issue_lock":
-            issue = {**(self._last_capability(context, "github.get_issue") or {}), **data}
+            issue = {
+                **(self._last_capability(context, "github.get_issue") or {}),
+                **data,
+            }
             verb = "锁定" if data.get("locked") else "解锁"
             fallback_answer = f"Issue 讨论已{verb}。"
         else:
@@ -591,7 +615,10 @@ class IssueAgent:
 
     @staticmethod
     def _labels(issue: dict[str, Any]) -> list[str]:
-        return [str(item.get("name", "")) if isinstance(item, dict) else str(item) for item in issue.get("labels", [])]
+        return [
+            str(item.get("name", "")) if isinstance(item, dict) else str(item)
+            for item in issue.get("labels", [])
+        ]
 
     @staticmethod
     def _assignees(issue: dict[str, Any]) -> list[str]:
@@ -605,7 +632,11 @@ class IssueAgent:
         milestone = issue.get("milestone")
         if not milestone:
             return None
-        return str(milestone.get("title", "")) if isinstance(milestone, dict) else str(milestone)
+        return (
+            str(milestone.get("title", ""))
+            if isinstance(milestone, dict)
+            else str(milestone)
+        )
 
     @classmethod
     def _bounded_issue(cls, issue: dict[str, Any]) -> dict[str, Any]:
@@ -628,7 +659,9 @@ class IssueAgent:
     def _bounded_comments(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [
             {
-                "author": (comment.get("user") or {}).get("login", "") if isinstance(comment.get("user"), dict) else "",
+                "author": (comment.get("user") or {}).get("login", "")
+                if isinstance(comment.get("user"), dict)
+                else "",
                 "body": str(comment.get("body") or "")[:2000],
                 "created_at": comment.get("created_at", ""),
             }
