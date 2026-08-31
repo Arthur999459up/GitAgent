@@ -20,6 +20,7 @@ agents:
       - repository.find_symbol
       - repository.get_file_history
       - context7.*
+      - rag.claude-code-analysis
       - skill.debug
       - native.read
     invoke:
@@ -30,6 +31,7 @@ agents:
         - repository.find_symbol
         - repository.get_file_history
         - context7.*
+        - rag.claude-code-analysis
         - skill.debug
         - native.read
       ask:
@@ -53,6 +55,7 @@ agents:
       - github.update_issue
       - github.set_issue_lock
       - context7.*
+      - rag.claude-code-analysis
       - skill.debug
       - native.read
     invoke:
@@ -68,6 +71,7 @@ agents:
         - repository.find_symbol
         - repository.find_references
         - context7.*
+        - rag.claude-code-analysis
         - skill.debug
         - native.read
       ask:
@@ -97,6 +101,7 @@ agents:
       - github.commit
       - github.merge
       - context7.*
+      - rag.claude-code-analysis
       - skill.code-review
       - skill.debug
       - native.read
@@ -113,6 +118,7 @@ agents:
         - repository.get_pr_diff
         - repository.get_changed_files
         - context7.*
+        - rag.claude-code-analysis
         - skill.code-review
         - skill.debug
         - native.read
@@ -141,6 +147,7 @@ agents:
       - native.bash
       - native.agent
       - context7.*
+      - rag.claude-code-analysis
       - skill.code-review
       - skill.debug
     invoke:
@@ -160,6 +167,7 @@ agents:
         - native.bash
         - native.agent
         - context7.*
+        - rag.claude-code-analysis
         - skill.code-review
         - skill.debug
       ask:
@@ -202,6 +210,7 @@ agents:
       - native.edit
       - native.bash
       - context7.*
+      - rag.claude-code-analysis
       - skill.code-review
       - skill.debug
     invoke:
@@ -220,6 +229,7 @@ agents:
         - native.now
         - native.bash
         - context7.*
+        - rag.claude-code-analysis
         - skill.code-review
         - skill.debug
       ask:

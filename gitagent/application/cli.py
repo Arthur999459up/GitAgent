@@ -17,6 +17,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from gitagent.capability.rag import (
+    KnowledgeBaseManager,
+    KnowledgeBaseStatus,
+    RAGUnavailableError,
+)
 from gitagent.domain.errors import GitAgentError, ValidationError
 from gitagent.domain.models import (
     DomainAction,
@@ -59,11 +64,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--github-api-url", help="GitHub API 地址，GitHub Enterprise 可覆盖"
     )
     parser.add_argument("-v", "--version", action="version", version="gitagent 0.1.0")
+    commands = parser.add_subparsers(dest="command")
+    rag = commands.add_parser("rag", help="管理内置的只读 Markdown 知识库")
+    rag_actions = rag.add_subparsers(dest="rag_action", required=True)
+    register = rag_actions.add_parser(
+        "register", help="注册并索引 database/knowledge_base/<kb-id>"
+    )
+    register.add_argument("knowledge_base_id", help="知识库 ID，例如 engineering")
+    register.add_argument(
+        "-d", "--description", required=True, help="供 Agent 选择知识库时使用的说明"
+    )
+    sync = rag_actions.add_parser("sync", help="增量同步知识库")
+    sync.add_argument("knowledge_base_id")
+    rag_actions.add_parser("list", help="列出已注册知识库")
+    status = rag_actions.add_parser("status", help="查看知识库与运行状态")
+    status.add_argument("knowledge_base_id")
+    remove = rag_actions.add_parser("remove", help="删除注册信息和派生索引")
+    remove.add_argument("knowledge_base_id")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "rag":
+        try:
+            return _run_rag_management(args)
+        except (GitAgentError, RAGUnavailableError, ValueError, OSError) as exc:
+            ui.text(str(exc), title="Error · RAG 管理失败", kind="error")
+            return 1
     config = _config_from_args(args)
     try:
         if not _collect_credentials(config):
@@ -84,6 +112,59 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _repl(application)
     finally:
         application.memory_hooks.close()
+
+
+def _run_rag_management(args: argparse.Namespace) -> int:
+    manager = KnowledgeBaseManager()
+    if args.rag_action == "register":
+        knowledge_base = manager.register_knowledge_base(
+            args.knowledge_base_id,
+            args.description,
+        )
+        ui.json(knowledge_base.to_dict(), title="RAG · Registered")
+        return 0
+    if args.rag_action == "sync":
+        result = manager.sync(args.knowledge_base_id)
+        ui.json(result.to_dict(), title="RAG · Synced")
+        return 0
+    if args.rag_action == "list":
+        table = Table(title="RAG Knowledge Bases")
+        table.add_column("ID", style="cyan")
+        table.add_column("Status")
+        table.add_column("Documents", justify="right")
+        table.add_column("Source")
+        for knowledge_base in manager.list():
+            table.add_row(
+                knowledge_base.id,
+                knowledge_base.status.value,
+                str(len(knowledge_base.documents)),
+                knowledge_base.source_directory,
+            )
+        console.print(table)
+        return 0
+    if args.rag_action == "status":
+        knowledge_base = manager.get(args.knowledge_base_id)
+        if knowledge_base.status != KnowledgeBaseStatus.ERROR:
+            knowledge_base = manager.freshness_check(args.knowledge_base_id)
+        effective_status, reason = manager.capability_status(knowledge_base)
+        value = knowledge_base.to_dict()
+        value["status"] = effective_status.value
+        if reason:
+            value["unavailable_reason"] = reason
+        ui.json(value, title="RAG · Status")
+        return 0
+    if args.rag_action == "remove":
+        removed = manager.remove(args.knowledge_base_id)
+        ui.json(
+            {
+                "knowledge_base": removed.id,
+                "removed": True,
+                "source_directory_preserved": removed.source_directory,
+            },
+            title="RAG · Removed",
+        )
+        return 0
+    raise ValidationError(f"unknown RAG action: {args.rag_action}")
 
 
 def _config_from_args(args: argparse.Namespace) -> CLIConfig:

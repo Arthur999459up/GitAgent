@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
@@ -160,7 +161,7 @@ class CapabilityLayer:
             call_id,
             capability_id,
             "call.started",
-            {"argument_keys": sorted(arguments), "arguments": arguments},
+            {"argument_keys": sorted(arguments), **_trace_arguments(capability_id, arguments)},
         )
         if self.failure_guard.blocked(context.run_id, identity):
             error = capability_error(
@@ -175,7 +176,13 @@ class CapabilityLayer:
             return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0)
         capability = registration.capability
         if capability.status != CapabilityStatus.AVAILABLE:
-            error = capability_error(CapabilityErrorType.UNAVAILABLE, f"Capability 当前不可用：{capability_id}")
+            unavailable_reason = str(
+                getattr(registration.binding.target, "unavailable_reason", "") or ""
+            ).strip()
+            message = f"Capability 当前不可用：{capability_id}"
+            if unavailable_reason:
+                message += f"（{unavailable_reason}）"
+            error = capability_error(CapabilityErrorType.UNAVAILABLE, message)
             return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0)
 
         authorization = self.policy.authorize(capability, arguments, context)
@@ -339,6 +346,26 @@ class CapabilityLayer:
 def _trace_content(
     capability_id: str, arguments: dict[str, Any], content: Any
 ) -> Any:
+    if capability_id.startswith("rag."):
+        value = content if isinstance(content, dict) else {}
+        hits = value.get("hits") if isinstance(value.get("hits"), list) else []
+        return {
+            "knowledge_base": value.get("knowledge_base") or capability_id.split(".", 1)[1],
+            "query_sha256": _query_hash(arguments),
+            "status": "STALE" if value.get("stale") else "READY",
+            "stale": bool(value.get("stale")),
+            "hit_count": len(hits),
+            "hits": [
+                {
+                    "document_id": hit.get("document_id"),
+                    "section_id": hit.get("section_id"),
+                    "chunk_id": hit.get("chunk_id"),
+                }
+                for hit in hits
+                if isinstance(hit, dict)
+            ],
+            "elapsed_ms": value.get("elapsed_ms"),
+        }
     if capability_id == "native.read" and arguments.get("root") in {
         "private_memory",
         "project_memory",
@@ -349,3 +376,17 @@ def _trace_content(
             "path": arguments.get("path"),
         }
     return content
+
+
+def _trace_arguments(capability_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if capability_id.startswith("rag."):
+        query = str(arguments.get("query") or "")
+        return {
+            "query_sha256": _query_hash(arguments),
+            "query_characters": len(query),
+        }
+    return {"arguments": arguments}
+
+
+def _query_hash(arguments: dict[str, Any]) -> str:
+    return hashlib.sha256(str(arguments.get("query") or "").encode("utf-8")).hexdigest()
