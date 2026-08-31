@@ -1,13 +1,24 @@
 """Agent Loop state-transition kernel."""
 
-from .actions import AgentAction, AgentActionKind, AgentLoopAgent, PendingAction
 from .loop import AgentLoop, rejection_feedback
+from .models import (
+    AgentCall,
+    AgentLoopAgent,
+    AgentResult,
+    CapabilityCall,
+    ModelResponse,
+    PendingCall,
+    StructuredCall,
+)
 
 __all__ = [
-    "AgentAction",
-    "AgentActionKind",
+    "AgentCall",
     "AgentLoop",
     "AgentLoopAgent",
-    "PendingAction",
+    "AgentResult",
+    "CapabilityCall",
+    "ModelResponse",
+    "PendingCall",
+    "StructuredCall",
     "rejection_feedback",
 ]

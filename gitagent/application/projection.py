@@ -56,7 +56,7 @@ def project_service_result(
         if isinstance(result.output, str)
         else assistant
     )
-    if result.decision.clarify:
+    if result.clarify:
         return TurnProjection(
             final_assistant,
             assistant,

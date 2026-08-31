@@ -185,6 +185,13 @@ class CapabilityLayer:
             error = capability_error(CapabilityErrorType.UNAVAILABLE, message)
             return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0)
 
+        try:
+            if capability.input_schema is not None:
+                validate_schema(arguments, capability.input_schema, label=f"{capability_id} arguments")
+        except ValidationError as exc:
+            error = capability_error(CapabilityErrorType.INVALID_INPUT, str(exc))
+            return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0)
+
         authorization = self.policy.authorize(capability, arguments, context)
         if authorization.decision == PermissionDecision.DENY:
             error = capability_error(CapabilityErrorType.PERMISSION_DENIED, authorization.reason)
@@ -199,13 +206,6 @@ class CapabilityLayer:
                 {"status": result.status, "content": ""},
             )
             return result
-
-        try:
-            if capability.input_schema is not None:
-                validate_schema(arguments, capability.input_schema, label=f"{capability_id} arguments")
-        except ValidationError as exc:
-            error = capability_error(CapabilityErrorType.INVALID_INPUT, str(exc))
-            return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0)
 
         provider = self._providers.get(registration.binding.provider_id)
         if provider is None:
@@ -267,6 +267,42 @@ class CapabilityLayer:
                     continue
                 return self._finish_failure(context, call_id, capability_id, identity, error, attempts=attempts)
             self._emit(context, call_id, capability_id, "attempt.succeeded", {"attempt": attempts})
+            try:
+                if capability.output_schema is not None:
+                    validate_schema(
+                        raw,
+                        capability.output_schema,
+                        label=f"{capability_id} result",
+                    )
+            except ValidationError as exc:
+                self._emit(
+                    context,
+                    call_id,
+                    capability_id,
+                    "output_validation.failed",
+                    {
+                        "attempt": attempts,
+                        "provider_executed": True,
+                        "side_effect_possible": mutation,
+                        "error": str(exc),
+                    },
+                )
+                error = capability_error(
+                    CapabilityErrorType.INVALID_OUTPUT,
+                    str(exc),
+                    details={
+                        "provider_executed": True,
+                        "side_effect_possible": mutation,
+                    },
+                )
+                return self._finish_failure(
+                    context,
+                    call_id,
+                    capability_id,
+                    identity,
+                    error,
+                    attempts=attempts,
+                )
             if attempts > 1:
                 self._emit(context, call_id, capability_id, "recovery.succeeded", {"attempt": attempts})
             self.failure_guard.clear(context.run_id, identity)

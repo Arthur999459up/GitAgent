@@ -19,7 +19,6 @@ from ..errors import (
     ProviderConflictError,
     ProviderExecutionError,
     ProviderTimeoutError,
-    ProviderUnavailableError,
 )
 from ..models import (
     AccessLevel,
@@ -61,10 +60,6 @@ class NativeProvider:
         self,
         workspace_root: str | Path,
         *,
-        subagent_runner: Callable[[str, InvocationContext, frozenset[str]], Any]
-        | None = None,
-        permission_resolver: Callable[[InvocationContext], frozenset[str]]
-        | None = None,
         memory_roots: Mapping[str, str | Path] | None = None,
         blocked_paths: Iterable[str | Path] = (),
         secret_values: Iterable[str] = (),
@@ -84,8 +79,6 @@ class NativeProvider:
             self.read_roots[name] = path
         self.blocked_paths = frozenset(Path(value).resolve() for value in blocked_paths)
         self.secret_values = tuple(value for value in secret_values if value)
-        self.subagent_runner = subagent_runner
-        self.permission_resolver = permission_resolver
         self._definitions = self._build_definitions()
 
     def load(self) -> list[CapabilityRegistration]:
@@ -217,14 +210,6 @@ class NativeProvider:
                     },
                     ["command"],
                 ),
-                object_output,
-            ),
-            NativeToolDefinition(
-                "native.agent",
-                "Run one restricted coding sub-agent with inherited effective permissions.",
-                AccessLevel.READ,
-                self._agent,
-                _object_schema({"task": {"type": "string", "minLength": 1}}, ["task"]),
                 object_output,
             ),
         )
@@ -515,33 +500,6 @@ class NativeProvider:
             ):
                 redacted = redacted.replace(secret, "[REDACTED]")
         return redacted
-
-    def _agent(self, arguments: dict[str, Any], context: InvocationContext) -> Any:
-        if self.subagent_runner is None or self.permission_resolver is None:
-            raise ProviderUnavailableError("coding sub-agent runner is not configured")
-        child_context = InvocationContext(
-            run_id=context.run_id,
-            session_id=context.session_id,
-            agent_id="coding_subagent",
-            repository=context.repository,
-            delegation_depth=context.delegation_depth + 1,
-        )
-        parent = self.permission_resolver(context)
-        child = self.permission_resolver(child_context)
-        effective = frozenset(parent & child)
-        restricted_context = InvocationContext(
-            run_id=child_context.run_id,
-            session_id=child_context.session_id,
-            agent_id=child_context.agent_id,
-            repository=child_context.repository,
-            approval_id=child_context.approval_id,
-            delegation_depth=child_context.delegation_depth,
-            effective_capabilities=effective,
-        )
-        return self.subagent_runner(
-            str(arguments["task"]), restricted_context, effective
-        )
-
 
 def _object_schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
     return {

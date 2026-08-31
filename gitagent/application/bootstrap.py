@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -145,7 +145,9 @@ class LiveApplication:
         text = user_input.strip()
         if not text:
             raise ValidationError("request cannot be empty")
-        turn = self.sessions.start_turn(scope, text)
+        stored_context = self._session().agent_context
+        waiting_agent = _waiting_child_agent(stored_context)
+        turn = self.sessions.start_turn(scope, text, agent=waiting_agent)
         dispatch_started = False
         rendered = False
         try:
@@ -167,6 +169,7 @@ class LiveApplication:
                 ),
                 tools=main_tools,
                 turn_seq=turn.seq,
+                current_user_is_main=waiting_agent is None,
             )
             try:
                 result = self.service.handle(
@@ -186,7 +189,7 @@ class LiveApplication:
             )
             current = self._session().working_state
             next_state = merge_working_state(current, projection=projection)
-            if result.agent is None and not result.decision.clarify:
+            if result.agent is None and not result.clarify:
                 next_state["open_question"] = current["open_question"]
             if renderer is not None:
                 renderer(result)
@@ -195,6 +198,9 @@ class LiveApplication:
                 scope,
                 turn.seq,
                 assistant_text=projection.assistant_text,
+                assistant_agent=(
+                    result.output_agent if result.output_agent != "main" else None
+                ),
                 workflow_summary=projection.workflow_summary,
                 route=projection.route,
                 entity_manifests=projection.entity_manifests,
@@ -426,8 +432,6 @@ class LiveApplication:
             build_capability_layer(
                 self.github,
                 trace=self.trace,
-                reasoner=self.reasoner,
-                coding_context_window_tokens=self.config.context_window_for("coding"),
                 context7_api_key=self.config.context7_api_key,
                 blocked_paths=(self.config.source_path,),
                 secret_values=self.config.secret_values,
@@ -495,6 +499,21 @@ class LiveApplication:
         except Exception:  # noqa: BLE001, S110 - startup recovery owns the row
             # The original started row remains and startup recovery will interrupt it.
             pass
+
+
+def _waiting_child_agent(context: Mapping[str, Any]) -> str | None:
+    """Return the owner of a paused user turn without interpreting its semantics."""
+
+    agent = str(context.get("agent") or "")
+    if agent not in {"issues", "pull_requests", "repository"}:
+        return None
+    if bool(context.get("finished")) or context.get("error") is not None:
+        return None
+    if context.get("pending") is not None or context.get("question"):
+        return agent
+    if context.get("reply_draft") is not None:
+        return agent
+    return None
 
 
 def build_live_application(config: RuntimeConfig) -> LiveApplication:
@@ -567,8 +586,6 @@ def build_live_application(config: RuntimeConfig) -> LiveApplication:
         build_capability_layer(
             github,
             trace=trace,
-            reasoner=reasoner,
-            coding_context_window_tokens=config.context_window_for("coding"),
             context7_api_key=config.context7_api_key,
             blocked_paths=(config.source_path,),
             secret_values=config.secret_values,

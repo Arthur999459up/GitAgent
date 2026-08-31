@@ -18,16 +18,12 @@ from gitagent.domain.models import (
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.file_access import safe_repository_path
-from gitagent.prompts import get_prompt_library
-
-_PROMPTS = get_prompt_library()
 
 VERIFICATION_SPEC = AgentSpec(
     name="static_verifier",
     role="Run syntax, lint, and static analysis only on candidate files.",
-    system_prompt=_PROMPTS.text("system.static_verifier"),
+    system_prompt="Deterministic verifier; no model interaction.",
     output_schema=("passed", "checks", "skipped", "attempts"),
-    routes=frozenset({"static_verification"}),
 )
 
 

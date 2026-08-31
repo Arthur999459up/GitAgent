@@ -16,17 +16,17 @@ from .builder import (
     fit_messages,
     fit_messages_with_plan,
 )
-from .capability_history import (
-    capability_attempted,
-    find_capability_observation,
-)
 from .messages import (
     assistant_tool_call,
     canonical_message,
     request_tokens,
     tool_result_message,
 )
-from .projector import derive_domain_messages, derive_main_messages
+from .projector import (
+    correlate_tool_results,
+    derive_domain_messages,
+    derive_main_messages,
+)
 
 __all__ = [
     "EMERGENCY_THRESHOLD",
@@ -38,12 +38,11 @@ __all__ = [
     "MessageCompactionPlan",
     "assistant_tool_call",
     "canonical_message",
-    "capability_attempted",
     "context_pressure",
+    "correlate_tool_results",
     "derive_domain_messages",
     "derive_main_messages",
     "estimate_tokens",
-    "find_capability_observation",
     "fit_messages",
     "fit_messages_with_plan",
     "request_tokens",

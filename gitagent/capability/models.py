@@ -58,8 +58,6 @@ class InvocationContext:
     agent_id: str
     repository: str = ""
     approval_id: str | None = None
-    delegation_depth: int = 0
-    effective_capabilities: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)

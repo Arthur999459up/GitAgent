@@ -68,6 +68,47 @@ class ApprovalStore:
             self._requests[request.approval_id] = request
         return request
 
+    def restore(
+        self,
+        *,
+        approval_id: str,
+        session_id: str,
+        repository: str,
+        summary: str,
+        calls: list[PlannedCapabilityCall],
+    ) -> ApprovalRequest:
+        """Restore one persisted, undecided request without changing its identity."""
+
+        if not approval_id or not calls:
+            raise ValidationError("a restored approval requires an ID and mutation calls")
+        with self._lock:
+            existing = self._requests.get(approval_id)
+            if existing is not None:
+                if (
+                    existing.session_id != session_id
+                    or existing.repository != repository
+                    or existing.summary != summary
+                    or existing.calls != calls
+                    or existing.decision is not None
+                ):
+                    raise ValidationError(
+                        "persisted approval does not match the active request"
+                    )
+                return existing
+            request = ApprovalRequest(
+                approval_id=approval_id,
+                session_id=session_id,
+                repository=repository,
+                summary=summary,
+                calls=calls,
+                created_at=datetime.now(UTC).isoformat(),
+                _remaining=[
+                    _exact_call(call.capability_id, call.arguments) for call in calls
+                ],
+            )
+            self._requests[approval_id] = request
+            return request
+
     def decide(self, approval_id: str, decision: str) -> ApprovalRequest:
         if decision not in self._DECISIONS:
             raise ValidationError("decision must be exactly Approve or Reject")

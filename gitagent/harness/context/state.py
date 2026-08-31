@@ -23,7 +23,6 @@ from gitagent.harness.context.messages import (
     tool_result_message,
 )
 from gitagent.harness.file_reads import FileReadLedger
-from gitagent.model import structured_tools
 from gitagent.prompts import get_prompt_library
 
 if TYPE_CHECKING:
@@ -61,17 +60,16 @@ class AgentContext:
         self.spec = spec
         self.run_id = f"run-{uuid.uuid4().hex}"
         self.origin_turn_seq = 0
+        self.parent_call_id = ""
+        self.parent_call_name = ""
         self.session_id = session_id
         self.repository = repository
         self.goal = goal
         self.entity_type = entity_type
         self.entity_id = entity_id
         self.guidance = guidance
-        self.operation = ""
-        self.requested_outcome = ""
         self.steps = 0
         self.max_steps = max_steps
-        self.delegation_depth = 0
         self.observations: list[dict[str, Any]] = []
         self.messages: list[dict[str, Any]] = []
         self.pending: Any = None
@@ -82,14 +80,18 @@ class AgentContext:
         self.change_request: ChangeRequest | None = None
         self.verification: VerificationReport | None = None
         self.reply_draft: str | None = None
-        self.result_required = True
+        self.code_explanation: Any = None
+        self.code_review: Any = None
+        self.code_plan: Any = None
+        self.review_dialogue: dict[str, Any] | None = None
+        self.ci_analysis: dict[str, Any] | None = None
+        self.merge_readiness: dict[str, Any] | None = None
         self.read_cache: dict[str, Any] = {}
         self._ephemeral_memory_reads: list[dict[str, str]] = []
         self.file_reads = FileReadLedger()
         self.last_capability_call: CapabilityCallRecord | None = None
         self.error: str | None = None
         self.finished = False
-        self.structured_retry_instruction = ""
 
     @property
     def agent(self) -> str:
@@ -277,37 +279,22 @@ class AgentContext:
             self.messages[:] = durable
         return fitted
 
-    def reason_structured(
+    def reason(
         self,
         reasoner: Any,
         *,
-        schema: dict[str, Any] | None = None,
-        tool_name: str = "respond",
         tools: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        """Run inference with one final tool payload used for fitting and transport."""
+    ) -> Any:
+        """Run one native Text/structured-call model step and persist it verbatim."""
 
-        final_tools = structured_tools(tool_name, schema, tools)
-        request = self.model_messages(final_tools)
-        return reasoner.complete_structured_messages(
+        request = self.model_messages(tools)
+        response = reasoner.complete_messages(
             messages=request,
-            schema=schema,
-            tool_name=tool_name,
-            final_tools=final_tools,
+            tools=tools,
             context_window_tokens=self.context_window_tokens,
         )
-
-    def record_model_response(
-        self,
-        value: dict[str, Any],
-        *,
-        tool_name: str,
-    ) -> dict[str, Any]:
-        self.structured_retry_instruction = ""
-        message = getattr(value, "assistant_message", None)
-        if not isinstance(message, dict):
-            message = assistant_tool_call(f"call-{uuid.uuid4().hex}", tool_name, value)
-        return self.append_message(message)
+        self.append_message(response.assistant_message)
+        return response
 
     def ensure_capability_tool_call(
         self, capability_id: str, arguments: dict[str, Any]
@@ -328,8 +315,10 @@ class AgentContext:
         self.append_message(assistant_tool_call(call_id, expected_name, arguments))
         return call_id
 
-    def append_tool_result(self, content: Any) -> dict[str, Any]:
-        call_id = self.open_tool_call_id()
+    def append_tool_result(
+        self, content: Any, *, call_id: str | None = None
+    ) -> dict[str, Any]:
+        call_id = call_id or self.open_tool_call_id()
         if not call_id:
             raise ValidationError("Domain tool result has no matching assistant call")
         return self.append_message(tool_result_message(call_id, content))
@@ -360,31 +349,6 @@ class AgentContext:
         call = self.open_tool_call()
         return str(call.get("id") or "") if call is not None else ""
 
-    def complete_control_call(self, outcome: Any) -> None:
-        if self.open_tool_call() is not None:
-            self.append_tool_result(outcome)
-
-    def complete_structured(
-        self,
-        reasoner: Any,
-        *,
-        prompt: str,
-        schema: dict[str, Any] | None = None,
-        tool_name: str = "respond",
-        tools: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        self.start_message_thread()
-        self.append_message({"role": "user", "content": prompt})
-        value = self.reason_structured(
-            reasoner,
-            schema=schema,
-            tool_name=tool_name,
-            tools=tools,
-        )
-        self.record_model_response(value, tool_name=tool_name)
-        self.complete_control_call({"status": "accepted", "result": value})
-        return value
-
     def complete_text(self, reasoner: Any, *, prompt: str) -> str:
         self.start_message_thread()
         self.append_message({"role": "user", "content": prompt})
@@ -398,11 +362,7 @@ class AgentContext:
     def _ephemeral_messages(self) -> list[dict[str, Any]]:
         messages = [dict(message) for message in self.messages]
         has_guidance = self.guidance is not None and not self.guidance.empty
-        if (
-            not has_guidance
-            and not self._ephemeral_memory_reads
-            and not self.structured_retry_instruction
-        ) or not messages:
+        if (not has_guidance and not self._ephemeral_memory_reads) or not messages:
             return messages
         payload = json.dumps(
             {
@@ -414,8 +374,6 @@ class AgentContext:
             default=str,
         )
         policy = "\n\n" + _PROMPTS.render("agents.guidance_section", payload=payload)
-        if self.structured_retry_instruction:
-            policy += "\n\n## Required correction\n" + self.structured_retry_instruction
         first = dict(messages[0])
         first["content"] = str(first.get("content") or "") + policy
         messages[0] = first

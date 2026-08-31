@@ -19,6 +19,7 @@ class CapabilityErrorType(str, Enum):
     CAPABILITY_NOT_FOUND = "capability_not_found"
     PERMISSION_DENIED = "permission_denied"
     INVALID_INPUT = "invalid_input"
+    INVALID_OUTPUT = "invalid_output"
     RESOURCE_NOT_FOUND = "resource_not_found"
     CONFLICT = "conflict"
     UNAVAILABLE = "unavailable"

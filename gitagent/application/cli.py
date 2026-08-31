@@ -528,9 +528,9 @@ def _render_application_output(application: LiveApplication, output: Any) -> Non
 
 
 def _render_result(application: LiveApplication, result: ServiceResult) -> None:
-    if result.decision.clarify:
+    if result.clarify:
         ui.markdown(
-            str(result.output or result.decision.message),
+            str(result.output),
             title="需要补充信息",
             kind="router",
         )

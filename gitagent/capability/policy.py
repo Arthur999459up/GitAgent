@@ -198,8 +198,6 @@ class PermissionPolicy:
                     )
 
     def can_discover(self, capability: Capability, context: InvocationContext) -> bool:
-        if context.effective_capabilities is not None and capability.id not in context.effective_capabilities:
-            return False
         config = self._agents.get(context.agent_id)
         if self._config_error(context.agent_id, config):
             return False
@@ -211,11 +209,6 @@ class PermissionPolicy:
         arguments: dict[str, Any],
         context: InvocationContext,
     ) -> Authorization:
-        if context.effective_capabilities is not None and capability.id not in context.effective_capabilities:
-            return Authorization(
-                PermissionDecision.DENY,
-                "capability is outside inherited effective permissions",
-            )
         config = self._agents.get(context.agent_id)
         config_error = self._config_error(context.agent_id, config)
         if config_error:
@@ -264,8 +257,6 @@ class PermissionPolicy:
                 PermissionDecision.DENY,
                 "WRITE and DESTRUCTIVE capabilities must use the agent invoke.ask policy",
             )
-        if capability.id == "native.agent" and (context.agent_id != "coding" or context.delegation_depth >= 1):
-            return Authorization(PermissionDecision.DENY, "sub-agent delegation is limited to one level")
         return Authorization(PermissionDecision.ALLOW, bash_profile=profile)
 
     @classmethod

@@ -201,7 +201,6 @@ def test_project_policy_grants_only_autonomous_agents() -> None:
         "issues",
         "pull_requests",
         "coding",
-        "coding_subagent",
     ):
         context = InvocationContext("run", "session", agent_id)
         assert [item.id for item in layer.discover(context)] == ["rag.engineering"]

@@ -7,12 +7,6 @@ from enum import Enum
 from typing import Any
 
 
-class Route(str, Enum):
-    ISSUE = "ISSUE"
-    PULL_REQUEST = "PULL_REQUEST"
-    REPOSITORY = "REPOSITORY"
-
-
 class ApprovalIntent(str, Enum):
     """The user's natural-language intent toward an open proposal."""
 
@@ -97,17 +91,6 @@ class RepositoryRef:
 
 
 @dataclass(frozen=True)
-class MainDecision:
-    target_agent: str | None = None
-    entity_type: str | None = None
-    entity_id: str | None = None
-    request: str = ""
-    message: str = ""
-    clarify: bool = False
-    requested_reply: bool = False
-
-
-@dataclass(frozen=True)
 class WorkflowTurnDecision:
     """Classification of a user's natural-language turn on an open proposal."""
 
@@ -122,9 +105,6 @@ class AgentSpec:
     role: str
     system_prompt: str
     output_schema: tuple[str, ...]
-    routes: frozenset[Route | str]
-    required_context: tuple[str, ...] = ()
-    routing_examples: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -354,7 +334,6 @@ class PullRequestAgentResult:
     answer: str
     pull_requests: list[PullRequestSummary]
     pr_number: int | None = None
-    requested_outcome: str | None = None
     changed_files: list[str] = field(default_factory=list)
     interpretation: CodeExplanationResult | None = None
     review: CodeReviewResult | None = None

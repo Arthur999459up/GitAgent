@@ -311,6 +311,8 @@ class SessionManager:
         self,
         scope: SessionScope,
         user_text: str,
+        *,
+        agent: str | None = None,
     ) -> TurnRecord:
         _validate_session_scope(scope)
         safe_user = self.store.text(_require_string(user_text, "user_text", allow_empty=False))
@@ -348,6 +350,7 @@ class SessionManager:
             scope,
             "user_message",
             turn_seq=seq,
+            agent=agent,
             data={"content": safe_user},
         )
         return _turn(
@@ -361,6 +364,7 @@ class SessionManager:
         seq: int,
         *,
         assistant_text: str,
+        assistant_agent: str | None = None,
         workflow_summary: str,
         route: Mapping[str, Any] | None,
         entity_manifests: Sequence[Mapping[str, Any]],
@@ -389,6 +393,7 @@ class SessionManager:
             scope,
             "assistant_message",
             turn_seq=seq,
+            agent=assistant_agent,
             data={"content": safe_assistant},
         )
         if safe_route is not None:

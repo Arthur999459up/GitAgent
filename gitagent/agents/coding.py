@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import difflib
 import json
-import re
 from typing import Any
 
+from gitagent.agent_loop import AgentResult
 from gitagent.capability import AccessLevel
+from gitagent.capability.schema import validate_schema
 from gitagent.domain.errors import LLMProviderError, ValidationError, WorkflowError
 from gitagent.domain.models import (
     AgentGuidance,
@@ -24,7 +25,7 @@ from gitagent.domain.reviews import canonical_review_event
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.file_access import safe_repository_path
-from gitagent.model import Reasoner
+from gitagent.model import Reasoner, structured_tools
 from gitagent.prompts import get_prompt_library
 
 from .guidance import guidance_section
@@ -52,9 +53,6 @@ _CHANGE_PLAN_SCHEMA = {
     "required": ["changes"],
     "additionalProperties": False,
 }
-
-_EXPLICIT_PATH = re.compile(r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9_-]+")
-
 
 _EXPLANATION_SCHEMA = {
     "type": "object",
@@ -152,10 +150,9 @@ _CI_SCHEMA = {
 _EVIDENCE_READY_SCHEMA = {
     "type": "object",
     "properties": {
-        "kind": {"type": "string", "enum": ["finish"]},
         "summary": {"type": "string"},
     },
-    "required": ["kind", "summary"],
+    "required": ["summary"],
     "additionalProperties": False,
 }
 
@@ -176,12 +173,6 @@ CODING_SPEC = AgentSpec(
     ),
     system_prompt=_PROMPTS.text("system.coding"),
     output_schema=(),
-    routes=frozenset({"coding"}),
-    required_context=("repository",),
-    routing_examples=(
-        "修复登录接口的空指针问题",
-        "为配置加载器增加超时参数",
-    ),
 )
 
 
@@ -191,164 +182,118 @@ class CodingAgent:
         self.reasoner = reasoner
         harness.register(CODING_SPEC)
 
-    def explain(
+    def run_call(
         self,
-        repository: str,
-        request: str,
+        parent: AgentContext,
+        *,
+        call_id: str,
+        mode: str,
+        task: str,
         evidence: dict[str, Any],
-        *,
-        session_id: str,
-        guidance: AgentGuidance | None = None,
-    ) -> CodeExplanationResult:
-        return self.harness.run(
-            "coding",
-            session_id=session_id,
-            operation=lambda context: self._explain(
-                context, request, evidence, guidance
-            ),
-            repository=repository,
-            goal=request,
-            guidance=guidance,
-        )
+        change_request: ChangeRequest | None = None,
+        verifier: Any | None = None,
+    ) -> tuple[AgentResult, Any]:
+        """Run a fresh Coding child and return its own final Text plus runtime artifact."""
 
-    def review(
-        self,
-        repository: str,
-        request: str,
-        evidence: dict[str, Any],
-        *,
-        session_id: str,
-        guidance: AgentGuidance | None = None,
-    ) -> CodeReviewResult:
-        return self.harness.run(
+        context = self.harness.context(
             "coding",
-            session_id=session_id,
-            operation=lambda context: self._review(
-                context, request, evidence, guidance
-            ),
-            repository=repository,
-            goal=request,
-            guidance=guidance,
+            parent.session_id,
+            repository=parent.repository,
+            goal=task,
+            entity_type=parent.entity_type,
+            entity_id=parent.entity_id,
+            guidance=parent.guidance,
         )
-
-    def plan(
-        self,
-        repository: str,
-        request: str,
-        evidence: dict[str, Any],
-        *,
-        session_id: str,
-        guidance: AgentGuidance | None = None,
-    ) -> CodePlanResult:
-        return self.harness.run(
-            "coding",
-            session_id=session_id,
-            operation=lambda context: self._plan(context, request, evidence, guidance),
-            repository=repository,
-            goal=request,
-            guidance=guidance,
-        )
-
-    def summarize_review_dialogue(
-        self,
-        repository: str,
-        request: str,
-        evidence: dict[str, Any],
-        *,
-        session_id: str,
-        guidance: AgentGuidance | None = None,
-    ) -> dict[str, Any]:
-        return self.harness.run(
-            "coding",
-            session_id=session_id,
-            operation=lambda context: self._summarize_review_dialogue(
-                context, request, evidence, guidance
-            ),
-            repository=repository,
-            goal=request,
-            guidance=guidance,
-        )
-
-    def analyze_ci(
-        self,
-        repository: str,
-        request: str,
-        evidence: dict[str, Any],
-        *,
-        session_id: str,
-        guidance: AgentGuidance | None = None,
-    ) -> dict[str, Any]:
-        return self.harness.run(
-            "coding",
-            session_id=session_id,
-            operation=lambda context: self._analyze_ci(
-                context, request, evidence, guidance
-            ),
-            repository=repository,
-            goal=request,
-            guidance=guidance,
-        )
-
-    def create_candidate(
-        self,
-        request: ChangeRequest,
-        *,
-        session_id: str,
-        guidance: AgentGuidance | None = None,
-    ) -> CandidatePreparationResult:
-        def operation(context: AgentContext) -> CandidatePreparationResult:
-            try:
-                return self._create(context, request, guidance)
-            except _CodingCapabilityFailure as failure:
-                return CandidatePreparationResult(
-                    None, capability_error=failure.payload
+        context.origin_turn_seq = parent.origin_turn_seq
+        try:
+            if mode == "explain":
+                artifact: Any = self._explain(
+                    context, task, evidence, parent.guidance
                 )
-
-        return self.harness.run(
-            "coding",
-            session_id=session_id,
-            operation=operation,
-            repository=request.repository,
-            goal=request.description,
-            entity_type="issue" if request.issue_number is not None else None,
-            entity_id=str(request.issue_number)
-            if request.issue_number is not None
-            else None,
-            guidance=guidance,
-        )
-
-    def repair_candidate(
-        self,
-        request: ChangeRequest,
-        candidate: CandidatePatch,
-        errors: list[str],
-        *,
-        session_id: str,
-        guidance: AgentGuidance | None = None,
-    ) -> CandidatePreparationResult:
-        if not self.reasoner:
-            return CandidatePreparationResult(candidate)
-
-        def operation(context: AgentContext) -> CandidatePreparationResult:
-            try:
-                return self._repair(context, request, candidate, errors, guidance)
-            except _CodingCapabilityFailure as failure:
-                return CandidatePreparationResult(
-                    None, capability_error=failure.payload
+            elif mode == "review":
+                artifact = self._review(context, task, evidence, parent.guidance)
+            elif mode == "plan":
+                artifact = self._plan(context, task, evidence, parent.guidance)
+            elif mode == "review_dialogue":
+                artifact = self._summarize_review_dialogue(
+                    context, task, evidence, parent.guidance
                 )
+            elif mode == "ci":
+                artifact = self._analyze_ci(
+                    context, task, evidence, parent.guidance
+                )
+            elif mode == "patch":
+                if change_request is None or verifier is None:
+                    raise WorkflowError(
+                        "Coding patch call requires a ChangeRequest and StaticVerifier"
+                    )
+                artifact = self._prepare_verified_in_context(
+                    context,
+                    change_request,
+                    verifier,
+                    parent.guidance,
+                )
+            else:
+                raise ValidationError(f"unknown Coding Agent mode: {mode}")
+            final_text = self._child_final_text(context)
+            return AgentResult(call_id, "coding", "completed", final_text), artifact
+        except Exception as exc:  # noqa: BLE001 - child failure is structured for parent
+            return (
+                AgentResult(
+                    call_id,
+                    "coding",
+                    "failed",
+                    str(exc),
+                    {"type": type(exc).__name__, "message": str(exc)},
+                ),
+                None,
+            )
 
-        return self.harness.run(
-            "coding",
-            session_id=session_id,
-            operation=operation,
-            repository=request.repository,
-            goal=f"Repair candidate: {request.description}",
-            entity_type="issue" if request.issue_number is not None else None,
-            entity_id=str(request.issue_number)
-            if request.issue_number is not None
-            else None,
-            guidance=guidance,
-        )
+    def _prepare_verified_in_context(
+        self,
+        context: AgentContext,
+        request: ChangeRequest,
+        verifier: Any,
+        guidance: AgentGuidance | None,
+    ) -> CandidatePreparationResult:
+        try:
+            prepared = self._create(context, request, guidance)
+        except _CodingCapabilityFailure as failure:
+            return CandidatePreparationResult(None, capability_error=failure.payload)
+        if prepared.candidate is None:
+            return prepared
+        candidate = prepared.candidate
+        report = verifier.verify(candidate, session_id=context.session_id, attempts=1)
+        if not report.passed:
+            failures = [
+                check.details for check in report.checks if check.status == "FAIL"
+            ]
+            try:
+                repaired = self._repair(
+                    context, request, candidate, failures, guidance
+                )
+            except _CodingCapabilityFailure as failure:
+                return CandidatePreparationResult(None, capability_error=failure.payload)
+            if repaired.candidate is None:
+                return repaired
+            candidate = repaired.candidate
+            report = verifier.verify(
+                candidate, session_id=context.session_id, attempts=2
+            )
+        return CandidatePreparationResult(candidate, report)
+
+    def _child_final_text(
+        self,
+        context: AgentContext,
+    ) -> str:
+        if self.reasoner is None:
+            raise WorkflowError("Coding Agent calls require a configured reasoner")
+        response = context.reason(self.reasoner)
+        if response.call is not None:
+            raise WorkflowError(
+                "CodingAgent must finish with natural Text after its typed result"
+            )
+        return response.text
 
     def _explain(
         self,
@@ -619,22 +564,24 @@ class CodingAgent:
             if capability.access == AccessLevel.READ
             and capability.input_schema is not None
         }
-        previous_signature = ""
-        repeated = 0
+        final_tools = structured_tools(tool_name, schema, tools)
         for _ in range(max_steps):
-            value = context.reason_structured(
-                self.reasoner,
-                schema=schema,
-                tool_name=tool_name,
-                tools=tools,
-            )
-            context.record_model_response(value, tool_name=tool_name)
-            if value.get("kind") != "capability":
-                context.complete_control_call({"status": "accepted", "result": value})
-                return value
-            capability_id = self.harness.resolve_llm_name(
-                str(value.get("capability_id") or ""), context
-            )
+            response = context.reason(self.reasoner, tools=final_tools)
+            call = response.call
+            if call is None:
+                raise WorkflowError(
+                    f"CodingAgent must call {tool_name} or one read-only Capability"
+                )
+            if call.name == tool_name:
+                validate_schema(call.arguments, schema, label=f"{tool_name} result")
+                context.append_tool_result(
+                    {"status": "accepted"}, call_id=call.call_id
+                )
+                return dict(call.arguments)
+            resolved = self.harness.resolve_model_call(call, context)
+            if not hasattr(resolved, "capability_id"):
+                raise WorkflowError("CodingAgent may not delegate another Agent")
+            capability_id = resolved.capability_id
             if capability_id not in allowed:
                 context.append_tool_result(
                     {
@@ -642,34 +589,16 @@ class CodingAgent:
                         "capability_id": capability_id,
                         "error": "permission_denied",
                         "message": "Coding evidence gathering is read-only.",
-                    }
+                    },
+                    call_id=call.call_id,
                 )
-                continue
-            arguments = dict(value.get("arguments") or {})
-            signature = json.dumps(
-                [capability_id, arguments],
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            repeated = repeated + 1 if signature == previous_signature else 0
-            previous_signature = signature
-            if repeated:
-                context.append_tool_result(
-                    {
-                        "status": "failed",
-                        "capability_id": capability_id,
-                        "error": "duplicate_call",
-                        "message": "The identical read was just attempted; choose another action.",
-                    }
-                )
-                if repeated > 1:
-                    raise WorkflowError(
-                        "CodingAgent repeated an identical capability call"
-                    )
                 continue
             try:
-                self._invoke_capability(context, capability_id, **arguments)
+                self._invoke_capability(
+                    context,
+                    capability_id,
+                    **dict(resolved.arguments),
+                )
             except _CodingCapabilityFailure:
                 continue
         raise WorkflowError(f"CodingAgent exceeded the {max_steps}-step evidence limit")
@@ -879,10 +808,7 @@ class CodingAgent:
         if self.reasoner is None:
             raise WorkflowError("repository change planning requires a reasoner")
         mentioned = list(
-            dict.fromkeys(
-                [safe_repository_path(path) for path in request.target_files]
-                + _EXPLICIT_PATH.findall(request.description)
-            )
+            dict.fromkeys(safe_repository_path(path) for path in request.target_files)
         )
         value = self._complete_structured_task(
             context,
@@ -1005,7 +931,7 @@ class CodingAgent:
                 ensure_ascii=False,
             ),
             schema=_EVIDENCE_READY_SCHEMA,
-            tool_name="finish_repair_evidence",
+            tool_name="record_repair_evidence",
             max_steps=6,
         )
         evidence = self._capability_evidence(context)
@@ -1150,55 +1076,3 @@ class CodingAgent:
         return any(
             segment in {"test", "tests", "spec", "specs"} for segment in segments[:-1]
         ) or any(marker in segments[-1] for marker in ("_test.", ".test.", ".spec."))
-
-
-def record_candidate_capability_error(
-    context: AgentContext, prepared: CandidatePreparationResult
-) -> bool:
-    payload = prepared.capability_error
-    if payload is None:
-        return False
-    context.observations.append({"kind": "capability_error", "payload": dict(payload)})
-    return True
-
-
-def prepare_verified_candidate(
-    coding: CodingAgent,
-    verifier: Any,
-    request: ChangeRequest,
-    *,
-    session_id: str,
-    guidance: AgentGuidance | None = None,
-    max_repair_attempts: int = 1,
-) -> CandidatePreparationResult:
-    """Generate a candidate synchronously and gate it behind static verification.
-
-    Candidate preparation emits no GitHub mutation call unless every static
-    check passes. One repair attempt is allowed, matching the previous
-    workflow's ``MAX_REPAIR_ATTEMPTS``.
-    """
-    prepared = coding.create_candidate(
-        request, session_id=session_id, guidance=guidance
-    )
-    if prepared.candidate is None:
-        return prepared
-    candidate = prepared.candidate
-    for attempt in range(1, max_repair_attempts + 2):
-        report = verifier.verify(candidate, session_id=session_id, attempts=attempt)
-        if report.passed:
-            return CandidatePreparationResult(candidate, report)
-        if attempt <= max_repair_attempts:
-            failures = [
-                check.details for check in report.checks if check.status == "FAIL"
-            ]
-            prepared = coding.repair_candidate(
-                request,
-                candidate,
-                failures,
-                session_id=session_id,
-                guidance=guidance,
-            )
-            if prepared.candidate is None:
-                return prepared
-            candidate = prepared.candidate
-    return CandidatePreparationResult(candidate, report)

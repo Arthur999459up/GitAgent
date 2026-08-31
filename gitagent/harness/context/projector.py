@@ -46,7 +46,7 @@ def derive_main_messages(
             content = event.data.get("content")
             if isinstance(content, str):
                 messages.append(canonical_message({"role": "user", "content": content}))
-        elif event.type == "assistant_message":
+        elif event.type == "assistant_message" and not has_native_model_events:
             content = event.data.get("content")
             if isinstance(content, str):
                 messages.append(
@@ -69,7 +69,7 @@ def derive_main_messages(
                     event.data.get("content", ""),
                 )
             )
-    return _deduplicate_trace_pairs(messages)
+    return correlate_tool_results(_deduplicate_trace_pairs(messages))
 
 
 def derive_domain_messages(
@@ -160,7 +160,7 @@ def _event_tool_call(data: Mapping[str, Any]) -> dict[str, Any]:
     tool = str(data.get("tool") or "")
     name = (
         tool
-        if tool.startswith(("capability__", "delegate_"))
+        if tool.startswith(("capability__", "agent__"))
         else "capability__" + tool.replace(".", "__").replace("-", "_")
     )
     arguments = data.get("arguments", {})
@@ -193,4 +193,46 @@ def _deduplicate_trace_pairs(messages: list[dict[str, Any]]) -> list[dict[str, A
     return result
 
 
-__all__ = ["CHECKPOINT_PREFIX", "derive_domain_messages", "derive_main_messages"]
+def correlate_tool_results(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep delayed Agent results adjacent to their original provider calls."""
+
+    results = {
+        str(message.get("tool_call_id") or ""): message
+        for message in messages
+        if message.get("role") == "tool" and message.get("tool_call_id")
+    }
+    call_ids = {
+        str(call.get("id") or "")
+        for message in messages
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    }
+    matched = call_ids & results.keys()
+    if not matched:
+        return messages
+
+    ordered: list[dict[str, Any]] = []
+    for message in messages:
+        if (
+            message.get("role") == "tool"
+            and str(message.get("tool_call_id") or "") in matched
+        ):
+            continue
+        ordered.append(message)
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            call_id = str(call.get("id") or "")
+            if call_id in matched:
+                ordered.append(results[call_id])
+    return ordered
+
+
+__all__ = [
+    "CHECKPOINT_PREFIX",
+    "correlate_tool_results",
+    "derive_domain_messages",
+    "derive_main_messages",
+]

@@ -1,15 +1,15 @@
-"""Separate structured control output from free-form text generation."""
+"""Provider-neutral model responses and typed business-output helpers."""
 
 from __future__ import annotations
 
-import json
 from typing import Any, Protocol
 
+from gitagent.agent_loop.models import ModelResponse, StructuredCall
 from gitagent.capability import validate_schema
 from gitagent.domain.errors import StructuredOutputError, ValidationError
 from gitagent.prompts import get_prompt_library
 
-from .chat_client import ChatClient, ChatResponse
+from .chat_client import ChatClient
 
 _PROMPTS = get_prompt_library()
 
@@ -25,6 +25,14 @@ class StructuredValue(dict[str, Any]):
 
 
 class Reasoner(Protocol):
+    def complete_messages(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        context_window_tokens: int | None = None,
+    ) -> ModelResponse: ...
+
     def complete_structured_messages(
         self,
         *,
@@ -45,10 +53,43 @@ class Reasoner(Protocol):
 
 
 class LLMReasoner:
-    """Use structured function calls for control contracts and plain text for content."""
+    """Normalize native Text/structured calls and validate typed business outputs."""
 
     def __init__(self, client: ChatClient) -> None:
         self.client = client
+
+    def complete_messages(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        context_window_tokens: int | None = None,
+    ) -> ModelResponse:
+        response = self.client.chat(
+            messages=messages,
+            tools=tools,
+            context_window_tokens=context_window_tokens,
+        )
+        if len(response.tool_calls) > 1:
+            raise StructuredOutputError(
+                "model must call at most one function per agent step",
+                expected_tool_calls=1,
+                actual_tool_calls=len(response.tool_calls),
+            )
+        call = None
+        if response.tool_calls:
+            provider_call = response.tool_calls[0]
+            call = StructuredCall(
+                provider_call.id,
+                provider_call.name,
+                dict(provider_call.arguments),
+            )
+        text = response.content
+        if call is None and not text.strip():
+            raise StructuredOutputError(
+                "model returned neither Text nor a structured call"
+            )
+        return ModelResponse(text, call, response.message)
 
     def complete_structured_messages(
         self,
@@ -60,7 +101,7 @@ class LLMReasoner:
         context_window_tokens: int | None = None,
     ) -> dict[str, Any]:
         _validate_final_tools(final_tools, schema=schema, tool_name=tool_name)
-        response = self.client.chat(
+        response = self.complete_messages(
             messages=messages,
             tools=final_tools,
             context_window_tokens=context_window_tokens,
@@ -69,50 +110,31 @@ class LLMReasoner:
             response,
             schema=schema,
             tool_name=tool_name,
-            domain_tools_available=_has_domain_tools(final_tools, tool_name),
         )
 
     def _structured_value(
         self,
-        response: ChatResponse,
+        response: ModelResponse,
         *,
         schema: dict[str, Any] | None,
         tool_name: str,
-        domain_tools_available: bool,
     ) -> dict[str, Any]:
-        if len(response.tool_calls) > 1:
-            raise StructuredOutputError(
-                "model must call at most one tool per agent step",
-                expected_tool_calls=1,
-                actual_tool_calls=len(response.tool_calls),
-            )
-        if response.tool_calls:
-            call = response.tool_calls[0]
+        if response.call is not None:
+            call = response.call
             arguments = call.arguments
             if isinstance(arguments, dict):
                 if call.name == tool_name:
                     self._validate_structured(arguments, schema)
-                    return StructuredValue(arguments, response.message)
-                if not domain_tools_available:
-                    raise StructuredOutputError(
-                        f"model called {call.name or '<unnamed>'} instead of required function {tool_name}",
-                        expected_tool=tool_name,
-                        actual_tool=call.name or "<unnamed>",
-                    )
-                return StructuredValue(
-                    {
-                        "kind": "capability",
-                        "summary": f"Call {call.name}",
-                        "capability_id": call.name,
-                        "arguments": arguments,
-                    },
-                    response.message,
+                    return StructuredValue(arguments, response.assistant_message)
+                raise StructuredOutputError(
+                    f"model called {call.name or '<unnamed>'} instead of required function {tool_name}",
+                    expected_tool=tool_name,
+                    actual_tool=call.name or "<unnamed>",
                 )
-        value = _first_json_object(response.content)
-        if not isinstance(value, dict):
-            raise StructuredOutputError("structured reasoning output must be a JSON object")
-        self._validate_structured(value, schema)
-        return StructuredValue(value, response.message)
+        raise StructuredOutputError(
+            "model returned Text where a typed structured result was required",
+            expected_tool=tool_name,
+        )
 
     @staticmethod
     def _validate_structured(value: dict[str, Any], schema: dict[str, Any] | None) -> None:
@@ -136,19 +158,6 @@ class LLMReasoner:
             context_window_tokens=context_window_tokens,
         )
         return response.content.strip()
-
-
-def _first_json_object(content: str) -> Any:
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(content):
-        if character != "{":
-            continue
-        try:
-            value, _ = decoder.raw_decode(content[index:])
-        except json.JSONDecodeError:
-            continue
-        return value
-    raise StructuredOutputError("model did not return a valid JSON object")
 
 
 def _structured_tools(tool_name: str, schema: dict[str, Any]) -> list[dict[str, Any]]:
@@ -205,14 +214,3 @@ def _validate_final_tools(
         raise ValidationError(
             f"final_tools must contain the structured output function {tool_name}"
         )
-
-
-def _has_domain_tools(
-    final_tools: list[dict[str, Any]] | None, structured_tool_name: str
-) -> bool:
-    return any(
-        tool.get("type") == "function"
-        and isinstance(tool.get("function"), dict)
-        and tool["function"].get("name") != structured_tool_name
-        for tool in final_tools or ()
-    )

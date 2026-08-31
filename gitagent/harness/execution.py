@@ -7,12 +7,14 @@ from dataclasses import asdict
 from time import perf_counter
 from typing import Any, TypeVar
 
+from gitagent.agent_loop.models import AgentCall, CapabilityCall, StructuredCall
 from gitagent.capability import (
     AccessLevel,
     CapabilityLayer,
     CapabilityResult,
     InvocationContext,
 )
+from gitagent.capability.schema import validate_schema, validate_schema_definition
 from gitagent.domain.errors import ValidationError
 from gitagent.domain.models import AgentGuidance, AgentSpec, VerificationReport
 from gitagent.harness.context.state import AgentContext
@@ -218,6 +220,52 @@ class AgentHarness:
             and (not read_only or capability.access == AccessLevel.READ)
         ]
 
+    @staticmethod
+    def agent_tool(
+        agent_id: str,
+        description: str,
+        schema: dict[str, Any],
+    ) -> dict[str, Any]:
+        validate_schema_definition(schema, f"agent {agent_id} input schema")
+        if schema.get("type") != "object":
+            raise ValidationError(f"agent {agent_id} input schema must describe an object")
+        return {
+            "type": "function",
+            "function": {
+                "name": f"agent__{agent_id}",
+                "description": description,
+                "parameters": schema,
+            },
+        }
+
+    def resolve_model_call(
+        self,
+        call: StructuredCall,
+        context: AgentContext,
+        *,
+        agent_schemas: Mapping[str, dict[str, Any]] | None = None,
+    ) -> CapabilityCall | AgentCall:
+        if call.name.startswith("capability__"):
+            capability_id = self.resolve_llm_name(call.name, context)
+            if capability_id == call.name:
+                raise ValidationError(f"unknown Capability function: {call.name}")
+            return CapabilityCall(call.call_id, capability_id, dict(call.arguments))
+        if call.name.startswith("agent__"):
+            agent_id = call.name.removeprefix("agent__")
+            schemas = agent_schemas or {}
+            schema = schemas.get(agent_id)
+            if schema is None:
+                raise ValidationError(f"Agent call is not allowed here: {call.name}")
+            validate_schema(
+                call.arguments,
+                schema,
+                label=f"{call.name} arguments",
+            )
+            return AgentCall(call.call_id, agent_id, dict(call.arguments))
+        raise ValidationError(
+            "structured function name must use capability__ or agent__ namespace"
+        )
+
     def resolve_llm_name(self, name: str, context: AgentContext) -> str:
         for capability in self.discover(context):
             if self._function_name(capability.id) == name:
@@ -241,11 +289,7 @@ class AgentHarness:
             agent_id=context.agent,
             repository=context.repository,
             approval_id=approval_id,
-            delegation_depth=context.delegation_depth,
         )
-
-    def specs_for(self, route: Any) -> tuple[AgentSpec, ...]:
-        return tuple(spec for spec in self._specs.values() if route in spec.routes)
 
     def spec(self, agent_name: str) -> AgentSpec:
         try:

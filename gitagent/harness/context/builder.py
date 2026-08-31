@@ -85,6 +85,7 @@ class ContextBuilder:
         system: str,
         tools: list[dict[str, Any]] | None = None,
         turn_seq: int | None = None,
+        current_user_is_main: bool = True,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
         """Return the exact Main provider messages and tools for this turn."""
 
@@ -111,14 +112,34 @@ class ContextBuilder:
                 for event in events
                 if event.turn_seq is None or event.turn_seq > session.summary_through_seq
             )
+        current_user_event = next(
+            (
+                event
+                for event in reversed(projected_events)
+                if event.type == "user_message"
+                and (turn_seq is None or event.turn_seq == turn_seq)
+            ),
+            None,
+        )
+        if current_user_event is None or current_user_event.data.get("content") != user_input:
+            raise ContextBuildError("durable history is missing the current user message")
+        event_is_main = current_user_event.agent in {None, "main"}
+        if event_is_main != current_user_is_main:
+            raise ContextBuildError("current user message has the wrong Agent owner")
+
         history = derive_main_messages(
             projected_events,
             legacy_checkpoint=legacy_checkpoint,
         )
-        if not history or history[-1].get("role") != "user":
-            raise ContextBuildError("durable Main history is missing the current user message")
-        if history[-1].get("content") != user_input:
-            raise ContextBuildError("current user message differs from durable Main history")
+        if current_user_is_main:
+            if not history or history[-1].get("role") != "user":
+                raise ContextBuildError(
+                    "durable Main history is missing the current user message"
+                )
+            if history[-1].get("content") != user_input:
+                raise ContextBuildError(
+                    "current user message differs from durable Main history"
+                )
         messages = [canonical_message({"role": "system", "content": system}), *history]
         fitted, level, stages, plan = fit_messages_with_plan(
             messages,
@@ -440,7 +461,7 @@ def _atomic_spans(messages: Sequence[Mapping[str, Any]]) -> list[tuple[int, int]
             not pending
             and end < len(messages)
             and any(
-                name.startswith("delegate_") or name == "route_session_turn"
+                name.startswith("agent__")
                 for name in names
             )
             and messages[end].get("role") == "assistant"

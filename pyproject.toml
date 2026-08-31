@@ -12,6 +12,7 @@ dependencies = [
     "prompt-toolkit>=3.0,<4",
     "rich>=13,<16",
     "PyYAML>=6,<7",
+    "jsonschema>=4.23,<5",
     "langchain-text-splitters>=1,<2",
     "qdrant-client[fastembed]>=1.12,<2",
     "sentence-transformers>=5,<6",
