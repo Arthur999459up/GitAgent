@@ -23,6 +23,7 @@ from gitagent.harness.context.messages import (
     tool_result_message,
 )
 from gitagent.harness.file_reads import FileReadLedger
+from gitagent.model import structured_tools
 from gitagent.prompts import get_prompt_library
 
 if TYPE_CHECKING:
@@ -105,8 +106,8 @@ class AgentContext:
         return self.pending is not None or bool(self.question)
 
     @property
-    def context_budget(self) -> int:
-        return self._harness.context_budget
+    def context_window_tokens(self) -> int:
+        return self._harness.context_window_for(self.agent)
 
     def invoke(
         self, capability_id: str, *, approval_id: str | None = None, **arguments: Any
@@ -246,7 +247,7 @@ class AgentContext:
         fitted, _, _, plan = fit_messages_with_plan(
             request,
             tools,
-            effective_input_budget=self.context_budget,
+            context_window_tokens=self.context_window_tokens,
         )
         if plan.changed:
             sink = self._harness.compaction_sink
@@ -266,25 +267,17 @@ class AgentContext:
         tool_name: str = "respond",
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Run structured inference and persist retry messages added by the Reasoner."""
+        """Run inference with one final tool payload used for fitting and transport."""
 
-        request = self.model_messages(tools)
-        before = len(request)
-        try:
-            return reasoner.complete_structured_messages(
-                messages=request,
-                schema=schema,
-                tool_name=tool_name,
-                tools=tools,
-            )
-        finally:
-            self._persist_external_messages(request, before)
-
-    def _persist_external_messages(
-        self, request: list[dict[str, Any]], start: int
-    ) -> None:
-        for message in request[start:]:
-            self.append_message(message)
+        final_tools = structured_tools(tool_name, schema, tools)
+        request = self.model_messages(final_tools)
+        return reasoner.complete_structured_messages(
+            messages=request,
+            schema=schema,
+            tool_name=tool_name,
+            final_tools=final_tools,
+            context_window_tokens=self.context_window_tokens,
+        )
 
     def record_model_response(
         self,
@@ -377,7 +370,8 @@ class AgentContext:
         self.start_message_thread()
         self.append_message({"role": "user", "content": prompt})
         content = reasoner.complete_text_messages(
-            messages=self.model_messages()
+            messages=self.model_messages(),
+            context_window_tokens=self.context_window_tokens,
         ).strip()
         self.append_message({"role": "assistant", "content": content})
         return content

@@ -21,6 +21,6 @@ Keys are derived from paths relative to `prompts/`, without `.md`, replacing `/`
 
 Capability IDs, descriptions, schemas, access levels, discovery, and invocation permissions do not live in these prompts. Agents receive only the Capability Layer definitions discoverable under their current policy; pure-LLM calls receive only the evidence supplied by the runtime.
 
-`GITAGENT_PROMPTS_DIR` may replace the prompt root when set before process startup. The override is captured before dotenv loading so a repository-controlled `.env` cannot redirect prompt loading.
+The prompt root is fixed to this package directory so startup configuration cannot redirect trusted prompt loading.
 
 Structured validation schemas remain in code because they are machine contracts rather than behavioral wording.

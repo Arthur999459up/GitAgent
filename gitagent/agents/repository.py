@@ -20,11 +20,12 @@ from gitagent.domain.models import (
 from gitagent.harness.context import (
     capability_attempted,
     capability_failure_observed,
+    fit_messages,
 )
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
 from gitagent.harness.validation.static import StaticVerifier
-from gitagent.model import Reasoner
+from gitagent.model import Reasoner, structured_tools
 from gitagent.prompts import get_prompt_library
 
 from .coding import (
@@ -131,22 +132,33 @@ class RepositoryAgent:
             raise ValidationError("repository request cannot be empty")
         if self.reasoner is None:
             return self._fallback_operation(text)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Classify one repository request into exactly one operation. "
+                    "EXPLORE browses structure; SEARCH locates code; EXPLAIN explains behavior/call chains; "
+                    "IMPACT_ANALYZE evaluates change impact; PLAN proposes an implementation plan without writing; "
+                    "HISTORY inspects file history; MODIFY requests an arbitrary direct repository code change. "
+                    "Issue-scoped and Pull-Request-scoped work must already have been routed elsewhere."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+        final_tools = structured_tools(
+            "select_repository_operation", _OPERATION_SCHEMA
+        )
+        messages, _, _ = fit_messages(
+            messages,
+            final_tools,
+            context_window_tokens=self.harness.context_window_for("repository"),
+        )
         raw = self.reasoner.complete_structured_messages(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Classify one repository request into exactly one operation. "
-                        "EXPLORE browses structure; SEARCH locates code; EXPLAIN explains behavior/call chains; "
-                        "IMPACT_ANALYZE evaluates change impact; PLAN proposes an implementation plan without writing; "
-                        "HISTORY inspects file history; MODIFY requests an arbitrary direct repository code change. "
-                        "Issue-scoped and Pull-Request-scoped work must already have been routed elsewhere."
-                    ),
-                },
-                {"role": "user", "content": text},
-            ],
+            messages=messages,
             schema=_OPERATION_SCHEMA,
             tool_name="select_repository_operation",
+            final_tools=final_tools,
+            context_window_tokens=self.harness.context_window_for("repository"),
         )
         try:
             return RepositoryOperation(str(raw.get("operation") or ""))

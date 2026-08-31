@@ -1047,7 +1047,7 @@ class GitHubClient:
     def _require_token(self) -> None:
         if not self.token:
             raise GitHubAPIError(
-                "GitHub write requires GITHUB_TOKEN or GH_TOKEN",
+                "GitHub write requires github_token in config.json",
                 status_code=401,
                 request_sent=False,
             )

@@ -5,7 +5,6 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from gitagent.domain.errors import StateError, ValidationError
@@ -36,7 +35,7 @@ from gitagent.model import ChatClient, LiteLLMChatClient, LLMReasoner, OpenAICha
 from gitagent.prompts import get_prompt_library
 
 from .capabilities import build_capability_layer
-from .config import CLIConfig
+from .config import RuntimeConfig
 from .projection import project_output, project_service_result
 from .service import GitAgentService
 
@@ -54,7 +53,7 @@ class IndexedMemory:
 
 @dataclass
 class LiveApplication:
-    config: CLIConfig
+    config: RuntimeConfig
     github: GitHubClient
     llm: ChatClient
     reasoner: LLMReasoner
@@ -428,6 +427,10 @@ class LiveApplication:
                 self.github,
                 trace=self.trace,
                 reasoner=self.reasoner,
+                coding_context_window_tokens=self.config.context_window_for("coding"),
+                context7_api_key=self.config.context7_api_key,
+                blocked_paths=(self.config.source_path,),
+                secret_values=self.config.secret_values,
                 memory_roots=self.memory.roots(scope.account_key, scope.repository_key)
                 if scope
                 else None,
@@ -440,7 +443,7 @@ class LiveApplication:
             memory_hooks=self.memory_hooks,
             trace=self.trace,
             session_scope=scope,
-            input_budget_tokens=self.config.effective_input_budget,
+            context_window_tokens=self.config.context_window_tokens,
         )
 
     def _swap_service(self, service: GitAgentService) -> None:
@@ -494,24 +497,15 @@ class LiveApplication:
             pass
 
 
-def build_live_application(config: CLIConfig) -> LiveApplication:
+def build_live_application(config: RuntimeConfig) -> LiveApplication:
     config.validate()
     if not config.api_key:
-        raise ValidationError(
-            "未找到模型 API Key；请设置 OPENAI_API_KEY 或 GITAGENT_API_KEY"
-        )
-    if config.provider not in {"openai", "litellm"}:
-        raise ValidationError("GITAGENT_PROVIDER 必须是 openai 或 litellm")
+        raise ValidationError("config.json 中的 api_key 不能为空")
+    if not config.github_token:
+        raise ValidationError("config.json 中的 github_token 不能为空")
 
     library = get_prompt_library()
     library.validate()
-    if (
-        config.prompts_dir is not None
-        and Path(config.prompts_dir).resolve() != library.root
-    ):
-        raise ValidationError(
-            f"GITAGENT_PROMPTS_DIR 指向 {config.prompts_dir!r}，但提示词库加载自 {library.root}"
-        )
 
     client_class = (
         LiteLLMChatClient if config.provider == "litellm" else OpenAIChatClient
@@ -521,17 +515,19 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         api_key=config.api_key,
         base_url=config.base_url,
         temperature=config.temperature,
-        max_tokens=config.max_tokens,
-        timeout=config.effective_llm_timeout,
+        max_output_tokens=config.max_output_tokens,
+        context_window_tokens=config.context_window_for("default"),
+        timeout=config.llm_timeout,
     )
     reasoner = LLMReasoner(llm)
     github = GitHubClient(
         token=config.github_token,
         api_url=config.github_api_url,
-        timeout=config.effective_github_timeout,
+        timeout=config.github_timeout,
     )
     store = StateStore(
-        config.state_path, secret_values=(config.github_token, config.api_key)
+        config.state_path,
+        secret_values=config.secret_values,
     )
     event_log = SessionEventLog(config.event_path, redactor=store.redact)
     sessions = SessionManager(store, event_log)
@@ -548,11 +544,14 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         ),
     )
     memory_search = MemorySearch(memory)
-    extractor = MemoryExtractor(reasoner, memory)
+    extractor = MemoryExtractor(
+        reasoner,
+        memory,
+        context_window_tokens=config.context_window_for("default"),
+    )
     extraction_contexts = MemoryExtractionContextBuilder(
         sessions,
         memory,
-        input_budget_tokens=config.effective_input_budget,
     )
     dream = AutoDream(sessions, memory)
     memory_hooks = MemoryStopHooks(
@@ -565,13 +564,17 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
     )
     context_builder = ContextBuilder(
         sessions,
-        context_window_tokens=config.context_window_tokens,
-        max_output_tokens=config.max_tokens,
-        safety_tokens=config.context_safety_tokens,
+        context_window_tokens=config.context_window_for("main"),
     )
     stateless_service = GitAgentService(
         build_capability_layer(
-            github, trace=trace, reasoner=reasoner
+            github,
+            trace=trace,
+            reasoner=reasoner,
+            coding_context_window_tokens=config.context_window_for("coding"),
+            context7_api_key=config.context7_api_key,
+            blocked_paths=(config.source_path,),
+            secret_values=config.secret_values,
         ),
         main_reasoner=reasoner,
         agent_reasoner=reasoner,
@@ -580,7 +583,7 @@ def build_live_application(config: CLIConfig) -> LiveApplication:
         memory_search=memory_search,
         memory_hooks=memory_hooks,
         trace=trace,
-        input_budget_tokens=config.effective_input_budget,
+        context_window_tokens=config.context_window_tokens,
     )
     return LiveApplication(
         config=config,

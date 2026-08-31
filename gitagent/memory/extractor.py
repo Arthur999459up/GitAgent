@@ -6,11 +6,11 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from gitagent.domain.errors import ValidationError
+from gitagent.domain.errors import ContextWindowExceeded, ValidationError
 from gitagent.domain.models import SessionScope
-from gitagent.harness.context import estimate_tokens
+from gitagent.harness.context import fit_messages
 from gitagent.infra.persistence import SessionManager
-from gitagent.model import Reasoner
+from gitagent.model import Reasoner, structured_tools
 from gitagent.prompts import get_prompt_library
 
 from .models import MemoryCandidate
@@ -99,14 +99,10 @@ class MemoryExtractionContextBuilder:
         sessions: SessionManager,
         memory: MemoryPageStore,
         *,
-        input_budget_tokens: int,
         max_context_turns: int = 20,
     ) -> None:
-        if not isinstance(input_budget_tokens, int) or isinstance(input_budget_tokens, bool) or input_budget_tokens < 4096:
-            raise ValueError("Memory extraction input budget must be at least 4096 tokens")
         self.sessions = sessions
         self.memory = memory
-        self.input_budget_tokens = input_budget_tokens
         self.max_context_turns = max_context_turns
 
     def build(
@@ -159,7 +155,7 @@ class MemoryExtractionContextBuilder:
         )
         context_slots = max(0, self.max_context_turns - len(evidence))
         units = (*context_only[-context_slots:], *evidence) if context_slots else evidence
-        context = MemoryExtractionContext(
+        return MemoryExtractionContext(
             scope=scope,
             repository_full_name=repository_full_name,
             extracted_through_seq=extracted_through_seq,
@@ -167,23 +163,6 @@ class MemoryExtractionContextBuilder:
             conversation_units=units,
             memory_index=self.memory.read_index(scope.account_key, scope.repository_key),
         )
-        while (
-            _context_tokens(context) > self.input_budget_tokens
-            and units
-            and not bool(units[0]["evidence"])
-        ):
-            units = units[1:]
-            context = MemoryExtractionContext(
-                scope,
-                repository_full_name,
-                extracted_through_seq,
-                target_through_seq,
-                units,
-                context.memory_index,
-            )
-        if _context_tokens(context) > self.input_budget_tokens:
-            raise ValidationError("Memory extraction context exceeds its isolated input budget")
-        return context
 
 
 class MemoryExtractor:
@@ -191,20 +170,31 @@ class MemoryExtractor:
 
     max_turns = MAX_EXTRACTOR_TURNS
 
-    def __init__(self, reasoner: Reasoner, memory: MemoryPageStore) -> None:
+    def __init__(
+        self,
+        reasoner: Reasoner,
+        memory: MemoryPageStore,
+        *,
+        context_window_tokens: int,
+    ) -> None:
         self.reasoner = reasoner
         self.memory = memory
+        self.context_window_tokens = context_window_tokens
 
     def extract(self, context: MemoryExtractionContext) -> MemoryExtractionResult:
-        payload = {
-            "repository": context.repository_full_name,
-            "extracted_through_seq": context.extracted_through_seq,
-            "target_through_seq": context.target_through_seq,
-            "conversation": list(context.conversation_units),
-            "memory_index": context.memory_index,
-        }
-        raw = self.reasoner.complete_structured_messages(
-            messages=[
+        final_tools = structured_tools(
+            "extract_persistent_memories", _CANDIDATE_SCHEMA
+        )
+        units = context.conversation_units
+        while True:
+            payload = {
+                "repository": context.repository_full_name,
+                "extracted_through_seq": context.extracted_through_seq,
+                "target_through_seq": context.target_through_seq,
+                "conversation": list(units),
+                "memory_index": context.memory_index,
+            }
+            messages = [
                 {"role": "system", "content": _PROMPTS.text("system.memory_extractor")},
                 {
                     "role": "user",
@@ -213,10 +203,32 @@ class MemoryExtractor:
                         payload=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
                     ),
                 },
-            ],
+            ]
+            try:
+                messages, _, _ = fit_messages(
+                    messages,
+                    final_tools,
+                    context_window_tokens=self.context_window_tokens,
+                )
+                break
+            except ContextWindowExceeded:
+                removable = next(
+                    (
+                        index
+                        for index, unit in enumerate(units)
+                        if not bool(unit["evidence"])
+                    ),
+                    None,
+                )
+                if removable is None:
+                    raise
+                units = units[:removable] + units[removable + 1 :]
+        raw = self.reasoner.complete_structured_messages(
+            messages=messages,
             schema=_CANDIDATE_SCHEMA,
             tool_name="extract_persistent_memories",
-            tools=None,
+            final_tools=final_tools,
+            context_window_tokens=self.context_window_tokens,
         )
         candidates = _candidates(raw)
         tools = MemoryTools(
@@ -283,10 +295,6 @@ def _bounded(value: Any, limit: int) -> str:
         return text
     half = max(1, (limit - 20) // 2)
     return text[:half] + " … content omitted … " + text[-half:]
-
-
-def _context_tokens(context: MemoryExtractionContext) -> int:
-    return estimate_tokens(json.dumps(context, default=lambda value: value.__dict__, ensure_ascii=False))
 
 
 __all__ = [

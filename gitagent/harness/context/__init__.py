@@ -1,15 +1,15 @@
 """Session context selection and deterministic compaction."""
 
+from gitagent.token_accounting import estimate_tokens
+
 from .budget import (
     EMERGENCY_THRESHOLD,
     LIGHT_THRESHOLD,
     SUMMARY_THRESHOLD,
     context_pressure,
-    estimate_tokens,
 )
 from .builder import (
     CompactResult,
-    ContextBudgetExceeded,
     ContextBuilder,
     ContextBuildError,
     MessageCompactionPlan,
@@ -34,7 +34,6 @@ __all__ = [
     "LIGHT_THRESHOLD",
     "SUMMARY_THRESHOLD",
     "CompactResult",
-    "ContextBudgetExceeded",
     "ContextBuildError",
     "ContextBuilder",
     "MessageCompactionPlan",

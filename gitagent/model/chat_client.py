@@ -12,10 +12,12 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from gitagent.domain.errors import (
+    ContextWindowExceeded,
     LLMProviderError,
     StructuredOutputError,
     ValidationError,
 )
+from gitagent.token_accounting import request_tokens
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,8 @@ class ChatClient(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_token: Any | None = None,
+        *,
+        context_window_tokens: int | None = None,
     ) -> ChatResponse: ...
 
 
@@ -82,7 +86,8 @@ class OpenAIChatClient:
         base_url: str | None = None,
         *,
         temperature: float = 0.0,
-        max_tokens: int = 16_384,
+        max_output_tokens: int = 16_384,
+        context_window_tokens: int = 32_768,
         timeout: float = 30.0,
         client: Any | None = None,
     ) -> None:
@@ -98,7 +103,12 @@ class OpenAIChatClient:
         self.base_url = base_url
         self.client = client
         self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.max_output_tokens = _positive_integer(
+            max_output_tokens, "max_output_tokens"
+        )
+        self.context_window_tokens = _positive_integer(
+            context_window_tokens, "context_window_tokens"
+        )
         self.timeout = timeout
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -113,17 +123,31 @@ class OpenAIChatClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_token: Any | None = None,
+        *,
+        context_window_tokens: int | None = None,
     ) -> ChatResponse:
+        outbound_messages = _outbound_messages(
+            messages,
+            preserve_reasoning_content=_requires_reasoning_content(
+                self.model, self.base_url
+            ),
+        )
+        actual_max_output_tokens = _actual_max_output_tokens(
+            outbound_messages,
+            tools,
+            context_window_tokens=(
+                self.context_window_tokens
+                if context_window_tokens is None
+                else context_window_tokens
+            ),
+            configured_max_output_tokens=self.max_output_tokens,
+        )
         params: dict[str, Any] = {
             "model": self.model,
-            "messages": _outbound_messages(
-                messages,
-                preserve_reasoning_content=_requires_reasoning_content(
-                    self.model, self.base_url
-                ),
-            ),
+            "messages": outbound_messages,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": actual_max_output_tokens,
+            "parallel_tool_calls": False,
         }
         if tools:
             params["tools"] = tools
@@ -162,7 +186,8 @@ class LiteLLMChatClient:
         base_url: str | None = None,
         *,
         temperature: float = 0.0,
-        max_tokens: int = 16_384,
+        max_output_tokens: int = 16_384,
+        context_window_tokens: int = 32_768,
         timeout: float = 30.0,
     ) -> None:
         if not api_key:
@@ -171,7 +196,12 @@ class LiteLLMChatClient:
         self.api_key = api_key
         self.base_url = base_url
         self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.max_output_tokens = _positive_integer(
+            max_output_tokens, "max_output_tokens"
+        )
+        self.context_window_tokens = _positive_integer(
+            context_window_tokens, "context_window_tokens"
+        )
         self.timeout = timeout
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -185,25 +215,39 @@ class LiteLLMChatClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_token: Any | None = None,
+        *,
+        context_window_tokens: int | None = None,
     ) -> ChatResponse:
         try:
             import litellm
         except ImportError as exc:
             raise ValidationError('LiteLLM 后端未安装，请执行 pip install -e ".[litellm]"') from exc
 
+        outbound_messages = _outbound_messages(
+            messages,
+            preserve_reasoning_content=_requires_reasoning_content(
+                self.model, self.base_url
+            ),
+        )
+        actual_max_output_tokens = _actual_max_output_tokens(
+            outbound_messages,
+            tools,
+            context_window_tokens=(
+                self.context_window_tokens
+                if context_window_tokens is None
+                else context_window_tokens
+            ),
+            configured_max_output_tokens=self.max_output_tokens,
+        )
         params: dict[str, Any] = {
             "model": self.model,
-            "messages": _outbound_messages(
-                messages,
-                preserve_reasoning_content=_requires_reasoning_content(
-                    self.model, self.base_url
-                ),
-            ),
+            "messages": outbound_messages,
             "api_key": self.api_key,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": actual_max_output_tokens,
             "timeout": self.timeout,
             "drop_params": True,
+            "parallel_tool_calls": False,
         }
         if self.base_url:
             params["api_base"] = self.base_url
@@ -232,6 +276,33 @@ class LiteLLMChatClient:
             completion_tokens,
             reasoning_content,
         )
+
+
+def _actual_max_output_tokens(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    *,
+    context_window_tokens: int,
+    configured_max_output_tokens: int,
+) -> int:
+    """Size output from the exact model-visible payload sent to the provider."""
+
+    window = _positive_integer(context_window_tokens, "context_window_tokens")
+    input_tokens = request_tokens(messages, tools)
+    remaining = window - input_tokens
+    if remaining < 1:
+        raise ContextWindowExceeded(
+            context_window_tokens=window,
+            input_tokens=input_tokens,
+            requested_output_tokens=configured_max_output_tokens,
+        )
+    return min(configured_max_output_tokens, remaining)
+
+
+def _positive_integer(value: int, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValidationError(f"{name} must be a positive integer")
+    return value
 
 
 def _requires_reasoning_content(model: str, base_url: str | None) -> bool:

@@ -7,8 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from gitagent.domain.errors import ValidationError
-
-from .budget import estimate_tokens
+from gitagent.token_accounting import request_tokens
 
 
 def canonical_message(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -105,16 +104,6 @@ def tool_result_message(call_id: str, content: Any) -> dict[str, Any]:
                 content, ensure_ascii=False, separators=(",", ":"), default=str
             ),
         }
-    )
-
-
-def request_tokens(
-    messages: Sequence[Mapping[str, Any]],
-    tools: Sequence[Mapping[str, Any]] | None = None,
-) -> int:
-    payload = {"messages": list(messages), "tools": list(tools or ())}
-    return estimate_tokens(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
     )
 
 

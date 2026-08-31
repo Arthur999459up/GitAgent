@@ -1,6 +1,6 @@
 """GitAgent public API."""
 
-from gitagent.application import CLIConfig, GitAgentService
+from gitagent.application import GitAgentService, RuntimeConfig
 from gitagent.capability import (
     AccessLevel,
     Capability,
@@ -58,7 +58,6 @@ __all__ = [
     "ApprovalIntent",
     "ApprovalRequest",
     "ApprovalStore",
-    "CLIConfig",
     "CandidatePatch",
     "Capability",
     "CapabilityError",
@@ -91,6 +90,7 @@ __all__ = [
     "PullRequestSummary",
     "Replacement",
     "Route",
+    "RuntimeConfig",
     "SessionEvent",
     "TraceBus",
     "TraceCategory",

@@ -31,7 +31,8 @@ class Reasoner(Protocol):
         messages: list[dict[str, Any]],
         schema: dict[str, Any] | None = None,
         tool_name: str = "respond",
-        tools: list[dict[str, Any]] | None = None,
+        final_tools: list[dict[str, Any]] | None = None,
+        context_window_tokens: int | None = None,
     ) -> dict[str, Any]: ...
 
     def complete_text_messages(
@@ -39,7 +40,9 @@ class Reasoner(Protocol):
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        context_window_tokens: int | None = None,
     ) -> str: ...
+
 
 class LLMReasoner:
     """Use structured function calls for control contracts and plain text for content."""
@@ -53,60 +56,21 @@ class LLMReasoner:
         messages: list[dict[str, Any]],
         schema: dict[str, Any] | None = None,
         tool_name: str = "respond",
-        tools: list[dict[str, Any]] | None = None,
+        final_tools: list[dict[str, Any]] | None = None,
+        context_window_tokens: int | None = None,
     ) -> dict[str, Any]:
-        available_tools = structured_tools(tool_name, schema, tools)
-        response: ChatResponse | None = None
-        try:
-            response = self.client.chat(
-                messages=messages,
-                tools=available_tools or None,
-            )
-            return self._structured_value(
-                response,
-                schema=schema,
-                tool_name=tool_name,
-                domain_tools_available=bool(tools),
-            )
-        except StructuredOutputError as first_error:
-            if schema is None:
-                raise
-            # An invalid tool-call message cannot be followed by a user correction
-            # until every call has a matching tool result. Keep rejected tool calls
-            # out of the canonical thread and retry from the last valid message.
-            if response is not None and not response.tool_calls:
-                messages.append(response.message)
-            if tools:
-                correction = (
-                    "The previous response could not be parsed or did not satisfy the required "
-                    f"structured-output contract ({first_error}). Correct only the output format now: "
-                    "call exactly one available tool. For a capability action, call that capability tool "
-                    f"directly; otherwise call {tool_name} exactly once with all required arguments. "
-                    "Do not explain the correction or use Markdown."
-                )
-            else:
-                correction = (
-                    "The previous response could not be parsed or did not satisfy the required "
-                    f"structured-output contract ({first_error}). Correct only the output format now: "
-                    f"call {tool_name} exactly once with all required arguments. Do not explain the "
-                    "correction or use Markdown."
-                )
-            messages.append({"role": "user", "content": correction})
-            try:
-                retry = self.client.chat(
-                    messages=messages,
-                    tools=available_tools or None,
-                )
-                return self._structured_value(
-                    retry,
-                    schema=schema,
-                    tool_name=tool_name,
-                    domain_tools_available=bool(tools),
-                )
-            except StructuredOutputError as retry_error:
-                raise StructuredOutputError(
-                    f"{retry_error} (after one structured-output format retry)"
-                ) from retry_error
+        _validate_final_tools(final_tools, schema=schema, tool_name=tool_name)
+        response = self.client.chat(
+            messages=messages,
+            tools=final_tools,
+            context_window_tokens=context_window_tokens,
+        )
+        return self._structured_value(
+            response,
+            schema=schema,
+            tool_name=tool_name,
+            domain_tools_available=_has_domain_tools(final_tools, tool_name),
+        )
 
     def _structured_value(
         self,
@@ -118,7 +82,9 @@ class LLMReasoner:
     ) -> dict[str, Any]:
         if len(response.tool_calls) > 1:
             raise StructuredOutputError(
-                "model must call at most one tool per agent step"
+                "model must call at most one tool per agent step",
+                expected_tool_calls=1,
+                actual_tool_calls=len(response.tool_calls),
             )
         if response.tool_calls:
             call = response.tool_calls[0]
@@ -129,7 +95,9 @@ class LLMReasoner:
                     return StructuredValue(arguments, response.message)
                 if not domain_tools_available:
                     raise StructuredOutputError(
-                        f"model called {call.name or '<unnamed>'} instead of required function {tool_name}"
+                        f"model called {call.name or '<unnamed>'} instead of required function {tool_name}",
+                        expected_tool=tool_name,
+                        actual_tool=call.name or "<unnamed>",
                     )
                 return StructuredValue(
                     {
@@ -160,9 +128,15 @@ class LLMReasoner:
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        context_window_tokens: int | None = None,
     ) -> str:
-        response = self.client.chat(messages=messages, tools=tools)
+        response = self.client.chat(
+            messages=messages,
+            tools=tools,
+            context_window_tokens=context_window_tokens,
+        )
         return response.content.strip()
+
 
 def _first_json_object(content: str) -> Any:
     decoder = json.JSONDecoder()
@@ -199,12 +173,46 @@ def structured_tools(
 ) -> list[dict[str, Any]] | None:
     """Return one deduplicated provider tool list for token accounting and calls."""
 
-    result = list(tools or ())
-    if schema is not None and not any(
+    result = [
+        tool
+        for tool in tools or ()
+        if not (
+            tool.get("type") == "function"
+            and isinstance(tool.get("function"), dict)
+            and tool["function"].get("name") == tool_name
+        )
+    ]
+    if schema is not None:
+        result = [*_structured_tools(tool_name, schema), *result]
+    return result or None
+
+
+def _validate_final_tools(
+    final_tools: list[dict[str, Any]] | None,
+    *,
+    schema: dict[str, Any] | None,
+    tool_name: str,
+) -> None:
+    if schema is None:
+        return
+    if not any(
         tool.get("type") == "function"
         and isinstance(tool.get("function"), dict)
         and tool["function"].get("name") == tool_name
-        for tool in result
+        and tool["function"].get("parameters") == schema
+        for tool in final_tools or ()
     ):
-        result = [*_structured_tools(tool_name, schema), *result]
-    return result or None
+        raise ValidationError(
+            f"final_tools must contain the structured output function {tool_name}"
+        )
+
+
+def _has_domain_tools(
+    final_tools: list[dict[str, Any]] | None, structured_tool_name: str
+) -> bool:
+    return any(
+        tool.get("type") == "function"
+        and isinstance(tool.get("function"), dict)
+        and tool["function"].get("name") != structured_tool_name
+        for tool in final_tools or ()
+    )

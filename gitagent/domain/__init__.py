@@ -2,6 +2,7 @@
 
 from .errors import (
     ApprovalRequired,
+    ContextWindowExceeded,
     ExternalExecutionError,
     GitAgentError,
     PermissionDenied,
@@ -13,6 +14,7 @@ from .errors import (
 
 __all__ = [
     "ApprovalRequired",
+    "ContextWindowExceeded",
     "ExternalExecutionError",
     "GitAgentError",
     "PermissionDenied",

@@ -11,7 +11,6 @@ dependencies = [
     "openai>=1.0,<3",
     "prompt-toolkit>=3.0,<4",
     "rich>=13,<16",
-    "python-dotenv>=1.0,<2",
     "PyYAML>=6,<7",
     "langchain-text-splitters>=1,<2",
     "qdrant-client[fastembed]>=1.12,<2",

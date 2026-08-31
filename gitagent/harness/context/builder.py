@@ -6,29 +6,23 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from gitagent.domain.errors import ContextWindowExceeded
 from gitagent.domain.models import SessionScope
 from gitagent.infra.persistence import SessionManager
+from gitagent.token_accounting import estimate_tokens
 
 from .budget import (
     EMERGENCY_THRESHOLD,
     LIGHT_THRESHOLD,
     SUMMARY_THRESHOLD,
     context_pressure,
-    estimate_tokens,
 )
 from .messages import canonical_message, request_tokens
 from .projector import CHECKPOINT_PREFIX, derive_main_messages
 
-RETRY_RESERVE_TOKENS = 512
-MINIMUM_EFFECTIVE_INPUT_BUDGET = 4096
-
 
 class ContextBuildError(RuntimeError):
     """Base error for missing state or an invalid context-building operation."""
-
-
-class ContextBudgetExceeded(ContextBuildError):
-    """The non-removable provider input does not fit the trusted budget."""
 
 
 @dataclass(frozen=True)
@@ -74,32 +68,11 @@ class ContextBuilder:
         session_manager: SessionManager,
         *,
         context_window_tokens: int = 32768,
-        max_output_tokens: int = 16_384,
-        safety_tokens: int = 2048,
-        retry_reserve_tokens: int = RETRY_RESERVE_TOKENS,
     ) -> None:
         self.session_manager = session_manager
         self.context_window_tokens = _integer(
             context_window_tokens, "context_window_tokens", positive=True
         )
-        self.max_output_tokens = _integer(
-            max_output_tokens, "max_output_tokens", positive=True
-        )
-        self.safety_tokens = _integer(safety_tokens, "safety_tokens")
-        self.retry_reserve_tokens = _integer(
-            retry_reserve_tokens, "retry_reserve_tokens"
-        )
-        self.effective_input_budget = (
-            self.context_window_tokens
-            - self.max_output_tokens
-            - self.safety_tokens
-            - self.retry_reserve_tokens
-        )
-        if self.effective_input_budget < MINIMUM_EFFECTIVE_INPUT_BUDGET:
-            raise ValueError(
-                "effective input budget must be at least 4096 tokens "
-                "(context window - output - safety - retry reserve)"
-            )
         self.last_compression_level = "none"
         self.last_stages: tuple[dict[str, Any], ...] = ()
 
@@ -150,7 +123,7 @@ class ContextBuilder:
         fitted, level, stages, plan = fit_messages_with_plan(
             messages,
             tools,
-            effective_input_budget=self.effective_input_budget,
+            context_window_tokens=self.context_window_tokens,
         )
         if plan.changed:
             if not isinstance(turn_seq, int) or isinstance(turn_seq, bool) or turn_seq < 1:
@@ -170,7 +143,7 @@ class ContextBuilder:
         return fitted, tools or None
 
     def compact(self, scope: SessionScope) -> CompactResult:
-        """Persist a budget-derived Main checkpoint; never select a fixed tail count."""
+        """Persist a context-pressure-derived Main checkpoint."""
 
         session = self.session_manager.get_session(
             scope.account_key, scope.repository_key, scope.session_id
@@ -202,14 +175,14 @@ def fit_messages(
     messages: Sequence[Mapping[str, Any]],
     tools: Sequence[Mapping[str, Any]] | None,
     *,
-    effective_input_budget: int,
+    context_window_tokens: int,
 ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
     """Apply pressure policy and return the exact provider request."""
 
     fitted, level, stages, _ = fit_messages_with_plan(
         messages,
         tools,
-        effective_input_budget=effective_input_budget,
+        context_window_tokens=context_window_tokens,
     )
     return fitted, level, stages
 
@@ -218,7 +191,7 @@ def fit_messages_with_plan(
     messages: Sequence[Mapping[str, Any]],
     tools: Sequence[Mapping[str, Any]] | None,
     *,
-    effective_input_budget: int,
+    context_window_tokens: int,
 ) -> tuple[
     list[dict[str, Any]],
     str,
@@ -235,10 +208,13 @@ def fit_messages_with_plan(
     light_replacements: tuple[tuple[str, str], ...] = ()
     level = "none"
 
-    if context_pressure(initial, effective_input_budget) >= LIGHT_THRESHOLD:
+    context_window_tokens = _integer(
+        context_window_tokens, "context_window_tokens", positive=True
+    )
+    if context_pressure(initial, context_window_tokens) >= LIGHT_THRESHOLD:
         level = "light"
         current, light_replacements = _light_compact(
-            current, tools, effective_input_budget
+            current, tools, context_window_tokens
         )
         stages.append(
             {
@@ -251,10 +227,10 @@ def fit_messages_with_plan(
     durable_base = current
     projected = _ProjectedCompaction(current)
     current_tokens = request_tokens(current, tools)
-    if context_pressure(current_tokens, effective_input_budget) >= SUMMARY_THRESHOLD:
+    if context_pressure(current_tokens, context_window_tokens) >= SUMMARY_THRESHOLD:
         level = "summary"
         before = current_tokens
-        projected = _summary_compact(current, tools, effective_input_budget)
+        projected = _summary_compact(current, tools, context_window_tokens)
         current = projected.messages
         stages.append(
             {
@@ -265,11 +241,11 @@ def fit_messages_with_plan(
         )
 
     current_tokens = request_tokens(current, tools)
-    if context_pressure(current_tokens, effective_input_budget) >= EMERGENCY_THRESHOLD:
+    if context_pressure(current_tokens, context_window_tokens) >= EMERGENCY_THRESHOLD:
         level = "emergency"
         before = current_tokens
         projected = _emergency_compact(
-            durable_base, tools, effective_input_budget
+            durable_base, tools, context_window_tokens
         )
         current = projected.messages
         stages.append(
@@ -280,9 +256,12 @@ def fit_messages_with_plan(
             }
         )
 
-    if request_tokens(current, tools) > effective_input_budget:
-        raise ContextBudgetExceeded(
-            "required model context exceeds the effective input budget; shorten the latest input"
+    final_input_tokens = request_tokens(current, tools)
+    if final_input_tokens >= context_window_tokens:
+        raise ContextWindowExceeded(
+            context_window_tokens=context_window_tokens,
+            input_tokens=final_input_tokens,
+            requested_output_tokens=1,
         )
     _validate_tool_protocol(current)
     plan = MessageCompactionPlan(
@@ -296,12 +275,15 @@ def fit_messages_with_plan(
 def _light_compact(
     messages: list[dict[str, Any]],
     tools: Sequence[Mapping[str, Any]] | None,
-    budget: int,
+    context_window_tokens: int,
 ) -> tuple[list[dict[str, Any]], tuple[tuple[str, str], ...]]:
     projected = [dict(message) for message in messages]
     replacements: list[tuple[str, str]] = []
     for index, message in enumerate(projected):
-        if context_pressure(request_tokens(projected, tools), budget) < LIGHT_THRESHOLD:
+        if (
+            context_pressure(request_tokens(projected, tools), context_window_tokens)
+            < LIGHT_THRESHOLD
+        ):
             break
         if message.get("role") != "tool":
             continue
@@ -324,7 +306,7 @@ def _light_compact(
 def _summary_compact(
     messages: list[dict[str, Any]],
     tools: Sequence[Mapping[str, Any]] | None,
-    budget: int,
+    context_window_tokens: int,
 ) -> _ProjectedCompaction:
     system, history = _split_current_system(messages)
     spans = _atomic_spans(history)
@@ -351,7 +333,7 @@ def _summary_compact(
                 tuple(range(end, len(history))),
             )
             best_tokens = tokens
-        if context_pressure(tokens, budget) < LIGHT_THRESHOLD:
+        if context_pressure(tokens, context_window_tokens) < LIGHT_THRESHOLD:
             return _ProjectedCompaction(
                 candidate,
                 durable_checkpoint,
@@ -363,7 +345,7 @@ def _summary_compact(
 def _emergency_compact(
     messages: list[dict[str, Any]],
     tools: Sequence[Mapping[str, Any]] | None,
-    budget: int,
+    context_window_tokens: int,
 ) -> _ProjectedCompaction:
     system, history = _split_current_system(messages)
     spans = _atomic_spans(history)
@@ -379,9 +361,12 @@ def _emergency_compact(
         message for index, message in enumerate(history) if index in required_indexes
     ]
     base = [system, *required]
-    if request_tokens(base, tools) > budget:
-        raise ContextBudgetExceeded(
-            "required system, tools, current user and open tool protocol exceed the effective input budget"
+    base_tokens = request_tokens(base, tools)
+    if base_tokens >= context_window_tokens:
+        raise ContextWindowExceeded(
+            context_window_tokens=context_window_tokens,
+            input_tokens=base_tokens,
+            requested_output_tokens=1,
         )
 
     selected: list[tuple[int, int]] = []
@@ -403,7 +388,7 @@ def _emergency_compact(
                 if index in candidate_indexes
             ],
         ]
-        if request_tokens(candidate, tools) <= budget:
+        if request_tokens(candidate, tools) < context_window_tokens:
             selected.append(span)
 
     chosen_indexes = required_indexes | {
@@ -427,7 +412,7 @@ def _emergency_compact(
         visible_checkpoint = str(checkpoint["content"])
         durable_checkpoint = visible_checkpoint.removeprefix(CHECKPOINT_PREFIX)
         candidate = [system, checkpoint, *chosen]
-        if request_tokens(candidate, tools) <= budget:
+        if request_tokens(candidate, tools) < context_window_tokens:
             return _ProjectedCompaction(candidate, durable_checkpoint, retained)
     return _ProjectedCompaction([system, *chosen], retain_message_indexes=retained)
 
@@ -546,7 +531,6 @@ def _integer(value: Any, label: str, *, positive: bool = False) -> int:
 
 __all__ = [
     "CompactResult",
-    "ContextBudgetExceeded",
     "ContextBuildError",
     "ContextBuilder",
     "MessageCompactionPlan",

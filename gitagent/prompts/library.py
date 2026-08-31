@@ -6,9 +6,7 @@ renders ``{{placeholder}}`` substitutions. A template with no placeholders is
 served verbatim by :meth:`text`; dynamic templates go through :meth:`render`.
 
 The directory is resolved from this package, so the bundle works from a source
-tree and a wheel. ``GITAGENT_PROMPTS_DIR`` can redirect it, but that value is
-captured here before dotenv loads — a repository-controlled ``.env`` can never
-redirect prompt loading (mirrors ``_STARTUP_STATE_PATH`` in ``app/config.py``).
+tree and a wheel.
 
 Schemas the validator depends on (``INTENT_SCHEMA`` / ``APPROVAL_SCHEMA``) stay
 in code; they are function-calling contracts, not wording.
@@ -24,9 +22,6 @@ _PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _RESIDUAL = re.compile(r"\{\{|\}\}")
 
 _DEFAULT_DIR = Path(__file__).resolve().parent
-# Captured before dotenv (like GITAGENT_STATE_PATH): a repository-controlled
-# .env must never be able to redirect the prompt directory.
-_ENV_DIR = os.environ.get("GITAGENT_PROMPTS_DIR")
 _library: PromptLibrary | None = None
 
 
@@ -125,17 +120,8 @@ class PromptLibrary:
 
 
 def get_prompt_library() -> PromptLibrary:
-    """Return the process-global library, built from the package or the env override."""
+    """Return the process-global prompt library bundled with the package."""
     global _library
     if _library is None:
-        _library = PromptLibrary(Path(_ENV_DIR) if _ENV_DIR else _DEFAULT_DIR)
-    return _library
-
-
-def configure(root: str | Path | None = None) -> PromptLibrary:
-    """Point the process-global library at another directory (tests/overrides)."""
-    global _library, _ENV_DIR
-    if root is not None:
-        _ENV_DIR = str(Path(root))
-    _library = PromptLibrary(Path(_ENV_DIR) if _ENV_DIR else _DEFAULT_DIR)
+        _library = PromptLibrary(_DEFAULT_DIR)
     return _library

@@ -109,7 +109,7 @@ class StateStore:
     ) -> None:
         self.path = Path(path).expanduser()
         if not self.path.is_absolute():
-            raise ValidationError("GITAGENT_STATE_PATH must be an absolute path")
+            raise ValidationError("state path must be absolute")
         if isinstance(secret_values, (str, bytes)) or not isinstance(
             secret_values, Sequence
         ):

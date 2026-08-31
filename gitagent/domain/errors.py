@@ -33,12 +33,41 @@ class LLMProviderError(GitAgentError):
     """The configured model provider request failed before a valid response was produced."""
 
 
+class ContextWindowExceeded(GitAgentError):
+    """The complete model-visible request leaves no valid output space."""
+
+    def __init__(
+        self,
+        *,
+        context_window_tokens: int,
+        input_tokens: int,
+        requested_output_tokens: int,
+        breakdown: dict[str, int] | None = None,
+    ) -> None:
+        self.context_window_tokens = context_window_tokens
+        self.input_tokens = input_tokens
+        self.requested_output_tokens = requested_output_tokens
+        self.remaining_tokens = context_window_tokens - input_tokens
+        self.breakdown = dict(breakdown or {})
+        super().__init__(
+            "ContextWindowExceeded: "
+            f"context_window_tokens={context_window_tokens}, "
+            f"input_tokens={input_tokens}, "
+            f"requested_output_tokens={requested_output_tokens}, "
+            f"remaining_tokens={self.remaining_tokens}"
+        )
+
+
 class ValidationError(GitAgentError):
     """Structured input or output did not match its contract."""
 
 
 class StructuredOutputError(ValidationError):
     """Model structured output was malformed or violated its declared schema."""
+
+    def __init__(self, message: str, **details: object) -> None:
+        super().__init__(message)
+        self.details = details
 
 
 class WorkflowError(GitAgentError):

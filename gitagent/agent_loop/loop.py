@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from gitagent.agent_loop.actions import AgentLoopAgent
-from gitagent.domain.errors import WorkflowError
+from gitagent.domain.errors import (
+    ContextWindowExceeded,
+    StructuredOutputError,
+    WorkflowError,
+)
 from gitagent.domain.models import WorkflowTurnDecision
 from gitagent.harness.action_dispatcher import HarnessActionDispatcher
 
@@ -54,6 +58,35 @@ class AgentLoop:
                 action = agent.decide(context)
                 self.dispatcher.emit(context, "progress", action.summary or action.kind.value)
                 should_continue = self.dispatcher.handle(context, agent, action)
+            except StructuredOutputError as exc:
+                self.dispatcher.observe(
+                    context,
+                    "structured_output_error",
+                    {
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                        **exc.details,
+                    },
+                )
+                self.dispatcher.emit(
+                    context, "progress", "structured model output rejected"
+                )
+                continue
+            except ContextWindowExceeded as exc:
+                self.dispatcher.observe(
+                    context,
+                    "context_window_error",
+                    {
+                        "error_type": type(exc).__name__,
+                        "context_window_tokens": exc.context_window_tokens,
+                        "input_tokens": exc.input_tokens,
+                        "requested_output_tokens": exc.requested_output_tokens,
+                        "remaining_tokens": exc.remaining_tokens,
+                        "breakdown": exc.breakdown,
+                    },
+                )
+                self._fail(context, str(exc))
+                return
             except Exception as exc:  # noqa: BLE001 - loop boundary records programming failures
                 self._fail(context, f"agent step failed: {exc}")
                 return
@@ -71,7 +104,6 @@ class AgentLoop:
         context.question = ""
         context.error = str(error)
         context.finished = True
-        context.append_message({"role": "assistant", "content": f"任务失败：{error}"})
         self.dispatcher.emit(context, "failed", str(error))
 
 

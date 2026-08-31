@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sysconfig
 from pathlib import Path
 from typing import Any
@@ -19,9 +18,13 @@ from gitagent.capability.providers import (
     context7_tool_definitions,
     github_tool_definitions,
 )
-from gitagent.harness.context import assistant_tool_call, tool_result_message
+from gitagent.harness.context import (
+    assistant_tool_call,
+    fit_messages,
+    tool_result_message,
+)
 from gitagent.infra.mcp import Context7Client
-from gitagent.model import Reasoner
+from gitagent.model import Reasoner, structured_tools
 
 
 def build_capability_layer(
@@ -29,6 +32,10 @@ def build_capability_layer(
     *,
     trace: Any | None = None,
     reasoner: Reasoner | None = None,
+    coding_context_window_tokens: int,
+    context7_api_key: str,
+    blocked_paths: tuple[Path, ...],
+    secret_values: tuple[str, ...],
     workspace_root: str | Path | None = None,
     memory_roots: dict[str, Path] | None = None,
 ) -> CapabilityLayer:
@@ -38,8 +45,10 @@ def build_capability_layer(
     native = NativeProvider(
         workspace_root or Path.cwd(),
         memory_roots=memory_roots,
+        blocked_paths=blocked_paths,
+        secret_values=secret_values,
     )
-    context7 = Context7Client(api_key=os.getenv("CONTEXT7_API_KEY", ""))
+    context7 = Context7Client(api_key=context7_api_key)
     layer.add_provider(native)
     layer.add_provider(
         MCPProvider(
@@ -82,11 +91,18 @@ def build_capability_layer(
         capability.id for capability in layer.discover(context)
     )
     if reasoner is not None:
-        native.subagent_runner = _subagent_runner(layer, reasoner)
+        native.subagent_runner = _subagent_runner(
+            layer, reasoner, context_window_tokens=coding_context_window_tokens
+        )
     return layer
 
 
-def _subagent_runner(layer: CapabilityLayer, reasoner: Reasoner) -> Any:
+def _subagent_runner(
+    layer: CapabilityLayer,
+    reasoner: Reasoner,
+    *,
+    context_window_tokens: int,
+) -> Any:
     schema = {
         "type": "object",
         "properties": {
@@ -133,12 +149,19 @@ def _subagent_runner(layer: CapabilityLayer, reasoner: Reasoner) -> Any:
             for item in discovered
             if item.input_schema is not None
         ]
+        final_tools = structured_tools("finish_subagent", schema, available_tools)
         for step in range(1, 21):
+            messages[:], _, _ = fit_messages(
+                messages,
+                final_tools,
+                context_window_tokens=context_window_tokens,
+            )
             value = reasoner.complete_structured_messages(
                 messages=messages,
                 schema=schema,
                 tool_name="finish_subagent",
-                tools=available_tools,
+                final_tools=final_tools,
+                context_window_tokens=context_window_tokens,
             )
             response_message = getattr(value, "assistant_message", None)
             if not isinstance(response_message, dict):

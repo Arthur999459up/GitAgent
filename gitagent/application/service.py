@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +40,7 @@ from gitagent.harness.context import (
     assistant_tool_call,
     canonical_message,
     derive_domain_messages,
+    fit_messages,
     tool_result_message,
 )
 from gitagent.harness.context.state import AgentContext
@@ -80,10 +82,12 @@ class GitAgentService:
         memory_hooks: MemoryStopHooks | None = None,
         trace: TraceBus | None = None,
         session_scope: SessionScope | None = None,
-        input_budget_tokens: int = 26_112,
+        context_window_tokens: Mapping[str, int] | None = None,
     ) -> None:
         self.harness = AgentHarness(
-            capabilities, trace=trace, context_budget=input_budget_tokens
+            capabilities,
+            trace=trace,
+            context_window_tokens=context_window_tokens,
         )
         self.harness.message_sink = self._persist_domain_message
         self.harness.compaction_sink = self._persist_domain_compaction
@@ -108,7 +112,10 @@ class GitAgentService:
             message_sink=self._persist_main_message,
             compaction_sink=self._persist_main_compaction,
         )
-        self.classifier = ApprovalIntentClassifier(main_reasoner)
+        self.classifier = ApprovalIntentClassifier(
+            main_reasoner,
+            context_window_tokens=self.harness.context_window_for("main"),
+        )
         self.reasoner = agent_reasoner or main_reasoner
         self.session_manager = session_manager
         self.memory_store = memory_store
@@ -391,7 +398,9 @@ class GitAgentService:
             self.loop.start(context, self.issue_agent)
             return self._after_loop(context)
         instruction = decision.instruction.strip() or user_input.strip()
-        revised = self._revise_text("GitHub Issue reply draft", draft, instruction)
+        revised = self._revise_text(
+            context, "GitHub Issue reply draft", draft, instruction
+        )
         context.reply_draft = revised
         self._save_context(context)
         return DraftResult(
@@ -475,7 +484,9 @@ class GitAgentService:
 
     def _revise_draft(self, context: AgentContext, instruction: str) -> DraftResult:
         current = str(context.reply_draft or "")
-        revised = self._revise_text("GitHub Issue reply draft", current, instruction)
+        revised = self._revise_text(
+            context, "GitHub Issue reply draft", current, instruction
+        )
         context.reply_draft = revised
         self._save_context(context)
         return DraftResult(
@@ -495,6 +506,7 @@ class GitAgentService:
             raise RoutingError("当前 Pull Request 提案不是可修改的 Review 正文")
         call = pending.calls[0]
         revised = self._revise_text(
+            context,
             "GitHub Pull Request review body",
             str(call.arguments.get("body") or ""),
             instruction,
@@ -511,24 +523,37 @@ class GitAgentService:
         self._save_context(context)
         return context
 
-    def _revise_text(self, artifact: str, current: str, instruction: str) -> str:
+    def _revise_text(
+        self,
+        context: AgentContext,
+        artifact: str,
+        current: str,
+        instruction: str,
+    ) -> str:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"You revise a {artifact}. Follow the user's editing instruction exactly. "
+                    "Return only the revised text. Do not claim it was posted and do not add meta commentary."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"current_draft": current, "instruction": instruction},
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        messages, _, _ = fit_messages(
+            messages,
+            None,
+            context_window_tokens=context.context_window_tokens,
+        )
         revised = self.reasoner.complete_text_messages(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        f"You revise a {artifact}. Follow the user's editing instruction exactly. "
-                        "Return only the revised text. Do not claim it was posted and do not add meta commentary."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {"current_draft": current, "instruction": instruction},
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
+            messages=messages,
+            context_window_tokens=context.context_window_tokens,
         ).strip()
         if not revised:
             raise RoutingError(f"{artifact} revision returned empty text")

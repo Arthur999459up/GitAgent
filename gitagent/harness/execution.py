@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from time import perf_counter
 from typing import Any, TypeVar
@@ -26,18 +26,33 @@ class AgentHarness:
         *,
         audit: AuditLog | None = None,
         trace: TraceBus | None = None,
-        context_budget: int = 26_112,
+        context_window_tokens: Mapping[str, int] | None = None,
     ) -> None:
-        if not isinstance(context_budget, int) or isinstance(context_budget, bool) or context_budget < 4096:
-            raise ValueError("context_budget must be an integer of at least 4096")
+        windows = (
+            {"default": 32_768}
+            if context_window_tokens is None
+            else dict(context_window_tokens)
+        )
+        if "default" not in windows:
+            raise ValueError("context_window_tokens must define a default")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in windows.values()
+        ):
+            raise ValueError("every context_window_tokens value must be a positive integer")
         self._capabilities = capabilities
         self.approvals = capabilities.policy.approvals
         self.audit = audit or AuditLog()
         self.trace = trace or TraceBus()
-        self.context_budget = context_budget
+        self.context_window_tokens = windows
         self._specs: dict[str, AgentSpec] = {}
         self.message_sink: Callable[[AgentContext, dict[str, Any]], dict[str, Any]] | None = None
         self.compaction_sink: Callable[[AgentContext, Any], None] | None = None
+
+    def context_window_for(self, agent_name: str) -> int:
+        return self.context_window_tokens.get(
+            agent_name, self.context_window_tokens["default"]
+        )
 
     def register(self, spec: AgentSpec) -> None:
         if spec.name in self._specs:

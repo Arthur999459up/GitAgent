@@ -123,17 +123,14 @@ class MainAgent:
     ) -> MainDecision:
         additional_memory_bytes = 0
         for _ in range(4):
-            self._fit_messages(agent_context, messages, tools)
-            before = len(messages)
-            try:
-                raw = self.reasoner.complete_structured_messages(
-                    messages=messages,
-                    schema=_MAIN_SCHEMA,
-                    tool_name="route_session_turn",
-                    tools=tools,
-                )
-            finally:
-                self._persist_external_messages(messages, before)
+            self._fit_messages(messages, tools)
+            raw = self.reasoner.complete_structured_messages(
+                messages=messages,
+                schema=_MAIN_SCHEMA,
+                tool_name="route_session_turn",
+                final_tools=tools,
+                context_window_tokens=self.harness.context_window_for("main"),
+            )
             if raw.get("kind") != "capability":
                 self._append_message(
                     messages, _assistant_message(raw, "route_session_turn")
@@ -186,7 +183,11 @@ class MainAgent:
         ) + persistent
 
     def finalize(self, messages: list[dict[str, Any]]) -> str:
-        text = self.reasoner.complete_text_messages(messages=messages).strip()
+        self._fit_messages(messages, None)
+        text = self.reasoner.complete_text_messages(
+            messages=messages,
+            context_window_tokens=self.harness.context_window_for("main"),
+        ).strip()
         if not text:
             raise RoutingError("Main Agent returned an empty final response")
         messages.append(canonical_message({"role": "assistant", "content": text}))
@@ -220,14 +221,13 @@ class MainAgent:
 
     def _fit_messages(
         self,
-        context: AgentContext,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
     ) -> None:
         fitted, _, _, plan = fit_messages_with_plan(
             messages,
             tools,
-            effective_input_budget=context.context_budget,
+            context_window_tokens=self.harness.context_window_for("main"),
         )
         if plan.changed and self.compaction_sink is not None:
             self.compaction_sink(plan)
@@ -241,15 +241,6 @@ class MainAgent:
             safe = self.message_sink(safe)
         messages.append(safe)
         return safe
-
-    def _persist_external_messages(
-        self, messages: list[dict[str, Any]], start: int
-    ) -> None:
-        for index in range(start, len(messages)):
-            safe = canonical_message(messages[index])
-            if self.message_sink is not None:
-                safe = self.message_sink(safe)
-            messages[index] = safe
 
     def _validate(self, raw: dict[str, Any], text: str) -> MainDecision:
         if not isinstance(raw, dict):

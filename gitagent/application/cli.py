@@ -7,6 +7,7 @@ import json
 import shlex
 from collections.abc import Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from prompt_toolkit import prompt as terminal_prompt
@@ -38,7 +39,7 @@ from gitagent.harness.context.state import AgentContext
 from gitagent.infra.persistence import SessionRecord
 
 from .bootstrap import LiveApplication, build_live_application
-from .config import CLIConfig
+from .config import RuntimeConfig
 from .projection import MAX_VISIBLE_ITEMS, visible_items
 from .service import ServiceResult
 from .terminal_ui import TerminalUI
@@ -52,16 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="gitagent",
         description="安全、可审计的个人 GitHub 仓库维护助手。",
     )
-    parser.add_argument("-m", "--model", help="模型名称，覆盖 GITAGENT_MODEL")
     parser.add_argument(
-        "--base-url",
-        help="OpenAI 兼容 API 地址，覆盖 GITAGENT_BASE_URL / OPENAI_BASE_URL",
-    )
-    parser.add_argument("--api-key", help="模型 API Key；省略时启动后隐藏输入")
-    parser.add_argument("--provider", choices=["openai", "litellm"], help="模型后端")
-    parser.add_argument("--github-token", help="GitHub Token；省略时启动后隐藏输入")
-    parser.add_argument(
-        "--github-api-url", help="GitHub API 地址，GitHub Enterprise 可覆盖"
+        "--config",
+        type=Path,
+        default=Path("config.json"),
+        help="运行时 JSON 配置文件（默认：当前目录的 config.json）",
     )
     parser.add_argument("-v", "--version", action="version", version="gitagent 0.1.0")
     commands = parser.add_subparsers(dest="command")
@@ -92,15 +88,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (GitAgentError, RAGUnavailableError, ValueError, OSError) as exc:
             ui.text(str(exc), title="Error · RAG 管理失败", kind="error")
             return 1
-    config = _config_from_args(args)
     try:
-        if not _collect_credentials(config):
-            return 0
+        config = RuntimeConfig.from_file(args.config)
         application = build_live_application(config)
         application.trace.subscribe(ui.trace)
         if not _select_startup_session(application):
             return 0
-    except (GitAgentError, ValueError) as exc:
+    except (GitAgentError, OSError, TypeError, ValueError) as exc:
         ui.text(str(exc), title="Error · 启动失败", kind="error")
         _show_configuration_hint()
         return 1
@@ -165,44 +159,6 @@ def _run_rag_management(args: argparse.Namespace) -> int:
         )
         return 0
     raise ValidationError(f"unknown RAG action: {args.rag_action}")
-
-
-def _config_from_args(args: argparse.Namespace) -> CLIConfig:
-    config = CLIConfig.from_env()
-    for argument, attribute in [
-        (args.model, "model"),
-        (args.base_url, "base_url"),
-        (args.api_key, "api_key"),
-        (args.provider, "provider"),
-        (args.github_token, "github_token"),
-        (args.github_api_url, "github_api_url"),
-    ]:
-        if argument is not None:
-            setattr(config, attribute, argument)
-    return config
-
-
-def _collect_credentials(config: CLIConfig) -> bool:
-    """缺少凭据时在终端安全读取，不强制用户预先配置环境变量。"""
-    if not config.github_token:
-        config.github_token = terminal_prompt(
-            "GitHub Token > ", is_password=True
-        ).strip()
-    if not config.github_token:
-        ui.text(
-            "需要 GitHub Token 才能读取并选择仓库。",
-            title="Credentials",
-            kind="approval",
-        )
-        return False
-    if not config.api_key:
-        config.api_key = terminal_prompt("模型 API Key > ", is_password=True).strip()
-    if not config.api_key:
-        ui.text(
-            "需要模型 API Key 才能启动仓库助手。", title="Credentials", kind="approval"
-        )
-        return False
-    return True
 
 
 def _select_startup_session(application: LiveApplication) -> bool:
@@ -425,13 +381,6 @@ def _run_command(application: LiveApplication, request: str) -> None:
             _select_repository(application)
         except (GitAgentError, ValueError) as exc:
             console.print(f"[red]仓库读取失败：{exc}[/red]")
-    elif command == "/model":
-        if argument:
-            application.config.model = argument
-            application.llm.model = argument
-            console.print(f"模型已切换为 [cyan]{argument}[/cyan]")
-        else:
-            console.print(f"当前模型：[cyan]{application.config.model}[/cyan]")
     elif command == "/tokens":
         prompt_tokens = int(getattr(application.llm, "total_prompt_tokens", 0))
         completion_tokens = int(getattr(application.llm, "total_completion_tokens", 0))
@@ -1093,7 +1042,6 @@ def _show_help() -> None:
             "  /memory [private|project|all|search|show|forget|rebuild|dream|auto]  管理 Persistent Memory\n"
             "  /remember [--scope private|project] <内容>  创建人工 Memory Page\n"
             "  /forget <private|project> <id|name>  删除指定 Memory Page\n"
-            "  /model [name]         查看或切换模型\n"
             "  /tokens               查看模型 token 与估算费用\n"
             "  /approve              批准当前 Session 的待执行提案\n"
             "  /reject               拒绝当前 Session 的待执行提案\n"
@@ -1113,7 +1061,4 @@ def _show_help() -> None:
 
 
 def _show_configuration_hint() -> None:
-    console.print(
-        "\n直接运行 gitagent 后可在终端安全输入 GitHub Token 和模型 API Key；"
-        "也可以使用环境变量或 .env 免去重复输入。详细配置见 README.md。"
-    )
+    console.print("\n请检查 config.json；也可通过 --config 指定其他 JSON 配置文件。")

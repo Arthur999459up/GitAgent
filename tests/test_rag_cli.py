@@ -20,9 +20,9 @@ class FailingManager:
 def test_rag_list_does_not_enter_interactive_credential_flow(monkeypatch) -> None:
     monkeypatch.setattr(cli, "KnowledgeBaseManager", EmptyManager)
     monkeypatch.setattr(
-        cli,
-        "_collect_credentials",
-        lambda config: (_ for _ in ()).throw(AssertionError(config)),
+        cli.RuntimeConfig,
+        "from_file",
+        lambda path: (_ for _ in ()).throw(AssertionError(path)),
     )
 
     assert cli.main(["rag", "list"]) == 0

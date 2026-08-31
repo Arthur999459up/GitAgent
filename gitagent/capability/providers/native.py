@@ -7,7 +7,7 @@ import os
 import re
 import shlex
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -66,6 +66,8 @@ class NativeProvider:
         permission_resolver: Callable[[InvocationContext], frozenset[str]]
         | None = None,
         memory_roots: Mapping[str, str | Path] | None = None,
+        blocked_paths: Iterable[str | Path] = (),
+        secret_values: Iterable[str] = (),
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         if not self.workspace_root.is_dir():
@@ -80,6 +82,8 @@ class NativeProvider:
             if not path.is_dir():
                 raise ValidationError(f"native read root is not a directory: {path}")
             self.read_roots[name] = path
+        self.blocked_paths = frozenset(Path(value).resolve() for value in blocked_paths)
+        self.secret_values = tuple(value for value in secret_values if value)
         self.subagent_runner = subagent_runner
         self.permission_resolver = permission_resolver
         self._definitions = self._build_definitions()
@@ -250,6 +254,8 @@ class NativeProvider:
             raise PermissionDenied(
                 "Memory files must be read through their authorized named root"
             )
+        if resolved in self.blocked_paths:
+            raise PermissionDenied("file path is reserved for runtime configuration")
         if must_exist and not resolved.exists():
             raise FileNotFoundError(value)
         return resolved
@@ -323,6 +329,7 @@ class NativeProvider:
             if (
                 any(part in self._SKIP_DIRS for part in relative.parts)
                 or self._memory_root_for(resolved) is not None
+                or resolved in self.blocked_paths
                 or not resolved.is_file()
             ):
                 continue
@@ -361,7 +368,10 @@ class NativeProvider:
             ):
                 continue
             resolved = path.resolve(strict=False)
-            if self._memory_root_for(resolved) is not None:
+            if (
+                self._memory_root_for(resolved) is not None
+                or resolved in self.blocked_paths
+            ):
                 continue
             try:
                 resolved.relative_to(self.workspace_root)
@@ -494,9 +504,10 @@ class NativeProvider:
             )
         return details
 
-    @staticmethod
-    def _redact(value: str) -> str:
+    def _redact(self, value: str) -> str:
         redacted = value
+        for secret in self.secret_values:
+            redacted = redacted.replace(secret, "[REDACTED]")
         for key, secret in os.environ.items():
             if secret and any(
                 marker in key.upper()

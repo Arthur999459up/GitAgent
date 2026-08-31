@@ -7,7 +7,8 @@ from typing import Any
 
 from gitagent.domain.errors import LLMProviderError, ValidationError
 from gitagent.domain.models import ApprovalIntent, WorkflowTurnDecision
-from gitagent.model import Reasoner
+from gitagent.harness.context import fit_messages
+from gitagent.model import Reasoner, structured_tools
 from gitagent.prompts import get_prompt_library
 
 _PROMPTS = get_prompt_library()
@@ -48,8 +49,11 @@ def _ambiguous_decision() -> WorkflowTurnDecision:
 class ApprovalIntentClassifier:
     """Classify user meaning only; the deterministic ApprovalStore grants authority."""
 
-    def __init__(self, reasoner: Reasoner | None) -> None:
+    def __init__(
+        self, reasoner: Reasoner | None, *, context_window_tokens: int
+    ) -> None:
         self.reasoner = reasoner
+        self.context_window_tokens = context_window_tokens
 
     def classify(self, *, user_input: str, proposal_context: dict[str, Any]) -> WorkflowTurnDecision:
         if self.reasoner is None:
@@ -59,14 +63,25 @@ class ApprovalIntentClassifier:
             user_input=user_input,
             proposal_context=json.dumps(proposal_context, ensure_ascii=False),
         )
+        messages = [
+            {"role": "system", "content": _PROMPTS.text("approval.system")},
+            {"role": "user", "content": prompt},
+        ]
+        final_tools = structured_tools(
+            "classify_approval_intent", _APPROVAL_SCHEMA
+        )
+        messages, _, _ = fit_messages(
+            messages,
+            final_tools,
+            context_window_tokens=self.context_window_tokens,
+        )
         try:
             value = self.reasoner.complete_structured_messages(
-                messages=[
-                    {"role": "system", "content": _PROMPTS.text("approval.system")},
-                    {"role": "user", "content": prompt},
-                ],
+                messages=messages,
                 schema=_APPROVAL_SCHEMA,
                 tool_name="classify_approval_intent",
+                final_tools=final_tools,
+                context_window_tokens=self.context_window_tokens,
             )
         except (LLMProviderError, ValidationError):
             return _ambiguous_decision()
