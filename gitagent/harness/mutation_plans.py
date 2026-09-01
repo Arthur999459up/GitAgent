@@ -19,12 +19,18 @@ def issue_fix_mutation_plan(
     review: HumanReviewPackage,
 ) -> list[PlannedCapabilityCall]:
     """Build the fixed mutation plan for applying a verified code change."""
+    if not request.source_ref:
+        raise WorkflowError("issue fix requires the reviewed default-branch head SHA")
     suffix = session_id.removeprefix("session-")[:32]
     branch = f"gitagent/{suffix}"
     return [
         PlannedCapabilityCall(
             "github.create_branch",
-            {"base": request.base_branch, "branch": branch},
+            {
+                "base": request.base_branch,
+                "branch": branch,
+                "expected_head_sha": request.source_ref,
+            },
         ),
         PlannedCapabilityCall(
             "github.commit",
@@ -33,6 +39,7 @@ def issue_fix_mutation_plan(
                 "files": candidate.files,
                 "deleted_files": candidate.deleted_files,
                 "message": candidate.summary,
+                "expected_head_sha": request.source_ref,
             },
         ),
         PlannedCapabilityCall("github.push", {"branch": branch}),

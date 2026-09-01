@@ -9,25 +9,29 @@ from gitagent.agent_loop import (
     AgentCall,
     AgentResult,
     ModelResponse,
+    StructuredCall,
+    WaitForUser,
+    explicit_wait,
     rejection_feedback,
+    wait_for_user_tool,
 )
 from gitagent.domain.errors import WorkflowError
 from gitagent.domain.models import (
     AgentSpec,
-    CandidatePreparationResult,
+    ApprovalIntent,
     ChangeRequest,
-    DomainAction,
+    CodingTask,
     IssueAgentResult,
     IssueOperation,
+    IssueReplyStage,
     IssueSummary,
+    WorkflowTurnDecision,
 )
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
-from gitagent.harness.validation.static import StaticVerifier
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
 
-from .coding import CodingAgent
 from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
@@ -47,12 +51,10 @@ ISSUE_AGENT_SPEC = AgentSpec(
     ),
     system_prompt=_PROMPTS.text("system.issues"),
     output_schema=(
-        "action",
         "operation",
         "answer",
         "issues",
         "issue_number",
-        "question",
     ),
 )
 
@@ -61,20 +63,18 @@ class IssueAgent:
     def __init__(
         self,
         harness: AgentHarness,
-        coding: CodingAgent,
-        verifier: StaticVerifier,
         reasoner: Reasoner,
     ) -> None:
         self.harness = harness
-        self.coding = coding
-        self.verifier = verifier
         self.reasoner = reasoner
         harness.register(ISSUE_AGENT_SPEC)
 
     def agent_schemas(self) -> dict[str, dict[str, Any]]:
         return {"coding": _CODING_SCHEMA}
 
-    def step(self, context: AgentContext) -> ModelResponse:
+    def step(self, context: AgentContext) -> ModelResponse | WaitForUser:
+        if context.issue_reply is not None:
+            return self._reply_step(context)
         feedback = rejection_feedback(context)
         if feedback is not None and not feedback:
             return self._text(
@@ -91,12 +91,16 @@ class IssueAgent:
                 ),
                 _CODING_SCHEMA,
             ),
+            wait_for_user_tool(),
         ]
-        return context.reason(self.reasoner, tools=tools)
+        return explicit_wait(context.reason(self.reasoner, tools=tools))
 
-    def invoke_child(
-        self, context: AgentContext, call: AgentCall
-    ) -> AgentResult:
+    def prepare_child(
+        self,
+        context: AgentContext,
+        call: AgentCall,
+        child: AgentContext,
+    ) -> None:
         if call.agent_id != "coding":
             raise WorkflowError(f"IssueAgent cannot call {call.agent_id}")
         issue = self._last_capability(context, "github.get_issue")
@@ -105,9 +109,7 @@ class IssueAgent:
         task = str(call.arguments["task"])
         request = self._change_request(context, issue, task)
         context.change_request = request
-        result, artifact = self.coding.run_call(
-            context,
-            call_id=call.call_id,
+        child.coding_task = CodingTask(
             mode="patch",
             task=task,
             evidence={
@@ -115,25 +117,25 @@ class IssueAgent:
                 "observations": _capability_evidence(context),
             },
             change_request=request,
-            verifier=self.verifier,
         )
-        if isinstance(artifact, CandidatePreparationResult):
-            context.code_candidate = artifact.candidate
-            context.verification = artifact.verification
-            if artifact.capability_error:
-                context.observations.append(
-                    {"kind": "capability_error", "payload": artifact.capability_error}
-                )
-        return result
 
     @staticmethod
     def after_agent_result(
         context: AgentContext,
         call: AgentCall,
         result: AgentResult,
+        child: AgentContext,
         dispatcher: Any,
     ) -> None:
         del call
+        context.change_request = child.change_request
+        context.code_candidate = child.code_candidate
+        context.verification = child.verification
+        context.observations.extend(
+            observation
+            for observation in child.observations
+            if observation.get("kind") == "capability_error"
+        )
         if result.status != "completed" or context.code_candidate is None:
             return
         if context.verification is None or not context.verification.passed:
@@ -141,6 +143,127 @@ class IssueAgent:
                 "static verification failed; refusing an Issue fix proposal"
             )
         dispatcher.queue_issue_fix(context)
+
+    def _reply_step(self, context: AgentContext) -> ModelResponse | WaitForUser:
+        workflow = context.issue_reply
+        if workflow is None:  # pragma: no cover - guarded by step
+            raise WorkflowError("Issue reply workflow state is missing")
+        if workflow.stage == IssueReplyStage.PUBLISH:
+            decision = self._latest_user_decision(context)
+            if decision is not None and decision.action == ApprovalIntent.REVISE:
+                workflow.stage = IssueReplyStage.DRAFT
+                workflow.draft = self._revise_reply(
+                    context, workflow.draft, decision.instruction
+                )
+                return WaitForUser(
+                    "草稿已修改；你可以继续修改、取消，或再次确认进入发布审批。"
+                )
+            if decision is not None and decision.action == ApprovalIntent.REJECT:
+                return self._text(
+                    context, "已取消 Issue 回复；没有发布评论。"
+                )
+            published = self._last_capability(context, "github.post_comment")
+            return self._text(
+                context,
+                "Issue 回复已发布。" if published is not None else "Issue 回复未发布。",
+            )
+        if workflow.draft and workflow.decision is not None:
+            decision = workflow.decision
+            workflow.decision = None
+            if decision.action == ApprovalIntent.AMBIGUOUS:
+                return WaitForUser(
+                    decision.message
+                    or "你是想发布当前草稿、继续修改，还是取消？"
+                )
+            if decision.action == ApprovalIntent.QUESTION:
+                return WaitForUser(
+                    "你可以继续修改、取消，或确认进入发布审批。"
+                )
+            if decision.action == ApprovalIntent.REJECT:
+                return self._text(
+                    context, "已取消 Issue 回复；没有创建发布提案。"
+                )
+            if decision.action == ApprovalIntent.REVISE:
+                workflow.draft = self._revise_reply(
+                    context, workflow.draft, decision.instruction
+                )
+                return WaitForUser(
+                    "草稿已修改；你可以继续修改、取消，或确认进入发布审批。"
+                )
+            if context.entity_id is None or not context.entity_id.isdigit():
+                raise WorkflowError("Issue reply workflow is missing its Issue number")
+            workflow.stage = IssueReplyStage.PUBLISH
+            arguments = {
+                "issue_number": int(context.entity_id),
+                "body": workflow.draft,
+            }
+            call_id = context.ensure_capability_tool_call(
+                "github.post_comment", arguments
+            )
+            call = StructuredCall(
+                call_id,
+                self.harness.function_name("github.post_comment"),
+                arguments,
+            )
+            return ModelResponse(
+                f"Publish the reviewed reply to Issue #{context.entity_id}.",
+                call,
+                context.messages[-1],
+            )
+        response = context.reason(
+            self.reasoner,
+            tools=[
+                *self.harness.llm_tools(context, read_only=True),
+                wait_for_user_tool(),
+            ],
+        )
+        explicit = explicit_wait(response)
+        if isinstance(explicit, WaitForUser) or response.call is not None:
+            return explicit
+        workflow.draft = self.draft_reply(context, self.reasoner)
+        return WaitForUser(
+            "请查看 Issue 回复草稿；你可以提出修改、取消，或确认进入发布审批。"
+        )
+
+    def _revise_reply(
+        self, context: AgentContext, draft: str, instruction: str
+    ) -> str:
+        revised = context.complete_text(
+            self.reasoner,
+            prompt=json.dumps(
+                {
+                    "task": (
+                        "Revise this GitHub Issue reply draft exactly as instructed. "
+                        "Return only the complete revised reply and do not claim it was posted."
+                    ),
+                    "current_draft": draft,
+                    "instruction": instruction,
+                },
+                ensure_ascii=False,
+            ),
+        ).strip()
+        if not revised:
+            raise WorkflowError("Issue reply revision returned empty text")
+        return revised
+
+    @staticmethod
+    def _latest_user_decision(
+        context: AgentContext,
+    ) -> WorkflowTurnDecision | None:
+        for observation in reversed(context.observations):
+            if observation.get("kind") != "user_decision":
+                continue
+            payload = observation.get("payload") or {}
+            try:
+                action = ApprovalIntent(str(payload.get("action") or ""))
+            except ValueError:
+                return None
+            return WorkflowTurnDecision(
+                action,
+                instruction=str(payload.get("instruction") or ""),
+                message=str(payload.get("message") or ""),
+            )
+        return None
 
     def build_result(self, context: AgentContext) -> IssueAgentResult:
         issue_number = self._entity_number(context)
@@ -169,7 +292,6 @@ class IssueAgent:
         if mutation is not None:
             operation = mutation
         return IssueAgentResult(
-            action=DomainAction.ANSWER,
             operation=operation,
             answer=context.final_message or "Issue 请求已处理。",
             issues=issues,

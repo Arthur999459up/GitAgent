@@ -189,7 +189,7 @@ class LiveApplication:
             )
             current = self._session().working_state
             next_state = merge_working_state(current, projection=projection)
-            if result.agent is None and not result.clarify:
+            if result.agent is None:
                 next_state["open_question"] = current["open_question"]
             if renderer is not None:
                 renderer(result)
@@ -505,13 +505,16 @@ def _waiting_child_agent(context: Mapping[str, Any]) -> str | None:
     """Return the owner of a paused user turn without interpreting its semantics."""
 
     agent = str(context.get("agent") or "")
+    if agent == "main":
+        child = context.get("active_child")
+        return _waiting_child_agent(child) if isinstance(child, Mapping) else None
     if agent not in {"issues", "pull_requests", "repository"}:
         return None
     if bool(context.get("finished")) or context.get("error") is not None:
         return None
-    if context.get("pending") is not None or context.get("question"):
+    if context.get("pending") is not None or context.get("waiting_for_user") is not None:
         return agent
-    if context.get("reply_draft") is not None:
+    if context.get("active_child") is not None or context.get("issue_reply") is not None:
         return agent
     return None
 

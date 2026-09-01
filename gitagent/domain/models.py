@@ -151,6 +151,30 @@ class ChangeRequest:
 
 
 @dataclass
+class CodingTask:
+    """Typed input owned by one Runtime-managed Coding child."""
+
+    mode: str
+    task: str
+    evidence: dict[str, Any] = field(default_factory=dict)
+    change_request: ChangeRequest | None = None
+
+
+class IssueReplyStage(str, Enum):
+    DRAFT = "draft"
+    PUBLISH = "publish"
+
+
+@dataclass
+class IssueReplyWorkflow:
+    """The only workflow state for an Issue reply call."""
+
+    stage: IssueReplyStage = IssueReplyStage.DRAFT
+    draft: str = ""
+    decision: WorkflowTurnDecision | None = None
+
+
+@dataclass
 class CandidatePatch:
     summary: str
     root_cause: str
@@ -233,11 +257,6 @@ class CodePlanResult:
     tests: list[str]
 
 
-class DomainAction(str, Enum):
-    ANSWER = "ANSWER"
-    CLARIFY = "CLARIFY"
-
-
 class RepositoryOperation(str, Enum):
     EXPLORE = "EXPLORE"
     SEARCH = "SEARCH"
@@ -250,7 +269,6 @@ class RepositoryOperation(str, Enum):
 
 @dataclass
 class RepositoryResult:
-    action: DomainAction
     operation: RepositoryOperation
     answer: str
     files: list[str] = field(default_factory=list)
@@ -261,7 +279,6 @@ class RepositoryResult:
     plan: CodePlanResult | None = None
     candidate: CandidatePatch | None = None
     verification: VerificationReport | None = None
-    question: str = ""
 
 
 class IssueOperation(str, Enum):
@@ -289,12 +306,10 @@ class IssueSummary:
 
 @dataclass
 class IssueAgentResult:
-    action: DomainAction
     operation: IssueOperation | None
     answer: str
     issues: list[IssueSummary]
     issue_number: int | None = None
-    question: str = ""
 
 
 class PullRequestOperation(str, Enum):
@@ -329,7 +344,6 @@ class PullRequestSummary:
 
 @dataclass
 class PullRequestAgentResult:
-    action: DomainAction
     operation: PullRequestOperation | None
     answer: str
     pull_requests: list[PullRequestSummary]
@@ -344,7 +358,6 @@ class PullRequestAgentResult:
     verification: VerificationReport | None = None
     merge_readiness: str = ""
     execution_result: dict[str, Any] | None = None
-    question: str = ""
 
 
 def to_plain(value: Any) -> Any:

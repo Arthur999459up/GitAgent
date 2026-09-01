@@ -8,17 +8,17 @@ from gitagent.agent_loop import (
     AgentCall,
     AgentResult,
     ModelResponse,
+    WaitForUser,
+    explicit_wait,
     rejection_feedback,
+    wait_for_user_tool,
 )
 from gitagent.domain.errors import WorkflowError
 from gitagent.domain.models import (
     AgentSpec,
-    CandidatePreparationResult,
     ChangeRequest,
-    CodeExplanationResult,
-    CodePlanResult,
     CodeReviewResult,
-    DomainAction,
+    CodingTask,
     PlannedCapabilityCall,
     PullRequestAgentResult,
     PullRequestOperation,
@@ -28,11 +28,8 @@ from gitagent.domain.models import (
 from gitagent.domain.reviews import effective_review_events
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
-from gitagent.harness.validation.static import StaticVerifier
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
-
-from .coding import CodingAgent
 
 _PROMPTS = get_prompt_library()
 _CODING_SCHEMA = {
@@ -64,7 +61,6 @@ PULL_REQUEST_AGENT_SPEC = AgentSpec(
     ),
     system_prompt=_PROMPTS.text("system.pull_requests"),
     output_schema=(
-        "action",
         "operation",
         "answer",
         "pull_requests",
@@ -79,7 +75,6 @@ PULL_REQUEST_AGENT_SPEC = AgentSpec(
         "verification",
         "merge_readiness",
         "execution_result",
-        "question",
     ),
 )
 
@@ -88,20 +83,16 @@ class PullRequestAgent:
     def __init__(
         self,
         harness: AgentHarness,
-        coding: CodingAgent,
-        verifier: StaticVerifier,
         reasoner: Reasoner,
     ) -> None:
         self.harness = harness
-        self.coding = coding
-        self.verifier = verifier
         self.reasoner = reasoner
         harness.register(PULL_REQUEST_AGENT_SPEC)
 
     def agent_schemas(self) -> dict[str, dict[str, Any]]:
         return {"coding": _CODING_SCHEMA}
 
-    def step(self, context: AgentContext) -> ModelResponse:
+    def step(self, context: AgentContext) -> ModelResponse | WaitForUser:
         feedback = rejection_feedback(context)
         if feedback is not None and not feedback:
             return self._text(
@@ -118,12 +109,16 @@ class PullRequestAgent:
                 ),
                 _CODING_SCHEMA,
             ),
+            wait_for_user_tool(),
         ]
-        return context.reason(self.reasoner, tools=tools)
+        return explicit_wait(context.reason(self.reasoner, tools=tools))
 
-    def invoke_child(
-        self, context: AgentContext, call: AgentCall
-    ) -> AgentResult:
+    def prepare_child(
+        self,
+        context: AgentContext,
+        call: AgentCall,
+        child: AgentContext,
+    ) -> None:
         if call.agent_id != "coding":
             raise WorkflowError(f"PullRequestAgent cannot call {call.agent_id}")
         mode = str(call.arguments["mode"])
@@ -155,41 +150,34 @@ class PullRequestAgent:
                 suggested_title=task[:200],
             )
             context.change_request = request
-        result, artifact = self.coding.run_call(
-            context,
-            call_id=call.call_id,
+        child.coding_task = CodingTask(
             mode=mode,
             task=task,
             evidence=evidence,
             change_request=request,
-            verifier=self.verifier,
         )
-        if isinstance(artifact, CandidatePreparationResult):
-            context.code_candidate = artifact.candidate
-            context.verification = artifact.verification
-            if artifact.capability_error:
-                context.observations.append(
-                    {"kind": "capability_error", "payload": artifact.capability_error}
-                )
-        elif isinstance(artifact, CodeExplanationResult):
-            context.code_explanation = artifact
-        elif isinstance(artifact, CodeReviewResult):
-            context.code_review = artifact
-        elif isinstance(artifact, CodePlanResult):
-            context.code_plan = artifact
-        elif mode == "review_dialogue" and isinstance(artifact, dict):
-            context.review_dialogue = artifact
-        elif mode == "ci" and isinstance(artifact, dict):
-            context.ci_analysis = artifact
-        return result
 
     def after_agent_result(
         self,
         context: AgentContext,
         call: AgentCall,
         result: AgentResult,
+        child: AgentContext,
         dispatcher: Any,
     ) -> None:
+        context.change_request = child.change_request
+        context.code_candidate = child.code_candidate
+        context.verification = child.verification
+        context.code_explanation = child.code_explanation
+        context.code_review = child.code_review
+        context.code_plan = child.code_plan
+        context.review_dialogue = child.review_dialogue
+        context.ci_analysis = child.ci_analysis
+        context.observations.extend(
+            observation
+            for observation in child.observations
+            if observation.get("kind") == "capability_error"
+        )
         if result.status != "completed":
             return
         mode = str(call.arguments.get("mode") or "")
@@ -210,6 +198,8 @@ class PullRequestAgent:
             return
         if context.verification is None or not context.verification.passed:
             raise WorkflowError("static verification failed; refusing a PR write proposal")
+        if context.change_request is None or not context.change_request.source_ref:
+            raise WorkflowError("PR write proposal is missing its candidate head SHA")
         pull_request = self._last_capability(context, "github.get_pr") or {}
         if self._is_fork(context.repository, pull_request):
             return
@@ -227,6 +217,7 @@ class PullRequestAgent:
                         "files": context.code_candidate.files,
                         "deleted_files": context.code_candidate.deleted_files,
                         "message": context.code_candidate.summary,
+                        "expected_head_sha": context.change_request.source_ref,
                     },
                 )
             ],
@@ -243,7 +234,6 @@ class PullRequestAgent:
         elif isinstance(pull_request, dict):
             pull_requests = [self._summary(pull_request)]
         return PullRequestAgentResult(
-            action=DomainAction.ANSWER,
             operation=self._result_operation(context, raw_list, pull_request),
             answer=context.final_message or "Pull Request 请求已处理。",
             pull_requests=pull_requests,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from gitagent.domain.errors import StructuredOutputError
 from gitagent.domain.models import PlannedCapabilityCall
 
 
@@ -19,7 +20,7 @@ class StructuredCall:
 
 @dataclass(frozen=True)
 class ModelResponse:
-    """The only two model response channels visible to an Agent Loop."""
+    """One native model response before the Agent gives it runtime meaning."""
 
     text: str
     call: StructuredCall | None
@@ -51,6 +52,53 @@ class AgentResult:
     error: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class WaitForUser:
+    """An explicit non-terminal Agent step result requiring one user answer."""
+
+    question: str
+    call_id: str | None = None
+
+
+def wait_for_user_tool() -> dict[str, Any]:
+    """Return the native Runtime tool used to make a pause explicit."""
+
+    return {
+        "type": "function",
+        "function": {
+            "name": "runtime__wait_for_user",
+            "description": (
+                "Pause this Agent call only when one necessary user answer is missing. "
+                "The same Agent message thread will resume with that answer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "minLength": 1, "maxLength": 4000}
+                },
+                "required": ["question"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def explicit_wait(response: ModelResponse) -> ModelResponse | WaitForUser:
+    """Translate only the dedicated Runtime call into a waiting step result."""
+
+    call = response.call
+    if call is None or call.name != "runtime__wait_for_user":
+        return response
+    question = call.arguments.get("question")
+    if not isinstance(question, str) or not question.strip():
+        raise StructuredOutputError(
+            "runtime__wait_for_user requires a non-empty question"
+        )
+    if set(call.arguments) != {"question"}:
+        raise StructuredOutputError("runtime__wait_for_user accepts only question")
+    return WaitForUser(question.strip(), call.call_id)
+
+
 @dataclass
 class PendingCall:
     """An exact set of Capability calls waiting for explicit approval."""
@@ -62,6 +110,6 @@ class PendingCall:
 
 
 class AgentLoopAgent(Protocol):
-    def step(self, context: Any) -> ModelResponse: ...
+    def step(self, context: Any) -> ModelResponse | WaitForUser: ...
 
     def build_result(self, context: Any) -> Any: ...

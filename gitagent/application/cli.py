@@ -25,7 +25,6 @@ from gitagent.capability.rag import (
 )
 from gitagent.domain.errors import GitAgentError, ValidationError
 from gitagent.domain.models import (
-    DomainAction,
     DraftResult,
     IssueAgentResult,
     MutationRejectedResult,
@@ -528,13 +527,6 @@ def _render_application_output(application: LiveApplication, output: Any) -> Non
 
 
 def _render_result(application: LiveApplication, result: ServiceResult) -> None:
-    if result.clarify:
-        ui.markdown(
-            str(result.output),
-            title="需要补充信息",
-            kind="router",
-        )
-        return
     if result.agent is None and isinstance(result.output, str):
         ui.markdown(result.output, title="GitAgent", kind="info")
         return
@@ -564,11 +556,8 @@ def _render_output(application: LiveApplication, output: Any) -> None:
         _render_context(application, output)
         return
     if isinstance(output, IssueAgentResult):
-        if output.action == DomainAction.CLARIFY:
-            ui.text(output.question, title="需要补充信息 · Issues", kind="router")
-            return
         visible, truncated = visible_items(output.issues)
-        operation = output.operation.value if output.operation else output.action.value
+        operation = output.operation.value if output.operation else ""
         content = output.answer
         if operation in {"LIST", "SUMMARIZE"} and visible:
             items = "\n".join(
@@ -591,13 +580,8 @@ def _render_output(application: LiveApplication, output: Any) -> None:
         ui.markdown(content, title=title, kind="agent")
         return
     if isinstance(output, PullRequestAgentResult):
-        if output.action == DomainAction.CLARIFY:
-            ui.text(
-                output.question, title="需要补充信息 · Pull Requests", kind="router"
-            )
-            return
         visible, truncated = visible_items(output.pull_requests)
-        operation = output.operation.value if output.operation else output.action.value
+        operation = output.operation.value if output.operation else ""
         content = output.answer
         if operation in {"LIST", "SUMMARIZE"} and visible:
             items = "\n".join(
@@ -621,13 +605,6 @@ def _render_output(application: LiveApplication, output: Any) -> None:
         ui.markdown(content, title=title, kind="agent")
         return
     if isinstance(output, RepositoryResult):
-        if output.action == DomainAction.CLARIFY:
-            ui.text(
-                output.question or output.answer,
-                title="需要补充信息 · Repository",
-                kind="router",
-            )
-            return
         content = output.answer
         if output.files:
             content += "\n\n---\n**相关文件：** " + ", ".join(
@@ -648,8 +625,8 @@ def _render_context(application: LiveApplication, context: AgentContext) -> None
     if context.error:
         ui.text(context.error, title="执行失败", kind="error")
         return
-    if context.question:
-        ui.text(context.question or context.goal, title="需要补充信息", kind="router")
+    if context.waiting_question:
+        ui.text(context.waiting_question, title="需要补充信息", kind="router")
         return
     if context.pending is not None:
         _render_proposal(application, context)
@@ -662,7 +639,7 @@ def _render_context(application: LiveApplication, context: AgentContext) -> None
 
 def _render_proposal(application: LiveApplication, context: AgentContext) -> None:
     calls = context.pending.calls
-    if context.reply_draft is not None and any(
+    if context.issue_reply is not None and context.issue_reply.draft and any(
         call.capability_id == "github.post_comment" for call in calls
     ):
         issue_number = next(
@@ -674,8 +651,8 @@ def _render_proposal(application: LiveApplication, context: AgentContext) -> Non
             context.entity_id,
         )
         ui.markdown(
-            context.reply_draft,
-            title=f"Issue #{issue_number} 修改报告 · 待发布",
+            context.issue_reply.draft,
+            title=f"Issue #{issue_number} 回复草稿 · 待发布审批",
             kind="agent",
         )
     elif any(

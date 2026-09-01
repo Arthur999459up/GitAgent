@@ -452,7 +452,13 @@ class InMemoryGitHubClient:
                 pull_request["state"] = state
         return deepcopy(pull_request)
 
-    def create_branch(self, repository: str, base: str, branch: str) -> dict[str, Any]:
+    def create_branch(
+        self,
+        repository: str,
+        base: str,
+        branch: str,
+        expected_head_sha: str,
+    ) -> dict[str, Any]:
         self._validate_branch(branch)
         with self._lock:
             repo = self._repo(repository)
@@ -460,8 +466,29 @@ class InMemoryGitHubClient:
                 raise ResourceNotFoundError(f"base branch not found: {base}")
             if branch in repo["branches"]:
                 raise GitHubAPIError(f"branch already exists: {branch}", status_code=409, request_sent=False)
-            repo["branches"][branch] = {"base": base, "commits": [], "pushed": False}
-        return {"repository": repository, "branch": branch, "base": base}
+            base_state = repo["branches"][base]
+            actual_head_sha = str(
+                base_state.get("head_sha")
+                or f"fixture-head-{len(base_state.get('commits', []))}"
+            )
+            if not expected_head_sha or expected_head_sha != actual_head_sha:
+                raise GitHubAPIError(
+                    "base branch changed after the candidate was prepared",
+                    status_code=409,
+                    request_sent=False,
+                )
+            repo["branches"][branch] = {
+                "base": base,
+                "head_sha": expected_head_sha,
+                "commits": [],
+                "pushed": False,
+            }
+        return {
+            "repository": repository,
+            "branch": branch,
+            "base": base,
+            "head_sha": expected_head_sha,
+        }
 
     def commit(
         self,
@@ -470,6 +497,7 @@ class InMemoryGitHubClient:
         files: dict[str, str],
         deleted_files: list[str],
         message: str,
+        expected_head_sha: str,
     ) -> dict[str, Any]:
         if (not files and not deleted_files) or not message.strip():
             raise ValidationError("commit requires file changes and a message")
@@ -481,11 +509,19 @@ class InMemoryGitHubClient:
             repo = self._repo(repository)
             if branch not in repo["branches"]:
                 raise ResourceNotFoundError(f"branch not found: {branch}")
+            state = repo["branches"][branch]
+            actual_head_sha = self._branch_head_sha(repo, branch)
+            if not expected_head_sha or expected_head_sha != actual_head_sha:
+                raise GitHubAPIError(
+                    "branch changed after the candidate was prepared",
+                    status_code=409,
+                    request_sent=False,
+                )
             missing = safe_deletions - set(repo["files"])
             if missing:
                 raise ResourceNotFoundError(f"cannot delete missing file: {min(missing)}")
-            commit_id = f"commit-{len(repo['branches'][branch].setdefault('commits', [])) + 1}"
-            repo["branches"][branch]["commits"].append(
+            commit_id = f"commit-{len(state.setdefault('commits', [])) + 1}"
+            state["commits"].append(
                 {
                     "id": commit_id,
                     "message": message,
@@ -493,6 +529,21 @@ class InMemoryGitHubClient:
                     "deleted_files": sorted(safe_deletions),
                 }
             )
+            state["head_sha"] = commit_id
+            for pull_request in repo["prs"].values():
+                head = pull_request.get("head") or {}
+                source = (head.get("repo") or {}) if isinstance(head, dict) else {}
+                source_name = (
+                    str(source.get("full_name") or "")
+                    if isinstance(source, dict)
+                    else ""
+                )
+                if (
+                    isinstance(head, dict)
+                    and str(head.get("ref") or "") == branch
+                    and source_name in {"", repository}
+                ):
+                    head["sha"] = commit_id
             repo["files"].update(safe_files)
             for path in safe_deletions:
                 del repo["files"][path]
@@ -627,6 +678,21 @@ class InMemoryGitHubClient:
         if item is None:
             raise ResourceNotFoundError(f"{label} not found: {number}")
         return item
+
+    @staticmethod
+    def _branch_head_sha(repo: dict[str, Any], branch: str) -> str:
+        state = repo["branches"][branch]
+        if state.get("head_sha"):
+            return str(state["head_sha"])
+        for pull_request in repo["prs"].values():
+            head = pull_request.get("head") or {}
+            if (
+                isinstance(head, dict)
+                and str(head.get("ref") or "") == branch
+                and head.get("sha")
+            ):
+                return str(head["sha"])
+        return f"fixture-head-{len(state.get('commits', []))}"
 
     @staticmethod
     def _paths_from_diff(diff: str) -> list[str]:

@@ -6,7 +6,12 @@ import difflib
 import json
 from typing import Any
 
-from gitagent.agent_loop import AgentResult
+from gitagent.agent_loop import (
+    ModelResponse,
+    WaitForUser,
+    explicit_wait,
+    wait_for_user_tool,
+)
 from gitagent.capability import AccessLevel
 from gitagent.capability.schema import validate_schema
 from gitagent.domain.errors import LLMProviderError, ValidationError, WorkflowError
@@ -19,6 +24,7 @@ from gitagent.domain.models import (
     CodeExplanationResult,
     CodePlanResult,
     CodeReviewResult,
+    CodingTask,
     Recommendation,
 )
 from gitagent.domain.reviews import canonical_review_event
@@ -177,77 +183,86 @@ CODING_SPEC = AgentSpec(
 
 
 class CodingAgent:
-    def __init__(self, harness: AgentHarness, reasoner: Reasoner | None = None) -> None:
+    def __init__(
+        self,
+        harness: AgentHarness,
+        reasoner: Reasoner | None = None,
+        verifier: Any | None = None,
+    ) -> None:
         self.harness = harness
         self.reasoner = reasoner
+        self.verifier = verifier
         harness.register(CODING_SPEC)
 
-    def run_call(
-        self,
-        parent: AgentContext,
-        *,
-        call_id: str,
-        mode: str,
-        task: str,
-        evidence: dict[str, Any],
-        change_request: ChangeRequest | None = None,
-        verifier: Any | None = None,
-    ) -> tuple[AgentResult, Any]:
-        """Run a fresh Coding child and return its own final Text plus runtime artifact."""
+    def step(self, context: AgentContext) -> ModelResponse | WaitForUser:
+        """Execute one typed Coding task inside the shared Agent Runtime."""
 
-        context = self.harness.context(
-            "coding",
-            parent.session_id,
-            repository=parent.repository,
-            goal=task,
-            entity_type=parent.entity_type,
-            entity_id=parent.entity_id,
-            guidance=parent.guidance,
+        task = context.coding_task
+        if task is None:
+            raise WorkflowError("Coding context is missing its typed task")
+        if not context.coding_task_completed:
+            artifact = self._run_task(context, task)
+            self._store_artifact(context, task.mode, artifact)
+            context.coding_task_completed = True
+        if self.reasoner is None:
+            raise WorkflowError("Coding Agent calls require a configured reasoner")
+        return explicit_wait(
+            context.reason(self.reasoner, tools=[wait_for_user_tool()])
         )
-        context.origin_turn_seq = parent.origin_turn_seq
-        try:
-            if mode == "explain":
-                artifact: Any = self._explain(
-                    context, task, evidence, parent.guidance
-                )
-            elif mode == "review":
-                artifact = self._review(context, task, evidence, parent.guidance)
-            elif mode == "plan":
-                artifact = self._plan(context, task, evidence, parent.guidance)
-            elif mode == "review_dialogue":
-                artifact = self._summarize_review_dialogue(
-                    context, task, evidence, parent.guidance
-                )
-            elif mode == "ci":
-                artifact = self._analyze_ci(
-                    context, task, evidence, parent.guidance
-                )
-            elif mode == "patch":
-                if change_request is None or verifier is None:
-                    raise WorkflowError(
-                        "Coding patch call requires a ChangeRequest and StaticVerifier"
-                    )
-                artifact = self._prepare_verified_in_context(
-                    context,
-                    change_request,
-                    verifier,
-                    parent.guidance,
-                )
-            else:
-                raise ValidationError(f"unknown Coding Agent mode: {mode}")
-            final_text = self._child_final_text(context)
-            return AgentResult(call_id, "coding", "completed", final_text), artifact
-        except Exception as exc:  # noqa: BLE001 - child failure is structured for parent
-            return (
-                AgentResult(
-                    call_id,
-                    "coding",
-                    "failed",
-                    str(exc),
-                    {"type": type(exc).__name__, "message": str(exc)},
-                ),
-                None,
+
+    @staticmethod
+    def build_result(context: AgentContext) -> str:
+        return context.final_message
+
+    def _run_task(self, context: AgentContext, task: CodingTask) -> Any:
+        mode = task.mode
+        if mode == "explain":
+            return self._explain(context, task.task, task.evidence, context.guidance)
+        if mode == "review":
+            return self._review(context, task.task, task.evidence, context.guidance)
+        if mode == "plan":
+            return self._plan(context, task.task, task.evidence, context.guidance)
+        if mode == "review_dialogue":
+            return self._summarize_review_dialogue(
+                context, task.task, task.evidence, context.guidance
             )
+        if mode == "ci":
+            return self._analyze_ci(
+                context, task.task, task.evidence, context.guidance
+            )
+        if mode == "patch":
+            if task.change_request is None or self.verifier is None:
+                raise WorkflowError(
+                    "Coding patch call requires a ChangeRequest and StaticVerifier"
+                )
+            context.change_request = task.change_request
+            return self._prepare_verified_in_context(
+                context,
+                task.change_request,
+                self.verifier,
+                context.guidance,
+            )
+        raise ValidationError(f"unknown Coding Agent mode: {mode}")
+
+    @staticmethod
+    def _store_artifact(context: AgentContext, mode: str, artifact: Any) -> None:
+        if isinstance(artifact, CandidatePreparationResult):
+            context.code_candidate = artifact.candidate
+            context.verification = artifact.verification
+            if artifact.capability_error:
+                context.observations.append(
+                    {"kind": "capability_error", "payload": artifact.capability_error}
+                )
+        elif isinstance(artifact, CodeExplanationResult):
+            context.code_explanation = artifact
+        elif isinstance(artifact, CodeReviewResult):
+            context.code_review = artifact
+        elif isinstance(artifact, CodePlanResult):
+            context.code_plan = artifact
+        elif mode == "review_dialogue" and isinstance(artifact, dict):
+            context.review_dialogue = artifact
+        elif mode == "ci" and isinstance(artifact, dict):
+            context.ci_analysis = artifact
 
     def _prepare_verified_in_context(
         self,
@@ -281,19 +296,6 @@ class CodingAgent:
                 candidate, session_id=context.session_id, attempts=2
             )
         return CandidatePreparationResult(candidate, report)
-
-    def _child_final_text(
-        self,
-        context: AgentContext,
-    ) -> str:
-        if self.reasoner is None:
-            raise WorkflowError("Coding Agent calls require a configured reasoner")
-        response = context.reason(self.reasoner)
-        if response.call is not None:
-            raise WorkflowError(
-                "CodingAgent must finish with natural Text after its typed result"
-            )
-        return response.text
 
     def _explain(
         self,

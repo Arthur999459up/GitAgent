@@ -9,7 +9,6 @@ from typing import Any, TypeVar
 
 from gitagent.domain.errors import ValidationError
 from gitagent.domain.models import (
-    DomainAction,
     DraftResult,
     IssueAgentResult,
     MutationRejectedResult,
@@ -56,15 +55,6 @@ def project_service_result(
         if isinstance(result.output, str)
         else assistant
     )
-    if result.clarify:
-        return TurnProjection(
-            final_assistant,
-            assistant,
-            None,
-            manifests,
-            focus,
-            open_question=assistant,
-        )
     if result.agent is None:
         return TurnProjection(final_assistant, assistant, None, manifests, focus)
 
@@ -98,8 +88,9 @@ def project_service_result(
         entity_manifests=manifests,
         focus=focus,
         open_question=(
-            result.domain_output.question
-            if isinstance(result.domain_output, AgentContext) and result.domain_output.question
+            result.domain_output.waiting_question
+            if isinstance(result.domain_output, AgentContext)
+            and result.domain_output.waiting_question
             else None
         ),
         goals=(result.goal,) if result.goal else (),
@@ -147,7 +138,7 @@ def domain_summary(
         mutation_executed = True
         mutation = output.execution_result
     pending = runtime.pending.summary if runtime is not None and runtime.pending is not None else ""
-    question = runtime.question if runtime is not None else ""
+    question = runtime.waiting_question if runtime is not None else ""
     failure = runtime.error if runtime is not None else ""
     if isinstance(output, MutationRejectedResult):
         failure = output.reason
@@ -195,13 +186,11 @@ def project_output(
     if isinstance(output, AgentContext):
         return _project_context(output, turn_seq=turn_seq, text_sanitizer=text_sanitizer)
     if isinstance(output, RepositoryResult):
-        text = output.question if output.action == DomainAction.CLARIFY and output.question else output.answer
+        text = output.answer
         files = ", ".join(output.files[:20])
         text += f"\n相关文件：{files}" if files else ""
         return _bounded(text, 8 * 1024, text_sanitizer), [], None
     if isinstance(output, IssueAgentResult):
-        if output.action == DomainAction.CLARIFY:
-            return _bounded(output.question, 8 * 1024, text_sanitizer), [], None
         selected, truncated = visible_items(output.issues)
         lines = [output.answer]
         lines.extend(
@@ -222,8 +211,6 @@ def project_output(
             }
         return _bounded("\n".join(filter(None, lines)), 8 * 1024, text_sanitizer), manifests, focus
     if isinstance(output, PullRequestAgentResult):
-        if output.action == DomainAction.CLARIFY:
-            return _bounded(output.question, 8 * 1024, text_sanitizer), [], None
         selected, truncated = visible_items(output.pull_requests)
         lines = [output.answer]
         lines.extend(f"PR #{item.number} {item.title} [{item.state}]" for item in selected)
@@ -256,8 +243,8 @@ def _project_context(
     focus: dict[str, str] | None = None
     if context.error:
         parts.append(f"错误：{context.error}")
-    elif context.question:
-        parts.append(f"问题：{context.question}")
+    elif context.waiting_question:
+        parts.append(f"问题：{context.waiting_question}")
     elif context.pending is not None:
         parts.append(f"提案：{context.pending.summary}")
         for call in context.pending.calls:
@@ -310,12 +297,14 @@ def _last_write_like_observation(context: AgentContext) -> Any | None:
 def _workflow_status(output: Any) -> str:
     if isinstance(output, MutationRejectedResult):
         return "rejected"
+    if isinstance(output, DraftResult):
+        return "awaiting_input"
     if isinstance(output, AgentContext):
         if output.error:
             return "failed"
         if output.pending is not None:
             return "awaiting_approval"
-        if output.question:
+        if output.waiting_question:
             return "awaiting_input"
     return "completed"
 

@@ -1,4 +1,4 @@
-"""Session service for Main Agent calls and isolated child Agent lifecycles."""
+"""Session service around the unified Agent Runtime lifecycle."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from gitagent.agent_loop import AgentCall, AgentLoop, CapabilityCall
+from gitagent.agent_loop import AgentLoop, WaitForUser
 from gitagent.agents import (
     CodingAgent,
     IssueAgent,
@@ -15,8 +15,8 @@ from gitagent.agents import (
     PullRequestAgent,
     RepositoryAgent,
 )
-from gitagent.capability import AccessLevel, CapabilityLayer
-from gitagent.domain.errors import RoutingError, WorkflowError
+from gitagent.capability import CapabilityLayer
+from gitagent.domain.errors import RoutingError, ValidationError, WorkflowError
 from gitagent.domain.models import (
     AgentGuidance,
     ApprovalIntent,
@@ -25,7 +25,10 @@ from gitagent.domain.models import (
     CodeExplanationResult,
     CodePlanResult,
     CodeReviewResult,
+    CodingTask,
     DraftResult,
+    IssueReplyStage,
+    IssueReplyWorkflow,
     PlannedCapabilityCall,
     Recommendation,
     Replacement,
@@ -41,8 +44,8 @@ from gitagent.harness.context import (
     MessageCompactionPlan,
     canonical_message,
     derive_domain_messages,
+    derive_main_messages,
     fit_messages,
-    tool_result_message,
 )
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
@@ -70,12 +73,11 @@ class ServiceResult:
     entity_id: str | None = None
     domain_output: Any = None
     workflow_summary: str = ""
-    clarify: bool = False
     output_agent: str = "main"
 
 
 class GitAgentService:
-    """Run one Main context and at most one persisted child lifecycle per Session."""
+    """Run and persist one Main-rooted Agent Runtime tree per Session."""
 
     def __init__(
         self,
@@ -96,26 +98,27 @@ class GitAgentService:
             trace=trace,
             context_window_tokens=context_window_tokens,
         )
-        self.harness.message_sink = self._persist_domain_message
-        self.harness.compaction_sink = self._persist_domain_compaction
+        self.harness.message_sink = self._persist_agent_message
+        self.harness.compaction_sink = self._persist_agent_compaction
         domain_reasoner = agent_reasoner or main_reasoner
-        self.coding = CodingAgent(self.harness, domain_reasoner)
         self.verifier = StaticVerifier(self.harness)
-        self.repository_agent = RepositoryAgent(
-            self.harness, self.coding, self.verifier, domain_reasoner
-        )
-        self.pull_request_agent = PullRequestAgent(
-            self.harness, self.coding, self.verifier, domain_reasoner
-        )
-        self.issue_agent = IssueAgent(
-            self.harness, self.coding, self.verifier, domain_reasoner
-        )
-        self.loop = AgentLoop(self.harness)
+        self.coding = CodingAgent(self.harness, domain_reasoner, self.verifier)
+        self.repository_agent = RepositoryAgent(self.harness, domain_reasoner)
+        self.pull_request_agent = PullRequestAgent(self.harness, domain_reasoner)
+        self.issue_agent = IssueAgent(self.harness, domain_reasoner)
         self.main_agent = MainAgent(
             self.harness,
             main_reasoner,
-            message_sink=self._persist_main_message,
-            compaction_sink=self._persist_main_compaction,
+            guidance_resolver=self._guidance,
+        )
+        self.loop = AgentLoop(
+            self.harness,
+            child_agents={
+                "issues": self.issue_agent,
+                "pull_requests": self.pull_request_agent,
+                "repository": self.repository_agent,
+                "coding": self.coding,
+            },
         )
         self.classifier = ApprovalIntentClassifier(
             main_reasoner,
@@ -151,32 +154,27 @@ class GitAgentService:
         if self._active_turn_seq > 0:
             self.harness.trace.bind_turn(self._scope().session_id, self._active_turn_seq)
 
-        current = self._load_context()
+        current = self._load_context(main_messages=main_messages)
         if current is None and (
             not main_messages or main_messages[-1].get("role") != "user"
         ):
             raise RoutingError("GitAgentService requires the current Main message thread")
         if current is not None:
-            self._ensure_domain_thread_durable(current)
-            self.dispatch_started = True
-            paused_output = (
-                self._resume_child(current, user_input)
-                if not current.finished and not current.error
-                else self._after_loop(current)
-            )
-            if self._child_waiting(current):
-                self._save_context(current)
-                return self._result_for_context(current, paused_output)
-            domain_output = self._after_loop(current)
-            self._complete_parent_agent_call(main_messages, current)
-            self._clear_context()
-            return self._run_main(
-                main_messages,
-                repository,
-                main_tools,
-                child_context=current,
-                domain_output=domain_output,
-            )
+            if current.agent != "main":
+                raise RoutingError("stored Runtime root is not the Main Agent")
+            if current.finished or current.error:
+                self._clear_context()
+            else:
+                current.messages = main_messages
+                current.model_tools = main_tools
+                self.loop.validate_context_tree(current)
+                self.dispatch_started = True
+                output = self._resume_context(current, user_input)
+                if current.waiting:
+                    self._save_context(current)
+                    return self._result_for_context(current, output=output)
+                self._clear_context()
+                return self._result_for_main(current)
 
         return self._run_main(main_messages, repository, main_tools)
 
@@ -185,246 +183,81 @@ class GitAgentService:
         main_messages: list[dict[str, Any]],
         repository: str,
         main_tools: list[dict[str, Any]] | None,
-        *,
-        child_context: AgentContext | None = None,
-        domain_output: Any = None,
     ) -> ServiceResult:
         tools = main_tools or self.main_agent.provider_tools(
             session_id=self._scope().session_id,
             repository=repository,
             goal=str(main_messages[-1].get("content") or ""),
         )
-        last_child = child_context
-        last_domain_output = domain_output
-        for _ in range(20):
-            response = self.main_agent.step(
-                main_messages,
-                repository=repository,
-                scope=self._scope(),
-                tools=tools,
-            )
-            if response.call is None:
-                return ServiceResult(
-                    output=response.text,
-                    agent=last_child.agent if last_child is not None else None,
-                    goal=last_child.goal if last_child is not None else "",
-                    entity_type=last_child.entity_type if last_child is not None else None,
-                    entity_id=last_child.entity_id if last_child is not None else None,
-                    domain_output=last_domain_output,
-                    workflow_summary=(
-                        last_child.final_message if last_child is not None else ""
-                    ),
-                )
-
-            main_context = self.harness.context(
-                "main",
-                self._scope().session_id,
-                repository=repository,
-                goal=str(main_messages[-1].get("content") or ""),
-            )
-            resolved = self.harness.resolve_model_call(
-                response.call,
-                main_context,
-                agent_schemas=self.main_agent.agent_schemas(),
-            )
-            if isinstance(resolved, CapabilityCall):
-                self._execute_main_capability(main_messages, main_context, resolved)
-                continue
-            if not isinstance(resolved, AgentCall):
-                raise RoutingError("Main Agent returned an unsupported structured call")
-
-            self.dispatch_started = True
-            context, reply_mode = self._start_child(resolved, repository)
-            if (
-                reply_mode
-                and context.finished
-                and not context.error
-                and context.pending is None
-            ):
-                draft = self.issue_agent.draft_reply(context, self.reasoner)
-                context.reply_draft = draft
-                context.finished = False
-                context.result = None
-                context.final_message = ""
-                self._save_context(context)
-                return self._result_for_context(
-                    context,
-                    DraftResult(
-                        "issue",
-                        context.entity_id,
-                        "Issue 回复草稿",
-                        draft,
-                        "草稿尚未发布。你可以直接提出修改，或确认发布。",
-                    ),
-                )
-            if self._child_waiting(context):
-                self._save_context(context)
-                return self._result_for_context(context, context)
-
-            last_domain_output = self._after_loop(context)
-            self._complete_parent_agent_call(main_messages, context)
-            last_child = context
-        raise RoutingError("Main Agent exceeded the 20-step call limit")
-
-    def _execute_main_capability(
-        self,
-        main_messages: list[dict[str, Any]],
-        context: AgentContext,
-        call: CapabilityCall,
-    ) -> None:
-        capability = next(
-            (
-                item
-                for item in self.harness.discover(context)
-                if item.id == call.capability_id
-            ),
-            None,
-        )
-        if capability is None or capability.access != AccessLevel.READ:
-            raise RoutingError("Main Agent may only call visible READ capabilities")
-        result = self.harness.invoke(context, call.capability_id, call.arguments)
-        payload = (
-            result.content
-            if result.status == "success"
-            else {
-                "status": result.status,
-                "error": result.error.type.value if result.error is not None else "unknown",
-                "message": result.error.message if result.error is not None else "",
-            }
-        )
-        self._append_main_message(
-            main_messages, tool_result_message(call.call_id, payload)
-        )
-
-    def _start_child(
-        self, call: AgentCall, repository: str
-    ) -> tuple[AgentContext, bool]:
-        arguments = call.arguments
-        goal = str(arguments["task"])
-        entity_type: str | None = None
-        entity_id: str | None = None
-        reply_mode = False
-        if call.agent_id == "issues":
-            entity_type = "issue"
-            if arguments.get("issue_number") is not None:
-                entity_id = str(arguments["issue_number"])
-            reply_mode = arguments.get("mode") == "reply"
-        elif call.agent_id == "pull_requests":
-            if arguments.get("pr_number") is not None:
-                entity_type = "pull_request"
-                entity_id = str(arguments["pr_number"])
-            elif arguments.get("workflow_run_id") is not None:
-                entity_type = "workflow_run"
-                entity_id = str(arguments["workflow_run_id"])
-            else:
-                entity_type = "pull_request"
-        elif call.agent_id == "repository":
-            entity_type = "repository"
-        else:
-            raise RoutingError(f"unsupported Domain Agent: {call.agent_id}")
-
         context = self.harness.context(
-            call.agent_id,
+            "main",
             self._scope().session_id,
             repository=repository,
-            goal=goal,
-            entity_type=entity_type,
-            entity_id=entity_id,
-            guidance=self._guidance(goal, entity_type, entity_id),
+            goal=str(main_messages[-1].get("content") or ""),
         )
-        context.parent_call_id = call.call_id
-        context.parent_call_name = f"agent__{call.agent_id}"
+        context.messages = main_messages
+        context.model_tools = tools
         self._bind_context_turn(context)
-        self.loop.start(context, self._agent_for(call.agent_id))
-        return context, reply_mode
+        self.dispatch_started = True
+        self.loop.start(context, self.main_agent)
+        if context.waiting:
+            self._save_context(context)
+            return self._result_for_context(context)
+        self._clear_context()
+        return self._result_for_main(context)
 
-    def _resume_child(self, context: AgentContext, user_input: str) -> Any:
-        if context.reply_draft is not None and context.pending is None:
-            return self._continue_draft(context, user_input)
-        if context.pending is not None:
+    def _resume_context(self, context: AgentContext, user_input: str) -> Any:
+        target = self.loop.waiting_context(context)
+        if (
+            target.issue_reply is not None
+            and target.issue_reply.stage == IssueReplyStage.DRAFT
+            and bool(target.issue_reply.draft)
+            and target.user_input_request is not None
+            and target.active_child is None
+        ):
             decision = self.classifier.classify(
                 user_input=user_input,
-                proposal_context=self._context_description(context),
+                proposal_context={
+                    "workflow_type": "issue_reply_draft",
+                    "entity": {"type": "issue", "id": target.entity_id or ""},
+                    "draft": target.issue_reply.draft,
+                    "state": "reviewing_draft",
+                },
             )
-            return self._continue_approval(context, decision, user_input)
-        if context.question:
-            self.loop.resume(
-                context,
-                self._agent_for(context.agent),
-                WorkflowTurnDecision(ApprovalIntent.APPROVE, instruction=user_input),
+            self._observe_service_decision(target, decision, user_input)
+            target.issue_reply.decision = WorkflowTurnDecision(
+                decision.action,
+                instruction=decision.instruction.strip() or user_input.strip(),
+                message=decision.message,
             )
-            return self._after_loop(context)
-        raise RoutingError("stored child Agent is not resumable")
-
-    def _continue_draft(self, context: AgentContext, user_input: str) -> Any:
-        draft = str(context.reply_draft or "")
-        if not draft or context.agent != "issues":
-            raise RoutingError("current Session has no Issue reply draft")
-        decision = self.classifier.classify(
-            user_input=user_input,
-            proposal_context={
-                "workflow_type": "issue_reply_draft",
-                "entity": {"type": "issue", "id": context.entity_id or ""},
-                "draft": draft,
-                "state": "reviewing_draft",
-            },
-        )
-        self._observe_service_decision(context, decision, user_input)
-        if decision.action == ApprovalIntent.AMBIGUOUS:
-            return decision.message or "你是想发布当前草稿、继续修改，还是查看草稿内容？"
-        if decision.action == ApprovalIntent.QUESTION:
-            return DraftResult(
-                "issue", context.entity_id, "Issue 回复草稿", draft, "草稿尚未发布。"
+            self.loop.resume_user_input(context, self.main_agent, user_input)
+            return self._runtime_output(context)
+        if target.pending is not None:
+            decision = self.classifier.classify(
+                user_input=user_input,
+                proposal_context=self._context_description(target),
             )
-        if decision.action == ApprovalIntent.REJECT:
-            return DraftResult(
-                "issue",
-                context.entity_id,
-                "Issue 回复草稿",
-                draft,
-                "本次没有发布；草稿仍保留。",
-            )
-        if decision.action == ApprovalIntent.REVISE:
-            instruction = decision.instruction.strip() or user_input.strip()
-            context.reply_draft = self._revise_text(
-                context, "GitHub Issue reply draft", draft, instruction
-            )
-            return DraftResult(
-                "issue",
-                context.entity_id,
-                "Issue 回复草稿 · 已修改",
-                context.reply_draft,
-                "仍未发布。继续提修改即可；确认后再发布。",
-            )
-
-        context.append_message(
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "instruction": "Publish the approved Issue reply draft.",
-                        "issue_number": int(context.entity_id or 0),
-                        "draft": context.reply_draft,
-                    },
-                    ensure_ascii=False,
-                ),
-            }
-        )
-        context.finished = False
-        context.error = None
-        context.result = None
-        context.final_message = ""
-        self.loop.start(context, self.issue_agent)
-        return self._after_loop(context)
+            return self._continue_approval(context, target, decision, user_input)
+        if target.user_input_request is not None:
+            self.loop.resume_user_input(context, self.main_agent, user_input)
+            return self._runtime_output(context)
+        raise RoutingError("stored Agent Runtime is not resumable")
 
     def _continue_approval(
         self,
+        root: AgentContext,
         context: AgentContext,
         decision: WorkflowTurnDecision,
         user_input: str,
     ) -> Any:
         if context.pending is None:
             raise RoutingError("当前 Session 没有待审批提案")
+        if decision.action == ApprovalIntent.REVISE and not decision.instruction.strip():
+            decision = WorkflowTurnDecision(
+                decision.action,
+                instruction=user_input.strip(),
+                message=decision.message,
+            )
         if decision.action == ApprovalIntent.AMBIGUOUS:
             self._observe_service_decision(context, decision, user_input)
             return decision.message
@@ -433,47 +266,16 @@ class GitAgentService:
             return self._proposal_description(context)
 
         if (
-            context.agent == "issues"
-            and context.reply_draft is not None
-            and decision.action in {ApprovalIntent.REJECT, ApprovalIntent.REVISE}
-        ):
-            self._observe_service_decision(context, decision, user_input)
-            pending = context.pending
-            self.harness.approvals.decide(pending.approval_id, "Reject")
-            context.pending = None
-            if pending.provider_call_id:
-                context.append_tool_result(
-                    {
-                        "status": "rejected",
-                        "instruction": decision.instruction or user_input,
-                    },
-                    call_id=pending.provider_call_id,
-                )
-            if decision.action == ApprovalIntent.REVISE:
-                context.reply_draft = self._revise_text(
-                    context,
-                    "GitHub Issue reply draft",
-                    str(context.reply_draft),
-                    decision.instruction.strip() or user_input.strip(),
-                )
-            return DraftResult(
-                "issue",
-                context.entity_id,
-                "Issue 回复草稿",
-                str(context.reply_draft),
-                "发布提案已拒绝；草稿仍保留。",
-            )
-
-        if (
             context.agent == "pull_requests"
             and decision.action == ApprovalIntent.REVISE
             and len(context.pending.calls) == 1
             and context.pending.calls[0].capability_id == "github.post_review"
         ):
             self._observe_service_decision(context, decision, user_input)
-            return self._revise_pr_review(
+            self._revise_pr_review(
                 context, decision.instruction.strip() or user_input.strip()
             )
+            return self._runtime_output(root)
 
         if (
             context.agent == "repository"
@@ -486,8 +288,8 @@ class GitAgentService:
             context.code_candidate = None
             context.verification = None
 
-        self.loop.resume(context, self._agent_for(context.agent), decision)
-        return self._after_loop(context)
+        self.loop.resume(root, self.main_agent, decision)
+        return self._runtime_output(root)
 
     def _revise_pr_review(self, context: AgentContext, instruction: str) -> AgentContext:
         pending = context.pending
@@ -552,53 +354,80 @@ class GitAgentService:
             raise RoutingError(f"{artifact} revision returned empty text")
         return revised
 
-    def _complete_parent_agent_call(
-        self, main_messages: list[dict[str, Any]], context: AgentContext
-    ) -> None:
-        if not context.parent_call_id:
-            raise RoutingError("child Agent is missing its parent call correlation")
-        status = "failed" if context.error else "completed"
-        content = context.error or context.final_message
-        if not content:
-            raise RoutingError("completed child Agent returned empty final Text")
-        self._append_main_message(
-            main_messages,
-            tool_result_message(
-                context.parent_call_id,
-                {
-                    "status": status,
-                    "agent": context.agent,
-                    "content": content,
-                },
-            ),
+    def _result_for_main(self, context: AgentContext) -> ServiceResult:
+        child = context.last_completed_child
+        domain_output = self._after_loop(child) if child is not None else None
+        return ServiceResult(
+            output=context.error or context.final_message,
+            agent=child.agent if child is not None else None,
+            goal=child.goal if child is not None else "",
+            entity_type=child.entity_type if child is not None else None,
+            entity_id=child.entity_id if child is not None else None,
+            domain_output=domain_output,
+            workflow_summary=child.final_message if child is not None else "",
         )
 
     def _after_loop(self, context: AgentContext) -> Any:
-        if self._child_waiting(context):
+        if context.waiting:
             return context
         if context.error:
             return context
         return context.result if context.result is not None else context.final_message
 
     @staticmethod
-    def _child_waiting(context: AgentContext) -> bool:
-        return (
-            context.pending is not None
-            or bool(context.question)
-            or (context.reply_draft is not None and not context.finished)
+    def _domain_context(context: AgentContext) -> AgentContext | None:
+        child = context.active_child or context.last_completed_child
+        return child if child is not None and child.agent != "coding" else None
+
+    def _runtime_output(self, context: AgentContext) -> Any:
+        domain = self._domain_context(context)
+        if domain is not None:
+            return (
+                self._waiting_output(domain)
+                if domain.waiting
+                else self._after_loop(domain)
+            )
+        return context.error or context.final_message
+
+    def _waiting_output(self, context: AgentContext) -> Any:
+        if (
+            context.issue_reply is not None
+            and context.issue_reply.stage == IssueReplyStage.DRAFT
+            and context.issue_reply.draft
+        ):
+            return self._issue_reply_draft_output(context)
+        return context
+
+    @staticmethod
+    def _issue_reply_draft_output(context: AgentContext) -> DraftResult:
+        workflow = context.issue_reply
+        if workflow is None or not workflow.draft:
+            raise RoutingError("Issue reply draft is missing")
+        return DraftResult(
+            "issue",
+            context.entity_id,
+            "Issue 回复草稿",
+            workflow.draft,
+            context.waiting_question
+            or "草稿尚未发布；确认后才会创建发布审批。",
         )
 
-    def _result_for_context(self, context: AgentContext, output: Any) -> ServiceResult:
+    def _result_for_context(
+        self, context: AgentContext, *, output: Any = None
+    ) -> ServiceResult:
+        domain = self._domain_context(context)
+        if domain is None:
+            raise RoutingError("waiting Main Runtime is missing its Domain child")
+        domain_output = self._waiting_output(domain)
         return ServiceResult(
-            output=output,
-            agent=context.agent,
-            goal=context.goal,
-            entity_type=context.entity_type,
-            entity_id=context.entity_id,
-            domain_output=output,
-            workflow_summary=context.final_message,
-            clarify=bool(context.question),
-            output_agent=context.agent,
+            output=domain_output if output is None else output,
+            agent=domain.agent,
+            goal=domain.goal,
+            entity_type=domain.entity_type,
+            entity_id=domain.entity_id,
+            domain_output=domain_output,
+            workflow_summary=domain.final_message,
+            output_agent=domain.agent,
         )
 
     def memory_after_turn(self, *, turn_seq: int) -> Any:
@@ -619,30 +448,37 @@ class GitAgentService:
         return None
 
     def approve(self) -> Any:
-        context = self._require_pending_context()
+        root, context = self._require_pending_context()
         output = self._continue_approval(
-            context, WorkflowTurnDecision(ApprovalIntent.APPROVE), ""
+            root, context, WorkflowTurnDecision(ApprovalIntent.APPROVE), ""
         )
-        self._save_context(context)
+        self._store_resumed_context(root)
         return output
 
     def reject(self) -> Any:
-        context = self._require_pending_context()
+        root, context = self._require_pending_context()
         output = self._continue_approval(
-            context, WorkflowTurnDecision(ApprovalIntent.REJECT), ""
+            root, context, WorkflowTurnDecision(ApprovalIntent.REJECT), ""
         )
-        self._save_context(context)
+        self._store_resumed_context(root)
         return output
 
     def revise_proposal(self, instruction: str) -> Any:
-        context = self._require_pending_context()
+        root, context = self._require_pending_context()
         output = self._continue_approval(
+            root,
             context,
             WorkflowTurnDecision(ApprovalIntent.REVISE, instruction=instruction.strip()),
             instruction,
         )
-        self._save_context(context)
+        self._store_resumed_context(root)
         return output
+
+    def _store_resumed_context(self, context: AgentContext) -> None:
+        if context.waiting:
+            self._save_context(context)
+        else:
+            self._clear_context()
 
     def dream_memory(self) -> dict[str, tuple[str, ...]] | None:
         return self.memory_hooks.dream_now(self._scope()) if self.memory_hooks else None
@@ -673,6 +509,7 @@ class GitAgentService:
             "origin_turn_seq": context.origin_turn_seq,
             "parent_call_id": context.parent_call_id,
             "parent_call_name": context.parent_call_name,
+            "parent_call_arguments": to_plain(context.parent_call_arguments),
             "repository": context.repository,
             "goal": context.goal,
             "entity_type": context.entity_type,
@@ -681,12 +518,26 @@ class GitAgentService:
             "max_steps": context.max_steps,
             "observations": to_plain(context.observations),
             "pending": pending,
-            "question": context.question,
+            "waiting_for_user": (
+                {
+                    "question": context.user_input_request.question,
+                    "call_id": context.user_input_request.call_id,
+                }
+                if context.user_input_request is not None
+                else None
+            ),
+            "active_child": (
+                self._serialize_context(context.active_child)
+                if context.active_child is not None
+                else None
+            ),
             "final_message": context.final_message,
             "code_candidate": to_plain(context.code_candidate),
             "change_request": to_plain(context.change_request),
             "verification": to_plain(context.verification),
-            "reply_draft": context.reply_draft,
+            "issue_reply": to_plain(context.issue_reply),
+            "coding_task": to_plain(context.coding_task),
+            "coding_task_completed": context.coding_task_completed,
             "code_explanation": to_plain(context.code_explanation),
             "code_review": to_plain(context.code_review),
             "code_plan": to_plain(context.code_plan),
@@ -699,9 +550,52 @@ class GitAgentService:
             "finished": context.finished,
         }
 
-    def _restore_context(self, raw: dict[str, Any], *, repository: str) -> AgentContext:
+    def _restore_context(
+        self,
+        raw: dict[str, Any],
+        *,
+        repository: str,
+        main_messages: list[dict[str, Any]] | None = None,
+    ) -> AgentContext:
+        context = self._restore_agent_context(
+            raw,
+            repository=repository,
+            parent_agent=None,
+            main_messages=main_messages,
+        )
+        if (
+            context.finished
+            or context.error is not None
+            or context.pending is not None
+            or context.user_input_request is not None
+            or context.active_child is None
+            or not context.waiting
+        ):
+            raise RoutingError("stored Main Runtime state is not paused in a child call")
+        try:
+            self.loop.validate_context_tree(context)
+        except ValidationError as exc:
+            raise RoutingError("stored Agent child correlation is invalid") from exc
+        return context
+
+    def _restore_agent_context(
+        self,
+        raw: dict[str, Any],
+        *,
+        repository: str,
+        parent_agent: str | None,
+        main_messages: list[dict[str, Any]] | None = None,
+    ) -> AgentContext:
         agent = str(raw.get("agent") or "")
-        if agent not in {"issues", "pull_requests", "repository"}:
+        allowed = {
+            None: {"main"},
+            "main": {"issues", "pull_requests", "repository"},
+            "issues": {"coding"},
+            "pull_requests": {"coding"},
+            "repository": {"coding"},
+            "coding": set(),
+        }.get(parent_agent, set())
+        if agent not in allowed:
             raise RoutingError("stored Session agent context is invalid")
         if str(raw.get("repository") or "") != repository:
             raise RoutingError("stored child Agent belongs to a different repository")
@@ -718,28 +612,91 @@ class GitAgentService:
         context.origin_turn_seq = int(raw.get("origin_turn_seq") or 0)
         context.parent_call_id = str(raw.get("parent_call_id") or "")
         context.parent_call_name = str(raw.get("parent_call_name") or "")
-        if not context.parent_call_id or context.parent_call_name != f"agent__{agent}":
-            raise RoutingError("stored child Agent correlation is invalid")
+        context.parent_call_arguments = dict(raw.get("parent_call_arguments") or {})
         context.steps = int(raw.get("steps") or 0)
         context.observations = list(raw.get("observations") or [])
-        persisted = derive_domain_messages(
-            self._require_session_manager().event_log.iter_events(self._scope()),
-            agent=agent,
-            run_id=context.run_id,
+        events = self._require_session_manager().event_log.iter_events(self._scope())
+        persisted = (
+            list(main_messages)
+            if agent == "main" and main_messages is not None
+            else derive_main_messages(events)
+            if agent == "main"
+            else derive_domain_messages(events, agent=agent, run_id=context.run_id)
         )
-        context.messages = persisted or [
-            canonical_message(message)
-            for message in raw.get("messages", [])
-            if isinstance(message, dict)
-        ]
-        context.question = str(raw.get("question") or "")
+        if agent == "main" and main_messages is None:
+            persisted.insert(
+                0,
+                canonical_message(
+                    {
+                        "role": "system",
+                        "content": self.main_agent.current_system(
+                            repository=repository,
+                            memory_context=self._memory_context(context.goal),
+                        ),
+                    }
+                ),
+            )
+        context.messages = [canonical_message(message) for message in persisted]
+        if not context.messages:
+            raise RoutingError("stored Agent message thread is missing")
+        waiting = raw.get("waiting_for_user")
+        if isinstance(waiting, dict):
+            question = str(waiting.get("question") or "").strip()
+            if not question:
+                raise RoutingError("stored waiting-for-user request is invalid")
+            context.user_input_request = WaitForUser(
+                question,
+                str(waiting.get("call_id") or "") or None,
+            )
+            if context.user_input_request.call_id:
+                open_call = context.open_tool_call()
+                function = (open_call or {}).get("function") or {}
+                if (
+                    open_call is None
+                    or context.open_tool_call_id()
+                    != context.user_input_request.call_id
+                    or str(function.get("name") or "")
+                    != "runtime__wait_for_user"
+                ):
+                    raise RoutingError(
+                        "stored waiting-for-user call correlation is invalid"
+                    )
         context.final_message = str(raw.get("final_message") or "")
         context.code_candidate = self._restore_candidate(raw.get("code_candidate"))
         context.change_request = self._restore_change_request(raw.get("change_request"))
         context.verification = self._restore_verification(raw.get("verification"))
-        context.reply_draft = (
-            str(raw.get("reply_draft")) if raw.get("reply_draft") is not None else None
-        )
+        issue_reply = raw.get("issue_reply")
+        if isinstance(issue_reply, dict):
+            raw_decision = issue_reply.get("decision")
+            try:
+                stage = IssueReplyStage(str(issue_reply.get("stage") or ""))
+                reply_decision = (
+                    WorkflowTurnDecision(
+                        ApprovalIntent(str(raw_decision.get("action") or "")),
+                        instruction=str(raw_decision.get("instruction") or ""),
+                        message=str(raw_decision.get("message") or ""),
+                    )
+                    if isinstance(raw_decision, dict)
+                    else None
+                )
+            except ValueError as exc:
+                raise RoutingError("stored Issue reply workflow is invalid") from exc
+            context.issue_reply = IssueReplyWorkflow(
+                stage=stage,
+                draft=str(issue_reply.get("draft") or ""),
+                decision=reply_decision,
+            )
+        coding_task = raw.get("coding_task")
+        if isinstance(coding_task, dict):
+            context.coding_task = CodingTask(
+                mode=str(coding_task.get("mode") or ""),
+                task=str(coding_task.get("task") or ""),
+                evidence=dict(coding_task.get("evidence") or {}),
+                change_request=self._restore_change_request(
+                    coding_task.get("change_request")
+                ),
+            )
+        context.coding_task_completed = bool(raw.get("coding_task_completed", False))
         context.code_explanation = self._restore_explanation(raw.get("code_explanation"))
         context.code_review = self._restore_review(raw.get("code_review"))
         context.code_plan = self._restore_plan(raw.get("code_plan"))
@@ -750,6 +707,13 @@ class GitAgentService:
         context.file_reads = FileReadLedger.from_plain(raw.get("file_reads"))
         context.error = str(raw.get("error")) if raw.get("error") is not None else None
         context.finished = bool(raw.get("finished", False))
+        active_child = raw.get("active_child")
+        if isinstance(active_child, dict):
+            context.active_child = self._restore_agent_context(
+                active_child,
+                repository=repository,
+                parent_agent=agent,
+            )
         pending = raw.get("pending")
         if isinstance(pending, dict):
             calls = [
@@ -766,6 +730,19 @@ class GitAgentService:
                 calls=calls,
                 provider_call_id=str(pending.get("provider_call_id") or "") or None,
             )
+        if context.issue_reply is not None and not context.finished and not context.error:
+            if context.issue_reply.decision is not None:
+                raise RoutingError("stored Issue reply contains an unconsumed decision")
+            if (
+                context.issue_reply.stage == IssueReplyStage.DRAFT
+                and context.user_input_request is None
+            ):
+                raise RoutingError("stored Issue reply draft is not waiting for input")
+            if (
+                context.issue_reply.stage == IssueReplyStage.PUBLISH
+                and context.pending is None
+            ):
+                raise RoutingError("stored Issue reply publish stage lacks approval")
         return context
 
     def _validate_restored_mutation_plan(
@@ -812,6 +789,25 @@ class GitAgentService:
                     review,
                 ):
                     raise RoutingError("stored Issue fix plan changed")
+                return
+            if context.issue_reply is not None:
+                expected = [
+                    PlannedCapabilityCall(
+                        "github.post_comment",
+                        {
+                            "issue_number": int(context.entity_id or 0),
+                            "body": context.issue_reply.draft,
+                        },
+                    )
+                ]
+                if (
+                    context.issue_reply.stage != IssueReplyStage.PUBLISH
+                    or not context.issue_reply.draft
+                    or context.entity_id is None
+                    or not context.entity_id.isdigit()
+                    or calls != expected
+                ):
+                    raise RoutingError("stored Issue reply proposal is invalid")
                 return
             if len(calls) != 1 or calls[0].capability_id not in {
                 "github.post_comment",
@@ -979,8 +975,8 @@ class GitAgentService:
     def _proposal_description(context: AgentContext) -> str:
         if context.pending is None:
             return "当前没有待确认的提案。"
-        if context.reply_draft is not None:
-            return context.reply_draft
+        if context.issue_reply is not None and context.issue_reply.draft:
+            return context.issue_reply.draft
         candidate = context.code_candidate
         if candidate is None:
             return context.pending.summary
@@ -992,52 +988,21 @@ class GitAgentService:
             ]
         )
 
-    def _agent_for(self, name: str) -> Any:
-        try:
-            return {
-                "issues": self.issue_agent,
-                "pull_requests": self.pull_request_agent,
-                "repository": self.repository_agent,
-            }[name]
-        except KeyError as exc:
-            raise RoutingError(f"unknown Domain Agent: {name}") from exc
-
-    def _append_main_message(
-        self, messages: list[dict[str, Any]], message: dict[str, Any]
-    ) -> dict[str, Any]:
-        safe = self._persist_main_message(message)
-        messages.append(safe)
-        return safe
-
-    def _persist_main_message(self, message: dict[str, Any]) -> dict[str, Any]:
-        if self._active_turn_seq < 1:
-            raise RoutingError("Main model message requires an active Turn")
-        return self._require_session_manager().record_model_message(
-            self._scope(), message, turn_seq=self._active_turn_seq, agent="main"
-        )
-
-    def _persist_main_compaction(self, plan: MessageCompactionPlan) -> None:
-        self._require_session_manager().record_message_compaction(
-            self._scope(),
-            turn_seq=self._active_turn_seq,
-            agent="main",
-            checkpoint=plan.checkpoint,
-            retain_message_indexes=plan.retain_message_indexes,
-            tool_replacements=plan.tool_replacements,
-        )
-
-    def _persist_domain_message(
+    def _persist_agent_message(
         self, context: AgentContext, message: dict[str, Any]
     ) -> dict[str, Any]:
+        turn_seq = self._active_turn_seq or context.origin_turn_seq
+        if turn_seq < 1:
+            raise RoutingError("Agent model message requires an active Turn")
         return self._require_session_manager().record_model_message(
             self._scope(),
             message,
-            turn_seq=self._active_turn_seq or context.origin_turn_seq,
+            turn_seq=turn_seq,
             agent=context.agent,
-            run_id=context.run_id,
+            **({"run_id": context.run_id} if context.agent != "main" else {}),
         )
 
-    def _persist_domain_compaction(
+    def _persist_agent_compaction(
         self, context: AgentContext, plan: MessageCompactionPlan
     ) -> None:
         self._require_session_manager().record_message_compaction(
@@ -1047,30 +1012,8 @@ class GitAgentService:
             checkpoint=plan.checkpoint,
             retain_message_indexes=plan.retain_message_indexes,
             tool_replacements=plan.tool_replacements,
-            run_id=context.run_id,
+            **({"run_id": context.run_id} if context.agent != "main" else {}),
         )
-
-    def _ensure_domain_thread_durable(self, context: AgentContext) -> None:
-        if self._active_turn_seq < 1 or not context.messages:
-            return
-        persisted = derive_domain_messages(
-            self._require_session_manager().event_log.iter_events(self._scope()),
-            agent=context.agent,
-            run_id=context.run_id,
-        )
-        if persisted:
-            context.messages = persisted
-            return
-        context.messages = [
-            self._require_session_manager().record_model_message(
-                self._scope(),
-                message,
-                turn_seq=self._active_turn_seq,
-                agent=context.agent,
-                run_id=context.run_id,
-            )
-            for message in context.messages
-        ]
 
     def _save_context(self, context: AgentContext) -> None:
         self._require_session_manager().save_agent_context(
@@ -1080,7 +1023,9 @@ class GitAgentService:
     def _clear_context(self) -> None:
         self._require_session_manager().save_agent_context(self._scope(), None)
 
-    def _load_context(self) -> AgentContext | None:
+    def _load_context(
+        self, *, main_messages: list[dict[str, Any]] | None = None
+    ) -> AgentContext | None:
         session = self._require_session_manager().get_session(
             self._scope().account_key,
             self._scope().repository_key,
@@ -1090,23 +1035,40 @@ class GitAgentService:
             raise RoutingError("Session not found")
         context = (
             self._restore_context(
-                session.agent_context, repository=session.repository_full_name
+                session.agent_context,
+                repository=session.repository_full_name,
+                main_messages=main_messages,
             )
             if session.agent_context
             else None
         )
         if context is not None:
+            self._restore_guidance(context)
+        return context
+
+    def _restore_guidance(
+        self,
+        context: AgentContext,
+        inherited: AgentGuidance | None = None,
+    ) -> None:
+        if context.agent in {"issues", "pull_requests", "repository"}:
             context.guidance = self._guidance(
                 context.goal, context.entity_type, context.entity_id
             )
-        return context
+        elif context.agent == "coding":
+            context.guidance = inherited
+        if context.active_child is not None:
+            self._restore_guidance(context.active_child, context.guidance)
 
-    def _require_pending_context(self) -> AgentContext:
+    def _require_pending_context(self) -> tuple[AgentContext, AgentContext]:
         self._require_live()
-        context = self._load_context()
-        if context is None or context.pending is None:
+        root = self._load_context()
+        if root is None:
             raise RoutingError("当前 Session 没有待审批提案")
-        return context
+        context = self.loop.waiting_context(root)
+        if context.pending is None:
+            raise RoutingError("当前 Session 没有待审批提案")
+        return root, context
 
     @staticmethod
     def _observe_service_decision(

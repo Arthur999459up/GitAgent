@@ -57,14 +57,6 @@ class StructuredCallDispatcher:
                 "message": decision.message,
             },
         )
-        if context.question:
-            user_content = (
-                decision.instruction or decision.message or decision.action.value
-            )
-            context.append_message({"role": "user", "content": user_content})
-            context.question = ""
-            return
-
         pending = context.pending
         if pending is None:
             raise WorkflowError("agent context is not waiting for user input")
@@ -331,6 +323,18 @@ class StructuredCallDispatcher:
             raise WorkflowError(
                 "default-branch commits may only come from the verified repository mutation plan"
             )
+        if capability_id == "github.post_comment" and context.issue_reply is not None:
+            workflow = context.issue_reply
+            if context.entity_id is None or not str(context.entity_id).isdigit():
+                raise WorkflowError("Issue reply workflow is missing its Issue number")
+            expected = {
+                "issue_number": int(context.entity_id),
+                "body": workflow.draft,
+            }
+            if workflow.stage.value != "publish" or arguments != expected:
+                raise WorkflowError(
+                    "Issue reply publication must use the reviewed draft workflow"
+                )
         if capability_id == "github.post_review":
             if context.agent != "pull_requests":
                 raise WorkflowError("only PullRequestAgent may post a Review")
@@ -362,10 +366,13 @@ class StructuredCallDispatcher:
                 raise WorkflowError(
                     "PR commits require a verified CandidatePatch prepared by CodingAgent"
                 )
+            if context.change_request is None or not context.change_request.source_ref:
+                raise WorkflowError("PR commit requires the candidate head SHA")
             expected = {
                 "files": candidate.files,
                 "deleted_files": candidate.deleted_files,
                 "message": candidate.summary,
+                "expected_head_sha": context.change_request.source_ref,
             }
             if any(arguments.get(key) != value for key, value in expected.items()):
                 raise WorkflowError(

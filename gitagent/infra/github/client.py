@@ -744,17 +744,35 @@ class GitHubClient:
             raise ValidationError("pull-request state must be open or closed")
         return self._request("PATCH", f"/repos/{repository}/pulls/{pr_number}", {"state": state})
 
-    def create_branch(self, repository: str, base: str, branch: str) -> dict[str, Any]:
+    def create_branch(
+        self,
+        repository: str,
+        base: str,
+        branch: str,
+        expected_head_sha: str,
+    ) -> dict[str, Any]:
         self._require_token()
         repository = self._repository(repository)
         self._validate_branch(branch)
         base_ref = self._request("GET", f"/repos/{repository}/git/ref/heads/{urllib.parse.quote(base, safe='')}")
+        actual_head_sha = str((base_ref.get("object") or {}).get("sha") or "")
+        if not expected_head_sha.strip() or actual_head_sha != expected_head_sha.strip():
+            raise GitHubAPIError(
+                "base branch changed after the candidate was prepared",
+                status_code=409,
+                request_sent=False,
+            )
         self._request(
             "POST",
             f"/repos/{repository}/git/refs",
-            {"ref": f"refs/heads/{branch}", "sha": base_ref["object"]["sha"]},
+            {"ref": f"refs/heads/{branch}", "sha": expected_head_sha.strip()},
         )
-        return {"repository": repository, "branch": branch, "base": base}
+        return {
+            "repository": repository,
+            "branch": branch,
+            "base": base,
+            "head_sha": expected_head_sha.strip(),
+        }
 
     def commit(
         self,
@@ -763,6 +781,7 @@ class GitHubClient:
         files: dict[str, str],
         deleted_files: list[str],
         message: str,
+        expected_head_sha: str,
     ) -> dict[str, Any]:
         self._require_token()
         repository = self._repository(repository)
@@ -770,7 +789,13 @@ class GitHubClient:
         if (not files and not deleted_files) or not message.strip():
             raise ValidationError("commit requires file changes and a message")
         ref = self._request("GET", f"/repos/{repository}/git/ref/heads/{urllib.parse.quote(branch, safe='')}")
-        parent_sha = ref["object"]["sha"]
+        parent_sha = str((ref.get("object") or {}).get("sha") or "")
+        if not expected_head_sha.strip() or parent_sha != expected_head_sha.strip():
+            raise GitHubAPIError(
+                "branch changed after the candidate was prepared",
+                status_code=409,
+                request_sent=False,
+            )
         parent = self._request("GET", f"/repos/{repository}/git/commits/{parent_sha}")
         base_tree_sha = str(parent["tree"]["sha"])
         existing_entries = self._tree_entries(repository, base_tree_sha)

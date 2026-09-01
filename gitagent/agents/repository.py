@@ -8,26 +8,23 @@ from gitagent.agent_loop import (
     AgentCall,
     AgentResult,
     ModelResponse,
+    WaitForUser,
+    explicit_wait,
     rejection_feedback,
+    wait_for_user_tool,
 )
 from gitagent.domain.errors import WorkflowError
 from gitagent.domain.models import (
     AgentSpec,
-    CandidatePreparationResult,
     ChangeRequest,
-    CodeExplanationResult,
-    CodePlanResult,
-    DomainAction,
+    CodingTask,
     RepositoryOperation,
     RepositoryResult,
 )
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import AgentHarness
-from gitagent.harness.validation.static import StaticVerifier
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
-
-from .coding import CodingAgent
 
 _PROMPTS = get_prompt_library()
 _CODING_SCHEMA = {
@@ -48,7 +45,7 @@ REPOSITORY_SPEC = AgentSpec(
         "verified repository modifications."
     ),
     system_prompt=_PROMPTS.text("system.repository"),
-    output_schema=("action", "operation", "answer", "files", "symbols", "reasoning"),
+    output_schema=("operation", "answer", "files", "symbols", "reasoning"),
 )
 
 
@@ -56,20 +53,16 @@ class RepositoryAgent:
     def __init__(
         self,
         harness: AgentHarness,
-        coding: CodingAgent,
-        verifier: StaticVerifier,
         reasoner: Reasoner,
     ) -> None:
         self.harness = harness
-        self.coding = coding
-        self.verifier = verifier
         self.reasoner = reasoner
         harness.register(REPOSITORY_SPEC)
 
     def agent_schemas(self) -> dict[str, dict[str, Any]]:
         return {"coding": _CODING_SCHEMA}
 
-    def step(self, context: AgentContext) -> ModelResponse:
+    def step(self, context: AgentContext) -> ModelResponse | WaitForUser:
         feedback = rejection_feedback(context)
         if feedback is not None and not feedback:
             return self._text(
@@ -86,12 +79,16 @@ class RepositoryAgent:
                 ),
                 _CODING_SCHEMA,
             ),
+            wait_for_user_tool(),
         ]
-        return context.reason(self.reasoner, tools=tools)
+        return explicit_wait(context.reason(self.reasoner, tools=tools))
 
-    def invoke_child(
-        self, context: AgentContext, call: AgentCall
-    ) -> AgentResult:
+    def prepare_child(
+        self,
+        context: AgentContext,
+        call: AgentCall,
+        child: AgentContext,
+    ) -> None:
         if call.agent_id != "coding":
             raise WorkflowError(f"RepositoryAgent cannot call {call.agent_id}")
         mode = str(call.arguments["mode"])
@@ -103,9 +100,7 @@ class RepositoryAgent:
                 description=task,
             )
             context.change_request = request
-        result, artifact = self.coding.run_call(
-            context,
-            call_id=call.call_id,
+        child.coding_task = CodingTask(
             mode=mode,
             task=task,
             evidence={
@@ -113,28 +108,26 @@ class RepositoryAgent:
                 "changed_files": self._evidence_paths(self._evidence(context)),
             },
             change_request=request,
-            verifier=self.verifier,
         )
-        if isinstance(artifact, CandidatePreparationResult):
-            context.code_candidate = artifact.candidate
-            context.verification = artifact.verification
-            if artifact.capability_error:
-                context.observations.append(
-                    {"kind": "capability_error", "payload": artifact.capability_error}
-                )
-        elif isinstance(artifact, CodeExplanationResult):
-            context.code_explanation = artifact
-        elif isinstance(artifact, CodePlanResult):
-            context.code_plan = artifact
-        return result
 
     @staticmethod
     def after_agent_result(
         context: AgentContext,
         call: AgentCall,
         result: AgentResult,
+        child: AgentContext,
         dispatcher: Any,
     ) -> None:
+        context.change_request = child.change_request
+        context.code_candidate = child.code_candidate
+        context.verification = child.verification
+        context.code_explanation = child.code_explanation
+        context.code_plan = child.code_plan
+        context.observations.extend(
+            observation
+            for observation in child.observations
+            if observation.get("kind") == "capability_error"
+        )
         if call.arguments.get("mode") != "patch" or result.status != "completed":
             return
         if context.code_candidate is None:
@@ -158,7 +151,6 @@ class RepositoryAgent:
             )
         history = self._last_capability(context, "repository.get_file_history") or {}
         return RepositoryResult(
-            action=DomainAction.ANSWER,
             operation=operation,
             answer=context.final_message or "仓库请求已处理。",
             files=files,

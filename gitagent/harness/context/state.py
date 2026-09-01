@@ -7,6 +7,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
+from gitagent.agent_loop.models import WaitForUser
 from gitagent.capability import AccessLevel, CapabilityResult
 from gitagent.domain.errors import ValidationError
 from gitagent.domain.models import (
@@ -14,6 +15,8 @@ from gitagent.domain.models import (
     AgentSpec,
     CandidatePatch,
     ChangeRequest,
+    CodingTask,
+    IssueReplyWorkflow,
     VerificationReport,
 )
 from gitagent.harness.context.builder import fit_messages_with_plan
@@ -72,14 +75,20 @@ class AgentContext:
         self.max_steps = max_steps
         self.observations: list[dict[str, Any]] = []
         self.messages: list[dict[str, Any]] = []
+        self.model_tools: list[dict[str, Any]] | None = None
         self.pending: Any = None
-        self.question = ""
+        self.user_input_request: WaitForUser | None = None
+        self.active_child: AgentContext | None = None
+        self.last_completed_child: AgentContext | None = None
+        self.parent_call_arguments: dict[str, Any] = {}
         self.result: Any = None
         self.final_message = ""
         self.code_candidate: CandidatePatch | None = None
         self.change_request: ChangeRequest | None = None
         self.verification: VerificationReport | None = None
-        self.reply_draft: str | None = None
+        self.issue_reply: IssueReplyWorkflow | None = None
+        self.coding_task: CodingTask | None = None
+        self.coding_task_completed = False
         self.code_explanation: Any = None
         self.code_review: Any = None
         self.code_plan: Any = None
@@ -103,7 +112,19 @@ class AgentContext:
 
     @property
     def waiting(self) -> bool:
-        return self.pending is not None or bool(self.question)
+        return (
+            self.pending is not None
+            or self.user_input_request is not None
+            or (self.active_child is not None and self.active_child.waiting)
+        )
+
+    @property
+    def waiting_question(self) -> str:
+        if self.active_child is not None and self.active_child.waiting:
+            return self.active_child.waiting_question
+        if self.user_input_request is not None:
+            return self.user_input_request.question
+        return ""
 
     @property
     def context_window_tokens(self) -> int:

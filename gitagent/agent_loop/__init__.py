@@ -9,6 +9,9 @@ from .models import (
     ModelResponse,
     PendingCall,
     StructuredCall,
+    WaitForUser,
+    explicit_wait,
+    wait_for_user_tool,
 )
 
 __all__ = [
@@ -20,5 +23,8 @@ __all__ = [
     "ModelResponse",
     "PendingCall",
     "StructuredCall",
+    "WaitForUser",
+    "explicit_wait",
     "rejection_feedback",
+    "wait_for_user_tool",
 ]
