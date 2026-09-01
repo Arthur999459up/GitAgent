@@ -9,12 +9,11 @@ from .budget import (
     context_pressure,
 )
 from .builder import (
-    CompactResult,
+    CompactionResult,
     ContextBuilder,
     ContextBuildError,
     MessageCompactionPlan,
-    fit_messages,
-    fit_messages_with_plan,
+    compact_messages,
 )
 from .messages import (
     assistant_tool_call,
@@ -32,19 +31,18 @@ __all__ = [
     "EMERGENCY_THRESHOLD",
     "LIGHT_THRESHOLD",
     "SUMMARY_THRESHOLD",
-    "CompactResult",
+    "CompactionResult",
     "ContextBuildError",
     "ContextBuilder",
     "MessageCompactionPlan",
     "assistant_tool_call",
     "canonical_message",
+    "compact_messages",
     "context_pressure",
     "correlate_tool_results",
     "derive_domain_messages",
     "derive_main_messages",
     "estimate_tokens",
-    "fit_messages",
-    "fit_messages_with_plan",
     "request_tokens",
     "tool_result_message",
 ]

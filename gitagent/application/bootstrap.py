@@ -10,7 +10,7 @@ from typing import Any
 from gitagent.domain.errors import StateError, ValidationError
 from gitagent.domain.models import SessionScope
 from gitagent.harness.context import (
-    CompactResult,
+    CompactionResult,
     ContextBuilder,
     derive_main_messages,
 )
@@ -180,15 +180,15 @@ class LiveApplication:
                 turn_seq=turn.seq,
                 current_user_is_main=waiting_agent is None,
             )
-            if self.context_builder.last_compaction_changed:
-                stages = self.context_builder.last_stages
+            compaction = self.context_builder.last_compaction
+            if compaction is not None and compaction.changed:
                 self.trace.emit_auto_compaction(
                     session_id=scope.session_id,
                     agent="main",
-                    level=self.context_builder.last_compression_level,
-                    before_tokens=int(stages[0]["before_tokens"]),
-                    after_tokens=int(stages[-1]["after_tokens"]),
-                    context_window_tokens=self.context_builder.context_window_tokens,
+                    level=compaction.level,
+                    before_tokens=compaction.before_tokens,
+                    after_tokens=compaction.after_tokens,
+                    context_window_tokens=compaction.context_window_tokens,
                     turn_seq=turn.seq,
                 )
             try:
@@ -341,8 +341,23 @@ class LiveApplication:
         self._swap_service(staged)
         return replacement
 
-    def compact(self) -> CompactResult:
-        return self.context_builder.compact(self._require_scope())
+    def compact(self) -> CompactionResult:
+        scope = self._require_scope()
+        repository = self._require_repository()
+        goal = "/compact"
+        memory_context = self.memory_search.context(
+            scope.account_key, scope.repository_key, goal
+        )
+        system = self.service.main_agent.current_system(
+            repository=repository,
+            memory_context=memory_context,
+        )
+        tools = self.service.main_agent.provider_tools(
+            session_id=scope.session_id,
+            repository=repository,
+            goal=goal,
+        )
+        return self.context_builder.compact(scope, system=system, tools=tools)
 
     def set_memory_automation(self, enabled: bool) -> bool:
         if not isinstance(enabled, bool):

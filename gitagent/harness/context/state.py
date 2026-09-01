@@ -19,7 +19,7 @@ from gitagent.domain.models import (
     IssueReplyWorkflow,
     VerificationReport,
 )
-from gitagent.harness.context.builder import fit_messages_with_plan
+from gitagent.harness.context.builder import compact_messages
 from gitagent.harness.context.messages import (
     assistant_tool_call,
     canonical_message,
@@ -398,26 +398,26 @@ class AgentContext:
     ) -> list[dict[str, Any]]:
         self.start_message_thread()
         request = self._ephemeral_messages()
-        fitted, level, stages, plan = fit_messages_with_plan(
+        result = compact_messages(
             request,
             tools,
             context_window_tokens=self.context_window_tokens,
         )
-        if plan.changed:
+        if result.changed:
             sink = self._harness.compaction_sink
             if sink is not None and self.origin_turn_seq > 0:
                 sink(
                     self,
-                    plan,
-                    level,
-                    int(stages[0]["before_tokens"]),
-                    int(stages[-1]["after_tokens"]),
+                    result.plan,
+                    result.level,
+                    result.before_tokens,
+                    result.after_tokens,
                 )
-            durable = [dict(message) for message in fitted]
+            durable = [dict(message) for message in result.messages]
             if durable and durable[0].get("role") == "system":
                 durable[0] = {"role": "system", "content": self.system_prompt}
             self.messages[:] = durable
-        return fitted
+        return result.messages
 
     def reason(
         self,

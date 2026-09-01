@@ -44,9 +44,9 @@ from gitagent.domain.models import (
 from gitagent.harness.context import (
     MessageCompactionPlan,
     canonical_message,
+    compact_messages,
     derive_domain_messages,
     derive_main_messages,
-    fit_messages,
 )
 from gitagent.harness.context.state import AgentContext, CapabilityCallRecord
 from gitagent.harness.execution import AgentHarness
@@ -346,9 +346,9 @@ class GitAgentService:
                 ),
             },
         ]
-        messages, _, _ = fit_messages(
+        messages = compact_messages(
             messages, None, context_window_tokens=context.context_window_tokens
-        )
+        ).messages
         revised = self.reasoner.complete_text_messages(
             messages=messages,
             context_window_tokens=context.context_window_tokens,

@@ -26,15 +26,6 @@ class ContextBuildError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class CompactResult:
-    changed: bool
-    level: str
-    before_tokens: int
-    after_tokens: int
-    context_window_tokens: int
-
-
-@dataclass(frozen=True)
 class MessageCompactionPlan:
     """Durable delta needed to replay one model-visible compaction exactly."""
 
@@ -49,6 +40,23 @@ class MessageCompactionPlan:
             or self.checkpoint
             or self.retain_message_indexes is not None
         )
+
+
+@dataclass(frozen=True)
+class CompactionResult:
+    """Canonical context-pressure result shared by every compaction caller."""
+
+    messages: list[dict[str, Any]]
+    level: str
+    stages: tuple[dict[str, Any], ...]
+    plan: MessageCompactionPlan
+    before_tokens: int
+    after_tokens: int
+    context_window_tokens: int
+
+    @property
+    def changed(self) -> bool:
+        return self.plan.changed
 
 
 @dataclass(frozen=True)
@@ -71,9 +79,7 @@ class ContextBuilder:
         self.context_window_tokens = _integer(
             context_window_tokens, "context_window_tokens", positive=True
         )
-        self.last_compression_level = "none"
-        self.last_stages: tuple[dict[str, Any], ...] = ()
-        self.last_compaction_changed = False
+        self.last_compaction: CompactionResult | None = None
 
     def build(
         self,
@@ -140,12 +146,12 @@ class ContextBuilder:
                     "current user message differs from durable Main history"
                 )
         messages = [canonical_message({"role": "system", "content": system}), *history]
-        fitted, level, stages, plan = fit_messages_with_plan(
+        result = compact_messages(
             messages,
             tools,
             context_window_tokens=self.context_window_tokens,
         )
-        if plan.changed:
+        if result.changed:
             if not isinstance(turn_seq, int) or isinstance(turn_seq, bool) or turn_seq < 1:
                 raise ContextBuildError(
                     "durable Main compaction requires the current Turn sequence"
@@ -154,92 +160,69 @@ class ContextBuilder:
                 scope,
                 turn_seq=turn_seq,
                 agent="main",
-                checkpoint=plan.checkpoint,
-                retain_message_indexes=plan.retain_message_indexes,
-                tool_replacements=plan.tool_replacements,
+                checkpoint=result.plan.checkpoint,
+                retain_message_indexes=result.plan.retain_message_indexes,
+                tool_replacements=result.plan.tool_replacements,
             )
-        self.last_compression_level = level
-        self.last_stages = tuple(stages)
-        self.last_compaction_changed = plan.changed
-        return fitted, tools or None
+        self.last_compaction = result
+        return result.messages, tools or None
 
-    def compact(self, scope: SessionScope) -> CompactResult:
+    def compact(
+        self,
+        scope: SessionScope,
+        *,
+        system: str,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> CompactionResult:
         """Persist a context-pressure-derived Main checkpoint."""
 
+        if not isinstance(scope, SessionScope):
+            raise TypeError("scope must be a SessionScope")
+        if not isinstance(system, str) or not system.strip():
+            raise ContextBuildError("current system message cannot be empty")
         session = self.session_manager.get_session(
             scope.account_key, scope.repository_key, scope.session_id
         )
         if session is None:
             raise ContextBuildError("session not found in the requested scope")
         events = tuple(self.session_manager.event_log.iter_events(scope))
-        history = derive_main_messages(events, legacy_checkpoint=session.summary)
-        before = request_tokens(history)
-        spans = _atomic_spans(history)
-        if len(spans) < 2:
-            return CompactResult(
-                changed=False,
-                level="none",
-                before_tokens=before,
-                after_tokens=before,
-                context_window_tokens=self.context_window_tokens,
+        projected_events = events
+        legacy_checkpoint = session.summary
+        if legacy_checkpoint:
+            projected_events = tuple(
+                event
+                for event in events
+                if event.turn_seq is None or event.turn_seq > session.summary_through_seq
             )
-        prefix_end = spans[-1][0]
-        summary = _checkpoint_content(history[:prefix_end])
-        if not summary:
-            return CompactResult(
-                changed=False,
-                level="none",
-                before_tokens=before,
-                after_tokens=before,
-                context_window_tokens=self.context_window_tokens,
-            )
-        self.session_manager.event_log.append(
-            scope,
-            "compaction_checkpoint",
-            agent="main",
-            data={"content": summary, "retain_from_message": prefix_end},
+        history = derive_main_messages(
+            projected_events,
+            legacy_checkpoint=legacy_checkpoint,
         )
-        replayed = derive_main_messages(
-            self.session_manager.event_log.iter_events(scope)
-        )
-        after = request_tokens(replayed)
-        return CompactResult(
-            changed=True,
-            level="summary",
-            before_tokens=before,
-            after_tokens=after,
+        result = compact_messages(
+            [canonical_message({"role": "system", "content": system}), *history],
+            tools,
             context_window_tokens=self.context_window_tokens,
         )
+        if result.changed:
+            self.session_manager.record_message_compaction(
+                scope,
+                turn_seq=None,
+                agent="main",
+                checkpoint=result.plan.checkpoint,
+                retain_message_indexes=result.plan.retain_message_indexes,
+                tool_replacements=result.plan.tool_replacements,
+            )
+        self.last_compaction = result
+        return result
 
 
-def fit_messages(
+def compact_messages(
     messages: Sequence[Mapping[str, Any]],
     tools: Sequence[Mapping[str, Any]] | None,
     *,
     context_window_tokens: int,
-) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
-    """Apply pressure policy and return the exact provider request."""
-
-    fitted, level, stages, _ = fit_messages_with_plan(
-        messages,
-        tools,
-        context_window_tokens=context_window_tokens,
-    )
-    return fitted, level, stages
-
-
-def fit_messages_with_plan(
-    messages: Sequence[Mapping[str, Any]],
-    tools: Sequence[Mapping[str, Any]] | None,
-    *,
-    context_window_tokens: int,
-) -> tuple[
-    list[dict[str, Any]],
-    str,
-    list[dict[str, Any]],
-    MessageCompactionPlan,
-]:
-    """Apply pressure policy and describe the durable replay delta."""
+) -> CompactionResult:
+    """Apply the canonical light -> summary -> emergency pressure policy."""
 
     canonical = [canonical_message(message) for message in messages]
     _validate_tool_protocol(canonical)
@@ -310,7 +293,15 @@ def fit_messages_with_plan(
         checkpoint=projected.checkpoint,
         retain_message_indexes=projected.retain_message_indexes,
     )
-    return current, level, stages, plan
+    return CompactionResult(
+        messages=current,
+        level=level,
+        stages=tuple(stages),
+        plan=plan,
+        before_tokens=initial,
+        after_tokens=final_input_tokens,
+        context_window_tokens=context_window_tokens,
+    )
 
 
 def _light_compact(
@@ -571,10 +562,9 @@ def _integer(value: Any, label: str, *, positive: bool = False) -> int:
 
 
 __all__ = [
-    "CompactResult",
+    "CompactionResult",
     "ContextBuildError",
     "ContextBuilder",
     "MessageCompactionPlan",
-    "fit_messages",
-    "fit_messages_with_plan",
+    "compact_messages",
 ]

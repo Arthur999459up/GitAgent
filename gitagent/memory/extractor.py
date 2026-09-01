@@ -8,7 +8,7 @@ from typing import Any
 
 from gitagent.domain.errors import ContextWindowExceeded, ValidationError
 from gitagent.domain.models import SessionScope
-from gitagent.harness.context import fit_messages
+from gitagent.harness.context import compact_messages
 from gitagent.infra.persistence import SessionManager
 from gitagent.model import Reasoner, structured_tools
 from gitagent.prompts import get_prompt_library
@@ -205,11 +205,11 @@ class MemoryExtractor:
                 },
             ]
             try:
-                messages, _, _ = fit_messages(
+                messages = compact_messages(
                     messages,
                     final_tools,
                     context_window_tokens=self.context_window_tokens,
-                )
+                ).messages
                 break
             except ContextWindowExceeded:
                 removable = next(

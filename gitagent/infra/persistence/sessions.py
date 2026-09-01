@@ -472,7 +472,7 @@ class SessionManager:
         self,
         scope: SessionScope,
         *,
-        turn_seq: int,
+        turn_seq: int | None,
         agent: str,
         checkpoint: str = "",
         retain_message_indexes: Sequence[int] | None = None,
@@ -482,7 +482,8 @@ class SessionManager:
         """Persist the deterministic delta that produced a compacted provider thread."""
 
         _validate_session_scope(scope)
-        _require_positive_integer(turn_seq, "Turn sequence")
+        if turn_seq is not None:
+            _require_positive_integer(turn_seq, "Turn sequence")
         safe_agent = _require_string(agent, "agent", allow_empty=False)
         data: dict[str, Any] = {}
         if checkpoint:

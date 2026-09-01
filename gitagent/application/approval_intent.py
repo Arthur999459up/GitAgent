@@ -7,7 +7,7 @@ from typing import Any
 
 from gitagent.domain.errors import LLMProviderError, ValidationError
 from gitagent.domain.models import ApprovalIntent, WorkflowTurnDecision
-from gitagent.harness.context import fit_messages
+from gitagent.harness.context import compact_messages
 from gitagent.model import Reasoner, structured_tools
 from gitagent.prompts import get_prompt_library
 
@@ -70,11 +70,11 @@ class ApprovalIntentClassifier:
         final_tools = structured_tools(
             "classify_approval_intent", _APPROVAL_SCHEMA
         )
-        messages, _, _ = fit_messages(
+        messages = compact_messages(
             messages,
             final_tools,
             context_window_tokens=self.context_window_tokens,
-        )
+        ).messages
         try:
             value = self.reasoner.complete_structured_messages(
                 messages=messages,
