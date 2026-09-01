@@ -140,6 +140,9 @@ class TerminalUI:
         hides successful completion echoes, task ids, long agent messages and raw
         argument JSON; `/trace` renders the complete history when needed.
         """
+        if event.category == TraceCategory.WORKFLOW and event.name == "auto_compact":
+            self._auto_compaction(event)
+            return
         if event.category == TraceCategory.WORKFLOW and event.name in _MEMORY_WORKFLOWS:
             self._memory_status(event)
             return
@@ -184,6 +187,63 @@ class TerminalUI:
             line.append(f"  {_single_line(event.message, 140)}", style=status_style)
 
         self.console.print(line)
+
+    def _auto_compaction(self, event: TraceEvent) -> None:
+        details = event.details
+        self.compaction(
+            automatic=True,
+            agent=str(details.get("agent") or ""),
+            level=str(details.get("level") or "none"),
+            before_tokens=int(details.get("before_tokens") or 0),
+            after_tokens=int(details.get("after_tokens") or 0),
+            context_window_tokens=int(details.get("context_window_tokens") or 0),
+        )
+
+    def compaction(
+        self,
+        *,
+        automatic: bool,
+        agent: str,
+        level: str,
+        before_tokens: int,
+        after_tokens: int,
+        context_window_tokens: int,
+    ) -> None:
+        """Render manual and automatic compaction with one canonical layout."""
+
+        agent_name = _AGENT_NAMES.get(
+            agent,
+            (agent or "Agent").replace("_", " ").title(),
+        )
+        reduced = before_tokens - after_tokens
+        before_percent = (
+            before_tokens / context_window_tokens * 100
+            if context_window_tokens
+            else 0.0
+        )
+        after_percent = (
+            after_tokens / context_window_tokens * 100 if context_window_tokens else 0.0
+        )
+        reduced_percent = reduced / before_tokens * 100 if before_tokens else 0.0
+        trigger = "Auto" if automatic else "Manual"
+        self.console.print(
+            Text(
+                "\n".join(
+                    [
+                        f"{trigger} compact · {agent_name} · {level}",
+                        (
+                            f"Before: {before_tokens:,} / {context_window_tokens:,} "
+                            f"tokens ({before_percent:.1f}%)"
+                        ),
+                        (
+                            f"After:  {after_tokens:,} / {context_window_tokens:,} "
+                            f"tokens ({after_percent:.1f}%)"
+                        ),
+                        f"Reduced: {reduced:,} tokens ({reduced_percent:.1f}%)",
+                    ]
+                )
+            )
+        )
 
     def _memory_status(self, event: TraceEvent) -> None:
         if event.status not in {
@@ -255,7 +315,15 @@ class TerminalUI:
                 else event.timestamp
             )
             label = _TRACE_LABELS[event.category][0]
-            title = f"{index:03d} · {timestamp} · {label} · {event.name} · {event.status.value}"
+            phase = ""
+            if event.category == TraceCategory.CAPABILITY:
+                capability_phase = str(event.details.get("event") or "")
+                if capability_phase:
+                    phase = f" · {capability_phase}"
+            title = (
+                f"{index:03d} · {timestamp} · {label} · {event.name} · "
+                f"{event.status.value}{phase}"
+            )
             self.console.print(
                 Panel(
                     Syntax(
@@ -317,6 +385,9 @@ def _debug_payload(event: TraceEvent) -> dict[str, Any]:
         return payload
     if event.category == TraceCategory.CAPABILITY:
         payload["agent"] = details.get("agent")
+        for key in ("event", "call_id", "run_id", "attempt", "attempts", "status"):
+            if key in details:
+                payload[key] = details[key]
         payload["arguments"] = details.get(
             "debug_arguments", details.get("arguments", {})
         )

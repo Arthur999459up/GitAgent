@@ -29,7 +29,11 @@ from gitagent.domain.models import (
 )
 from gitagent.domain.reviews import canonical_review_event
 from gitagent.harness.context.state import AgentContext
-from gitagent.harness.execution import AgentHarness
+from gitagent.harness.execution import (
+    AgentHarness,
+    ExecutionProfile,
+    ResourceClaims,
+)
 from gitagent.harness.file_access import safe_repository_path
 from gitagent.model import Reasoner, structured_tools
 from gitagent.prompts import get_prompt_library
@@ -179,6 +183,8 @@ CODING_SPEC = AgentSpec(
     ),
     system_prompt=_PROMPTS.text("system.coding"),
     output_schema=(),
+    agent_depth=2,
+    execution_profile=ExecutionProfile.exclusive(),
 )
 
 
@@ -201,9 +207,11 @@ class CodingAgent:
         if task is None:
             raise WorkflowError("Coding context is missing its typed task")
         if not context.coding_task_completed:
-            artifact = self._run_task(context, task)
-            self._store_artifact(context, task.mode, artifact)
-            context.coding_task_completed = True
+            claims = ResourceClaims(write=(f"workspace:{context.repository}",))
+            with self.harness.coordinator.claim_resources(claims):
+                artifact = self._run_task(context, task)
+                self._store_artifact(context, task.mode, artifact)
+                context.coding_task_completed = True
         if self.reasoner is None:
             raise WorkflowError("Coding Agent calls require a configured reasoner")
         return explicit_wait(
@@ -551,7 +559,6 @@ class CodingAgent:
         prompt: str,
         schema: dict[str, Any],
         tool_name: str,
-        max_steps: int = 8,
     ) -> dict[str, Any]:
         """Allow bounded read-only tool use before one typed Coding result."""
 
@@ -567,13 +574,13 @@ class CodingAgent:
             and capability.input_schema is not None
         }
         final_tools = structured_tools(tool_name, schema, tools)
-        for _ in range(max_steps):
+        for _ in range(context.max_steps):
             response = context.reason(self.reasoner, tools=final_tools)
-            call = response.call
-            if call is None:
+            if len(response.calls) != 1:
                 raise WorkflowError(
-                    f"CodingAgent must call {tool_name} or one read-only Capability"
+                    f"CodingAgent must make exactly one {tool_name} or read-only Capability call"
                 )
+            call = response.calls[0]
             if call.name == tool_name:
                 validate_schema(call.arguments, schema, label=f"{tool_name} result")
                 context.append_tool_result(
@@ -599,25 +606,28 @@ class CodingAgent:
                 self._invoke_capability(
                     context,
                     capability_id,
+                    call_id=call.call_id,
                     **dict(resolved.arguments),
                 )
             except _CodingCapabilityFailure:
                 continue
-        raise WorkflowError(f"CodingAgent exceeded the {max_steps}-step evidence limit")
+        raise WorkflowError(
+            f"CodingAgent exceeded the {context.max_steps}-step evidence limit"
+        )
 
     @staticmethod
     def _invoke_capability(
-        context: AgentContext, capability_id: str, **arguments: Any
+        context: AgentContext,
+        capability_id: str,
+        *,
+        call_id: str,
+        **arguments: Any,
     ) -> Any:
-        context.ensure_capability_tool_call(capability_id, arguments)
-        content = context.invoke(capability_id, **arguments)
-        call = context.last_capability_call
-        if call is None:
-            raise WorkflowError(
-                "Coding capability invocation did not record its result"
-            )
-        if call.result.status == "failed":
-            error = call.result.error
+        record = context.invoke(
+            capability_id, call_id=call_id, **arguments
+        )
+        if record.result.status == "failed":
+            error = record.result.error
             if error is None:
                 raise WorkflowError(
                     "Coding capability failed without a structured error"
@@ -625,50 +635,51 @@ class CodingAgent:
             context.append_tool_result(
                 {
                     "status": "failed",
-                    "capability_id": call.result.capability_id,
+                    "capability_id": record.result.capability_id,
                     "error": error.type.value,
                     "message": error.message,
-                }
+                },
+                call_id=call_id,
             )
             context.observations.append(
                 {
                     "kind": "capability_error",
                     "payload": {
-                        "capability_id": call.result.capability_id,
+                        "capability_id": record.result.capability_id,
                         "arguments": dict(arguments),
                         "error": error.type.value,
                         "message": error.message,
                         "details": error.details,
-                        "attempts": call.result.attempts,
+                        "attempts": record.result.attempts,
                     },
                 }
             )
             raise _CodingCapabilityFailure(
                 {
-                    "capability_id": call.result.capability_id,
+                    "capability_id": record.result.capability_id,
                     "arguments": dict(arguments),
                     "error": error.type.value,
                     "message": error.message,
                     "details": error.details,
-                    "attempts": call.result.attempts,
+                    "attempts": record.result.attempts,
                 }
             )
-        if call.result.status != "success":
+        if record.result.status != "success":
             raise WorkflowError(
-                f"Coding capability returned unsupported status: {call.result.status}"
+                f"Coding capability returned unsupported status: {record.result.status}"
             )
-        context.append_tool_result(call.observation_data)
+        context.append_tool_result(record.observation_data, call_id=call_id)
         context.observations.append(
             {
                 "kind": "capability",
                 "payload": {
                     "capability_id": capability_id,
                     "arguments": dict(arguments),
-                    "data": call.observation_data,
+                    "data": record.observation_data,
                 },
             }
         )
-        return content
+        return record.result.content
 
     def _create(
         self,
@@ -934,7 +945,6 @@ class CodingAgent:
             ),
             schema=_EVIDENCE_READY_SCHEMA,
             tool_name="record_repair_evidence",
-            max_steps=6,
         )
         evidence = self._capability_evidence(context)
         writable_operations = [

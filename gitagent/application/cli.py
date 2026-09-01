@@ -33,7 +33,6 @@ from gitagent.domain.models import (
     VerificationReport,
     to_plain,
 )
-from gitagent.harness.context import CompactResult
 from gitagent.harness.context.state import AgentContext
 from gitagent.infra.persistence import SessionRecord
 
@@ -490,7 +489,18 @@ def _run_command(application: LiveApplication, request: str) -> None:
             console.print("[yellow]用法：/compact[/yellow]")
             return
         try:
-            _show_compaction(application.compact())
+            result = application.compact()
+            if not result.changed:
+                console.print("[dim]当前没有可压缩的旧 Context。[/dim]")
+                return
+            ui.compaction(
+                automatic=False,
+                agent="main",
+                level=result.level,
+                before_tokens=result.before_tokens,
+                after_tokens=result.after_tokens,
+                context_window_tokens=result.context_window_tokens,
+            )
         except (GitAgentError, ValueError) as exc:
             console.print(f"[red]Context 压缩失败：{exc}[/red]")
     elif command == "/remember":
@@ -820,16 +830,6 @@ def _show_session_safety_note() -> None:
     console.print(
         "[dim]后续请求只载入当前 Session 的历史，以及当前账号/仓库作用域的 Memory；"
         "运行时审批 ID 不跨 Service 复用。[/dim]"
-    )
-
-
-def _show_compaction(result: CompactResult) -> None:
-    if not result.changed:
-        console.print("[dim]当前没有可压缩的旧 Context。[/dim]")
-        return
-    console.print(
-        f"已压缩 Turn [cyan]{result.covered_from_seq}–{result.covered_to_seq}[/cyan]；"
-        f"摘要估算 token：{result.before_tokens} → {result.after_tokens}"
     )
 
 

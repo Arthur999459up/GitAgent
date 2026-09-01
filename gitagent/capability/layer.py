@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 import uuid
+from threading import Lock, RLock
 from typing import Any
 
 from gitagent.domain.errors import ValidationError
@@ -35,6 +35,7 @@ class FailureGuard:
 
     def __init__(self) -> None:
         self._failed_calls: dict[str, dict[tuple[str, str], CapabilityErrorType]] = {}
+        self._lock = Lock()
 
     @staticmethod
     def call_identity(agent_id: str, capability_id: str, arguments: dict[str, Any]) -> tuple[str, str]:
@@ -46,7 +47,8 @@ class FailureGuard:
         run_id: str,
         identity: tuple[str, str],
     ) -> bool:
-        return identity in self._failed_calls.get(run_id, {})
+        with self._lock:
+            return identity in self._failed_calls.get(run_id, {})
 
     def record(
         self,
@@ -54,15 +56,17 @@ class FailureGuard:
         identity: tuple[str, str],
         error_type: CapabilityErrorType,
     ) -> None:
-        self._failed_calls.setdefault(run_id, {})[identity] = error_type
+        with self._lock:
+            self._failed_calls.setdefault(run_id, {})[identity] = error_type
 
     def clear(self, run_id: str, identity: tuple[str, str]) -> None:
-        failures = self._failed_calls.get(run_id)
-        if failures is None:
-            return
-        failures.pop(identity, None)
-        if not failures:
-            self._failed_calls.pop(run_id, None)
+        with self._lock:
+            failures = self._failed_calls.get(run_id)
+            if failures is None:
+                return
+            failures.pop(identity, None)
+            if not failures:
+                self._failed_calls.pop(run_id, None)
 
 
 class CapabilityLayer:
@@ -80,63 +84,67 @@ class CapabilityLayer:
         self.failure_guard = failure_guard or FailureGuard()
         self._providers: dict[str, Any] = {}
         self._provider_sources: dict[str, set[str]] = {}
+        self._control_lock = RLock()
 
     def add_provider(self, provider: Any) -> None:
         provider_id = str(provider.id)
-        if provider_id in self._providers:
-            raise ValidationError(f"duplicate capability provider: {provider_id}")
-        self._providers[provider_id] = provider
+        with self._control_lock:
+            if provider_id in self._providers:
+                raise ValidationError(f"duplicate capability provider: {provider_id}")
+            self._providers[provider_id] = provider
 
     def load(self) -> None:
-        snapshots = {
-            provider_id: provider.load()
-            for provider_id, provider in self._providers.items()
-        }
+        with self._control_lock:
+            providers = tuple(self._providers.items())
+        snapshots = {provider_id: provider.load() for provider_id, provider in providers}
         owners: dict[str, str] = {}
         for provider_id, registrations in snapshots.items():
             for source_id in {item.capability.source_id for item in registrations}:
                 if source_id in owners:
                     raise ValidationError(f"multiple providers attempted to load source: {source_id}")
                 owners[source_id] = provider_id
-        for provider_id, registrations in snapshots.items():
-            sources = {item.capability.source_id for item in registrations}
-            for source_id in self._provider_sources.get(provider_id, set()) | sources:
-                self.registry.replace_source(
-                    source_id,
-                    [item for item in registrations if item.capability.source_id == source_id],
-                )
-            self._provider_sources[provider_id] = sources
+        with self._control_lock:
+            for provider_id, registrations in snapshots.items():
+                sources = {item.capability.source_id for item in registrations}
+                for source_id in self._provider_sources.get(provider_id, set()) | sources:
+                    self.registry.replace_source(
+                        source_id,
+                        [item for item in registrations if item.capability.source_id == source_id],
+                    )
+                self._provider_sources[provider_id] = sources
         self.policy.validate_capabilities(self.registry.list())
 
     def refresh(self, provider_id: str | None = None) -> None:
-        providers = (
-            self._providers.items()
-            if provider_id is None
-            else ((provider_id, self._providers[provider_id]),)
-        )
+        with self._control_lock:
+            providers = tuple(
+                self._providers.items()
+                if provider_id is None
+                else ((provider_id, self._providers[provider_id]),)
+            )
         for current_provider_id, provider in providers:
             if hasattr(provider, "refresh"):
                 provider.refresh()
             registrations = provider.load()
             current_sources = {item.capability.source_id for item in registrations}
-            other_sources = {
-                source
-                for owner, sources in self._provider_sources.items()
-                if owner != current_provider_id
-                for source in sources
-            }
-            overlap = current_sources & other_sources
-            if overlap:
-                raise ValidationError(
-                    f"multiple providers attempted to load source: {min(overlap)}"
-                )
-            all_sources = self._provider_sources.get(current_provider_id, set()) | current_sources
-            for source_id in all_sources:
-                self.registry.replace_source(
-                    source_id,
-                    [item for item in registrations if item.capability.source_id == source_id],
-                )
-            self._provider_sources[current_provider_id] = current_sources
+            with self._control_lock:
+                other_sources = {
+                    source
+                    for owner, sources in self._provider_sources.items()
+                    if owner != current_provider_id
+                    for source in sources
+                }
+                overlap = current_sources & other_sources
+                if overlap:
+                    raise ValidationError(
+                        f"multiple providers attempted to load source: {min(overlap)}"
+                    )
+                all_sources = self._provider_sources.get(current_provider_id, set()) | current_sources
+                for source_id in all_sources:
+                    self.registry.replace_source(
+                        source_id,
+                        [item for item in registrations if item.capability.source_id == source_id],
+                    )
+                self._provider_sources[current_provider_id] = current_sources
         self.policy.validate_capabilities(self.registry.list())
 
     def discover(self, context: InvocationContext) -> tuple[Capability, ...]:
@@ -146,15 +154,68 @@ class CapabilityLayer:
             if capability.status == CapabilityStatus.AVAILABLE and self.policy.can_discover(capability, context)
         )
 
+    def permission_decision(
+        self,
+        capability_id: str,
+        arguments: dict[str, Any],
+        context: InvocationContext,
+    ) -> str:
+        """Perform the no-side-effect permission portion of Coordinator preflight."""
+
+        registration = self.registry.resolve(capability_id)
+        if registration is None:
+            return PermissionDecision.DENY.value
+        capability = registration.capability
+        if capability.status != CapabilityStatus.AVAILABLE:
+            return PermissionDecision.DENY.value
+        if capability.input_schema is not None:
+            validate_schema(
+                arguments,
+                capability.input_schema,
+                label=f"{capability_id} arguments",
+            )
+        return self.policy.authorize(capability, arguments, context).decision.value
+
+    def describe_execution(
+        self,
+        capability_id: str,
+        arguments: dict[str, Any],
+        context: InvocationContext,
+    ) -> Any:
+        """Ask the bound provider for per-invocation scheduling semantics."""
+
+        from gitagent.harness.execution import ConcurrencyMode, ExecutionProfile
+
+        registration = self.registry.resolve(capability_id)
+        if registration is None:
+            return ExecutionProfile.unknown(repository=context.repository)
+        with self._control_lock:
+            provider = self._providers.get(registration.binding.provider_id)
+        describe = getattr(provider, "describe_execution", None)
+        if not callable(describe):
+            return ExecutionProfile.unknown(repository=context.repository)
+        try:
+            profile = describe(registration.binding, dict(arguments), context)
+        except Exception:  # noqa: BLE001 - classification failures must fail closed
+            return ExecutionProfile.unknown(repository=context.repository)
+        if (
+            not isinstance(profile, ExecutionProfile)
+            or profile.concurrency_mode == ConcurrencyMode.UNKNOWN
+        ):
+            return ExecutionProfile.unknown(repository=context.repository)
+        return profile
+
     def invoke(
         self,
         capability_id: str,
         arguments: dict[str, Any],
         context: InvocationContext,
+        *,
+        preflighted: bool = False,
     ) -> CapabilityResult:
         if not isinstance(arguments, dict):
             raise CapabilityInternalError("CapabilityLayer.invoke arguments must be a dict")
-        call_id = f"call-{uuid.uuid4().hex}"
+        call_id = context.call_id or f"call-{uuid.uuid4().hex}"
         identity = self.failure_guard.call_identity(context.agent_id, capability_id, arguments)
         self._emit(
             context,
@@ -163,17 +224,19 @@ class CapabilityLayer:
             "call.started",
             {"argument_keys": sorted(arguments), **_trace_arguments(capability_id, arguments)},
         )
-        if self.failure_guard.blocked(context.run_id, identity):
+        if not preflighted and self.failure_guard.blocked(context.run_id, identity):
             error = capability_error(
                 CapabilityErrorType.REPEATED_FAILURE,
                 "相同 Capability 和参数在本次运行中已经失败",
             )
-            return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0, record=False)
+            return self._finish_failure(
+                context, call_id, capability_id, error, attempts=0
+            )
 
         registration = self.registry.resolve(capability_id)
         if registration is None:
             error = capability_error(CapabilityErrorType.CAPABILITY_NOT_FOUND, f"Capability 不存在：{capability_id}")
-            return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0)
+            return self._finish_failure(context, call_id, capability_id, error, attempts=0)
         capability = registration.capability
         if capability.status != CapabilityStatus.AVAILABLE:
             unavailable_reason = str(
@@ -183,19 +246,19 @@ class CapabilityLayer:
             if unavailable_reason:
                 message += f"（{unavailable_reason}）"
             error = capability_error(CapabilityErrorType.UNAVAILABLE, message)
-            return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0)
+            return self._finish_failure(context, call_id, capability_id, error, attempts=0)
 
         try:
             if capability.input_schema is not None:
                 validate_schema(arguments, capability.input_schema, label=f"{capability_id} arguments")
         except ValidationError as exc:
             error = capability_error(CapabilityErrorType.INVALID_INPUT, str(exc))
-            return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0)
+            return self._finish_failure(context, call_id, capability_id, error, attempts=0)
 
         authorization = self.policy.authorize(capability, arguments, context)
         if authorization.decision == PermissionDecision.DENY:
             error = capability_error(CapabilityErrorType.PERMISSION_DENIED, authorization.reason)
-            return self._finish_failure(context, call_id, capability_id, identity, error, attempts=0)
+            return self._finish_failure(context, call_id, capability_id, error, attempts=0)
         if authorization.decision == PermissionDecision.ASK:
             result = CapabilityResult(capability_id, "approval_required", "none", attempts=0)
             self._emit(
@@ -207,7 +270,8 @@ class CapabilityLayer:
             )
             return result
 
-        provider = self._providers.get(registration.binding.provider_id)
+        with self._control_lock:
+            provider = self._providers.get(registration.binding.provider_id)
         if provider is None:
             raise CapabilityInternalError(f"provider is not loaded: {registration.binding.provider_id}")
         mutation = capability.access in {AccessLevel.WRITE, AccessLevel.DESTRUCTIVE}
@@ -242,7 +306,6 @@ class CapabilityLayer:
                                 context,
                                 call_id,
                                 capability_id,
-                                identity,
                                 recovery_error,
                                 attempts=attempts,
                             )
@@ -256,7 +319,6 @@ class CapabilityLayer:
                                 context,
                                 call_id,
                                 capability_id,
-                                identity,
                                 missing,
                                 attempts=attempts,
                             )
@@ -265,7 +327,9 @@ class CapabilityLayer:
                     if error.type == CapabilityErrorType.RATE_LIMITED and isinstance(retry_after, int | float):
                         time.sleep(float(retry_after))
                     continue
-                return self._finish_failure(context, call_id, capability_id, identity, error, attempts=attempts)
+                return self._finish_failure(
+                    context, call_id, capability_id, error, attempts=attempts
+                )
             self._emit(context, call_id, capability_id, "attempt.succeeded", {"attempt": attempts})
             try:
                 if capability.output_schema is not None:
@@ -299,13 +363,11 @@ class CapabilityLayer:
                     context,
                     call_id,
                     capability_id,
-                    identity,
                     error,
                     attempts=attempts,
                 )
             if attempts > 1:
                 self._emit(context, call_id, capability_id, "recovery.succeeded", {"attempt": attempts})
-            self.failure_guard.clear(context.run_id, identity)
             result_type = {
                 "native_tool": "data",
                 "mcp_tool": "data",
@@ -327,6 +389,33 @@ class CapabilityLayer:
             return result
         raise CapabilityInternalError("capability recovery loop exceeded its invariant")
 
+    def commit_failure_guard(
+        self,
+        capability_id: str,
+        arguments: dict[str, Any],
+        context: InvocationContext,
+        result: CapabilityResult,
+    ) -> None:
+        """Apply FailureGuard state only from the ordered commit path."""
+
+        identity = self.failure_guard.call_identity(
+            context.agent_id, capability_id, arguments
+        )
+        if result.status == "success":
+            self.failure_guard.clear(context.run_id, identity)
+            return
+        error = result.error
+        if (
+            result.status == "failed"
+            and error is not None
+            and error.type
+            not in {
+                CapabilityErrorType.REPEATED_FAILURE,
+                CapabilityErrorType.DUPLICATE_CALL,
+            }
+        ):
+            self.failure_guard.record(context.run_id, identity, error.type)
+
     @staticmethod
     def _recoverable(error: CapabilityError, access: AccessLevel) -> bool:
         if access != AccessLevel.READ:
@@ -343,14 +432,10 @@ class CapabilityLayer:
         context: InvocationContext,
         call_id: str,
         capability_id: str,
-        identity: tuple[str, str],
         error: CapabilityError,
         *,
         attempts: int,
-        record: bool = True,
     ) -> CapabilityResult:
-        if record:
-            self.failure_guard.record(context.run_id, identity, error.type)
         result = CapabilityResult(capability_id, "failed", "none", error=error, attempts=attempts)
         self._emit(
             context,
@@ -387,7 +472,7 @@ def _trace_content(
         hits = value.get("hits") if isinstance(value.get("hits"), list) else []
         return {
             "knowledge_base": value.get("knowledge_base") or capability_id.split(".", 1)[1],
-            "query_sha256": _query_hash(arguments),
+            "query_characters": len(str(arguments.get("query") or "")),
             "status": "STALE" if value.get("stale") else "READY",
             "stale": bool(value.get("stale")),
             "hit_count": len(hits),
@@ -417,12 +502,5 @@ def _trace_content(
 def _trace_arguments(capability_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if capability_id.startswith("rag."):
         query = str(arguments.get("query") or "")
-        return {
-            "query_sha256": _query_hash(arguments),
-            "query_characters": len(query),
-        }
+        return {"query_characters": len(query)}
     return {"arguments": arguments}
-
-
-def _query_hash(arguments: dict[str, Any]) -> str:
-    return hashlib.sha256(str(arguments.get("query") or "").encode("utf-8")).hexdigest()

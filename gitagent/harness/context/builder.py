@@ -28,12 +28,10 @@ class ContextBuildError(RuntimeError):
 @dataclass(frozen=True)
 class CompactResult:
     changed: bool
+    level: str
     before_tokens: int
     after_tokens: int
-    covered_from_seq: int | None
-    covered_to_seq: int | None
-    summary_through_seq: int
-    summary: str = ""
+    context_window_tokens: int
 
 
 @dataclass(frozen=True)
@@ -75,6 +73,7 @@ class ContextBuilder:
         )
         self.last_compression_level = "none"
         self.last_stages: tuple[dict[str, Any], ...] = ()
+        self.last_compaction_changed = False
 
     def build(
         self,
@@ -161,6 +160,7 @@ class ContextBuilder:
             )
         self.last_compression_level = level
         self.last_stages = tuple(stages)
+        self.last_compaction_changed = plan.changed
         return fitted, tools or None
 
     def compact(self, scope: SessionScope) -> CompactResult:
@@ -176,20 +176,40 @@ class ContextBuilder:
         before = request_tokens(history)
         spans = _atomic_spans(history)
         if len(spans) < 2:
-            return CompactResult(False, before, before, None, None, 0, "")
+            return CompactResult(
+                changed=False,
+                level="none",
+                before_tokens=before,
+                after_tokens=before,
+                context_window_tokens=self.context_window_tokens,
+            )
         prefix_end = spans[-1][0]
         summary = _checkpoint_content(history[:prefix_end])
         if not summary:
-            return CompactResult(False, before, before, None, None, 0, "")
+            return CompactResult(
+                changed=False,
+                level="none",
+                before_tokens=before,
+                after_tokens=before,
+                context_window_tokens=self.context_window_tokens,
+            )
         self.session_manager.event_log.append(
             scope,
             "compaction_checkpoint",
             agent="main",
             data={"content": summary, "retain_from_message": prefix_end},
         )
-        replayed = derive_main_messages(self.session_manager.event_log.iter_events(scope))
+        replayed = derive_main_messages(
+            self.session_manager.event_log.iter_events(scope)
+        )
         after = request_tokens(replayed)
-        return CompactResult(True, before, after, None, None, 0, summary)
+        return CompactResult(
+            changed=True,
+            level="summary",
+            before_tokens=before,
+            after_tokens=after,
+            context_window_tokens=self.context_window_tokens,
+        )
 
 
 def fit_messages(

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any, Protocol
 
 from gitagent.domain.errors import (
@@ -111,6 +112,7 @@ class OpenAIChatClient:
         self.timeout = timeout
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self._usage_lock = Lock()
 
     @property
     def estimated_cost(self) -> None:
@@ -146,7 +148,7 @@ class OpenAIChatClient:
             "messages": outbound_messages,
             "temperature": self.temperature,
             "max_tokens": actual_max_output_tokens,
-            "parallel_tool_calls": False,
+            "parallel_tool_calls": True,
         }
         if tools:
             params["tools"] = tools
@@ -162,8 +164,9 @@ class OpenAIChatClient:
         reasoning_content = _reasoning_content(message)
         calls = _tool_calls(getattr(message, "tool_calls", None))
         prompt_tokens, completion_tokens = _usage_tokens(getattr(raw, "usage", None))
-        self.total_prompt_tokens += prompt_tokens
-        self.total_completion_tokens += completion_tokens
+        with self._usage_lock:
+            self.total_prompt_tokens += prompt_tokens
+            self.total_completion_tokens += completion_tokens
         if on_token and content:
             on_token(content)
         return ChatResponse(

@@ -16,7 +16,7 @@ from gitagent.domain.models import (
     VerificationReport,
 )
 from gitagent.harness.context.state import AgentContext
-from gitagent.harness.execution import AgentHarness
+from gitagent.harness.execution import AgentHarness, ExecutionProfile
 from gitagent.harness.file_access import safe_repository_path
 
 VERIFICATION_SPEC = AgentSpec(
@@ -24,6 +24,8 @@ VERIFICATION_SPEC = AgentSpec(
     role="Run syntax, lint, and static analysis only on candidate files.",
     system_prompt="Deterministic verifier; no model interaction.",
     output_schema=("passed", "checks", "skipped", "attempts"),
+    agent_depth=0,
+    execution_profile=ExecutionProfile.unknown(),
 )
 
 

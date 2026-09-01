@@ -23,7 +23,7 @@ class ModelResponse:
     """One native model response before the Agent gives it runtime meaning."""
 
     text: str
-    call: StructuredCall | None
+    calls: list[StructuredCall]
     assistant_message: dict[str, Any]
 
 
@@ -86,9 +86,16 @@ def wait_for_user_tool() -> dict[str, Any]:
 def explicit_wait(response: ModelResponse) -> ModelResponse | WaitForUser:
     """Translate only the dedicated Runtime call into a waiting step result."""
 
-    call = response.call
-    if call is None or call.name != "runtime__wait_for_user":
+    waiting = [
+        call for call in response.calls if call.name == "runtime__wait_for_user"
+    ]
+    if not waiting:
         return response
+    if len(response.calls) != 1:
+        raise StructuredOutputError(
+            "runtime__wait_for_user must be the only structured call in a response"
+        )
+    call = waiting[0]
     question = call.arguments.get("question")
     if not isinstance(question, str) or not question.strip():
         raise StructuredOutputError(

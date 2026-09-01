@@ -110,6 +110,23 @@ class NativeProvider:
             raise TypeError("native binding target is invalid")
         return definition.handler(arguments, context)
 
+    @staticmethod
+    def describe_execution(
+        binding: CapabilityBinding,
+        arguments: dict[str, Any],
+        context: InvocationContext,
+    ) -> Any:
+        del arguments
+        from gitagent.harness.execution import ExecutionProfile
+
+        definition = binding.target
+        if not isinstance(definition, NativeToolDefinition):
+            return ExecutionProfile.unknown(repository=context.repository)
+        if definition.access == AccessLevel.READ:
+            return ExecutionProfile.concurrent()
+        scope = context.repository.strip() or "<unscoped>"
+        return ExecutionProfile.exclusive(write=(f"workspace:{scope}",))
+
     def _build_definitions(self) -> tuple[NativeToolDefinition, ...]:
         object_output = {"type": "object"}
         return (

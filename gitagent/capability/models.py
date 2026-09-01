@@ -58,6 +58,7 @@ class InvocationContext:
     agent_id: str
     repository: str = ""
     approval_id: str | None = None
+    call_id: str | None = None
 
 
 @dataclass(frozen=True)

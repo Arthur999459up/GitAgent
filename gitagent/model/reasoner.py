@@ -70,26 +70,20 @@ class LLMReasoner:
             tools=tools,
             context_window_tokens=context_window_tokens,
         )
-        if len(response.tool_calls) > 1:
-            raise StructuredOutputError(
-                "model must call at most one function per agent step",
-                expected_tool_calls=1,
-                actual_tool_calls=len(response.tool_calls),
-            )
-        call = None
-        if response.tool_calls:
-            provider_call = response.tool_calls[0]
-            call = StructuredCall(
+        calls = [
+            StructuredCall(
                 provider_call.id,
                 provider_call.name,
                 dict(provider_call.arguments),
             )
+            for provider_call in response.tool_calls
+        ]
         text = response.content
-        if call is None and not text.strip():
+        if not calls and not text.strip():
             raise StructuredOutputError(
                 "model returned neither Text nor a structured call"
             )
-        return ModelResponse(text, call, response.message)
+        return ModelResponse(text, calls, response.message)
 
     def complete_structured_messages(
         self,
@@ -119,8 +113,8 @@ class LLMReasoner:
         schema: dict[str, Any] | None,
         tool_name: str,
     ) -> dict[str, Any]:
-        if response.call is not None:
-            call = response.call
+        if len(response.calls) == 1:
+            call = response.calls[0]
             arguments = call.arguments
             if isinstance(arguments, dict):
                 if call.name == tool_name:
@@ -131,6 +125,12 @@ class LLMReasoner:
                     expected_tool=tool_name,
                     actual_tool=call.name or "<unnamed>",
                 )
+        if len(response.calls) > 1:
+            raise StructuredOutputError(
+                "typed structured output requires exactly one function call",
+                expected_tool_calls=1,
+                actual_tool_calls=len(response.calls),
+            )
         raise StructuredOutputError(
             "model returned Text where a typed structured result was required",
             expected_tool=tool_name,

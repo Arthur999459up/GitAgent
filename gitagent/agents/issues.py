@@ -28,7 +28,7 @@ from gitagent.domain.models import (
     WorkflowTurnDecision,
 )
 from gitagent.harness.context.state import AgentContext
-from gitagent.harness.execution import AgentHarness
+from gitagent.harness.execution import AgentHarness, ExecutionProfile
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
 
@@ -56,6 +56,8 @@ ISSUE_AGENT_SPEC = AgentSpec(
         "issues",
         "issue_number",
     ),
+    agent_depth=1,
+    execution_profile=ExecutionProfile.concurrent(),
 )
 
 
@@ -207,7 +209,7 @@ class IssueAgent:
             )
             return ModelResponse(
                 f"Publish the reviewed reply to Issue #{context.entity_id}.",
-                call,
+                [call],
                 context.messages[-1],
             )
         response = context.reason(
@@ -218,7 +220,7 @@ class IssueAgent:
             ],
         )
         explicit = explicit_wait(response)
-        if isinstance(explicit, WaitForUser) or response.call is not None:
+        if isinstance(explicit, WaitForUser) or response.calls:
             return explicit
         workflow.draft = self.draft_reply(context, self.reasoner)
         return WaitForUser(
@@ -324,7 +326,7 @@ class IssueAgent:
     @staticmethod
     def _text(context: AgentContext, content: str) -> ModelResponse:
         message = context.append_message({"role": "assistant", "content": content})
-        return ModelResponse(content, None, message)
+        return ModelResponse(content, [], message)
 
     @staticmethod
     def _change_request(

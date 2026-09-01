@@ -125,6 +125,25 @@ class MCPProvider:
                 exc, mutation=definition.access != AccessLevel.READ
             )
 
+    @staticmethod
+    def describe_execution(
+        binding: CapabilityBinding,
+        arguments: dict[str, Any],
+        context: InvocationContext,
+    ) -> Any:
+        del arguments
+        from gitagent.harness.execution import ExecutionProfile
+
+        definition = binding.target
+        if not isinstance(definition, MCPToolDefinition):
+            return ExecutionProfile.unknown(repository=context.repository)
+        if definition.access != AccessLevel.READ:
+            scope = context.repository.strip() or "<unscoped>"
+            return ExecutionProfile.exclusive(write=(f"repo:{scope}",))
+        if definition.server_id in {"github", "context7"}:
+            return ExecutionProfile.concurrent()
+        return ExecutionProfile.unknown(repository=context.repository)
+
     def reconnect(self, binding: CapabilityBinding) -> None:
         definition = binding.target
         if not isinstance(definition, MCPToolDefinition):

@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from gitagent.domain.errors import StateError, ValidationError
 from gitagent.domain.models import SessionScope
-from gitagent.harness.context import CompactResult, ContextBuilder
+from gitagent.harness.context import (
+    CompactResult,
+    ContextBuilder,
+    derive_main_messages,
+)
 from gitagent.infra.github import GitHubClient
 from gitagent.infra.observability import TraceBus
 from gitagent.infra.persistence import (
@@ -146,7 +150,12 @@ class LiveApplication:
         if not text:
             raise ValidationError("request cannot be empty")
         stored_context = self._session().agent_context
-        waiting_agent = _waiting_child_agent(stored_context)
+        waiting_agent = _waiting_child_agent(
+            stored_context,
+            main_messages=derive_main_messages(
+                self.sessions.event_log.iter_events(scope)
+            ),
+        )
         turn = self.sessions.start_turn(scope, text, agent=waiting_agent)
         dispatch_started = False
         rendered = False
@@ -171,6 +180,17 @@ class LiveApplication:
                 turn_seq=turn.seq,
                 current_user_is_main=waiting_agent is None,
             )
+            if self.context_builder.last_compaction_changed:
+                stages = self.context_builder.last_stages
+                self.trace.emit_auto_compaction(
+                    session_id=scope.session_id,
+                    agent="main",
+                    level=self.context_builder.last_compression_level,
+                    before_tokens=int(stages[0]["before_tokens"]),
+                    after_tokens=int(stages[-1]["after_tokens"]),
+                    context_window_tokens=self.context_builder.context_window_tokens,
+                    turn_seq=turn.seq,
+                )
             try:
                 result = self.service.handle(
                     text,
@@ -448,6 +468,7 @@ class LiveApplication:
             trace=self.trace,
             session_scope=scope,
             context_window_tokens=self.config.context_window_tokens,
+            execution=asdict(self.config.execution),
         )
 
     def _swap_service(self, service: GitAgentService) -> None:
@@ -501,20 +522,47 @@ class LiveApplication:
             pass
 
 
-def _waiting_child_agent(context: Mapping[str, Any]) -> str | None:
+def _waiting_child_agent(
+    context: Mapping[str, Any],
+    *,
+    main_messages: list[dict[str, Any]] | None = None,
+) -> str | None:
     """Return the owner of a paused user turn without interpreting its semantics."""
 
     agent = str(context.get("agent") or "")
     if agent == "main":
-        child = context.get("active_child")
-        return _waiting_child_agent(child) if isinstance(child, Mapping) else None
+        children = context.get("active_children")
+        if not isinstance(children, Mapping):
+            return None
+        ordered_children = []
+        if main_messages is not None:
+            resolved = {
+                str(message.get("tool_call_id") or "")
+                for message in main_messages
+                if message.get("role") == "tool"
+            }
+            ordered_children = [
+                children[call_id]
+                for message in main_messages
+                if message.get("role") == "assistant"
+                for call in message.get("tool_calls") or []
+                for call_id in [str(call.get("id") or "")]
+                if call_id not in resolved and call_id in children
+            ]
+        if not ordered_children:
+            ordered_children = list(children.values())
+        for child in ordered_children:
+            waiting = _waiting_child_agent(child) if isinstance(child, Mapping) else None
+            if waiting is not None:
+                return waiting
+        return None
     if agent not in {"issues", "pull_requests", "repository"}:
         return None
     if bool(context.get("finished")) or context.get("error") is not None:
         return None
     if context.get("pending") is not None or context.get("waiting_for_user") is not None:
         return agent
-    if context.get("active_child") is not None or context.get("issue_reply") is not None:
+    if context.get("active_children") or context.get("issue_reply") is not None:
         return agent
     return None
 
@@ -601,6 +649,7 @@ def build_live_application(config: RuntimeConfig) -> LiveApplication:
         memory_hooks=memory_hooks,
         trace=trace,
         context_window_tokens=config.context_window_tokens,
+        execution=asdict(config.execution),
     )
     return LiveApplication(
         config=config,

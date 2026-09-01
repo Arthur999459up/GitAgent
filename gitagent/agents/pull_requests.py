@@ -27,7 +27,7 @@ from gitagent.domain.models import (
 )
 from gitagent.domain.reviews import effective_review_events
 from gitagent.harness.context.state import AgentContext
-from gitagent.harness.execution import AgentHarness
+from gitagent.harness.execution import AgentHarness, ExecutionProfile
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
 
@@ -76,6 +76,8 @@ PULL_REQUEST_AGENT_SPEC = AgentSpec(
         "merge_readiness",
         "execution_result",
     ),
+    agent_depth=1,
+    execution_profile=ExecutionProfile.concurrent(),
 )
 
 
@@ -253,7 +255,7 @@ class PullRequestAgent:
     @staticmethod
     def _text(context: AgentContext, content: str) -> ModelResponse:
         message = context.append_message({"role": "assistant", "content": content})
-        return ModelResponse(content, None, message)
+        return ModelResponse(content, [], message)
 
     def _assess_merge_readiness(
         self, context: AgentContext, review: CodeReviewResult

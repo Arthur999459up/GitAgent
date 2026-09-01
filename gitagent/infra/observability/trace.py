@@ -105,6 +105,34 @@ class TraceBus:
                 continue
         return event
 
+    def emit_auto_compaction(
+        self,
+        *,
+        session_id: str,
+        agent: str,
+        level: str,
+        before_tokens: int,
+        after_tokens: int,
+        context_window_tokens: int,
+        turn_seq: int | None = None,
+    ) -> TraceEvent:
+        """Emit the one normalized event used for automatic compact visibility."""
+
+        return self.emit(
+            session_id=session_id,
+            category=TraceCategory.WORKFLOW,
+            name="auto_compact",
+            status=TraceStatus.COMPLETED,
+            details={
+                "agent": agent,
+                "level": level,
+                "before_tokens": before_tokens,
+                "after_tokens": after_tokens,
+                "context_window_tokens": context_window_tokens,
+            },
+            turn_seq=turn_seq,
+        )
+
     def events(self, session_id: str | None = None) -> list[TraceEvent]:
         with self._lock:
             events = list(self._events)

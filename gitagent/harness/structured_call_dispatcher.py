@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from gitagent.agent_loop.models import CapabilityCall, PendingCall
+from gitagent.capability import CapabilityResult
+from gitagent.capability.errors import CapabilityErrorType, capability_error
 from gitagent.domain.errors import ValidationError, WorkflowError
 from gitagent.domain.models import (
     ApprovalIntent,
@@ -87,13 +89,11 @@ class StructuredCallDispatcher:
                 {"role": "user", "content": decision.instruction.strip()}
             )
 
-    def handle_capability(
+    def preflight_capability(
         self,
         context: Any,
         call: CapabilityCall,
-        *,
-        summary: str = "",
-    ) -> bool:
+    ) -> Any | None:
         arguments = dict(call.arguments)
         self.validate_protected_capability(context, call.capability_id, arguments)
         self._validate_open_call(context, call)
@@ -106,35 +106,42 @@ class StructuredCallDispatcher:
             and previous_payload.get("arguments") == arguments
         ):
             already_corrected = previous_payload.get("error") == "duplicate_call"
-            duplicate = {
-                "status": "failed",
-                "capability_id": call.capability_id,
-                "error": "duplicate_call",
-                "message": "The identical capability call was just attempted; choose another call.",
-            }
-            context.append_tool_result(duplicate, call_id=call.call_id)
-            self.observe(
-                context,
-                "capability_error",
-                {
-                    "capability_id": call.capability_id,
-                    "arguments": arguments,
-                    "error": "duplicate_call",
-                    "message": duplicate["message"],
-                    "details": {},
-                    "attempts": 0,
-                },
-            )
             if already_corrected:
                 raise WorkflowError(
                     "agent repeated an identical capability call after correction"
                 )
-            return True
+            error = capability_error(
+                CapabilityErrorType.DUPLICATE_CALL,
+                "The identical capability call was just attempted; choose another call.",
+            )
+            from gitagent.harness.context.state import CapabilityCallRecord
 
-        context.invoke(call.capability_id, **arguments)
-        invocation = context.last_capability_call
-        if invocation is None:
-            raise WorkflowError("capability invocation did not record its result")
+            return CapabilityCallRecord(
+                call.call_id,
+                arguments,
+                None,
+                CapabilityResult(
+                    call.capability_id,
+                    "failed",
+                    "none",
+                    error=error,
+                    attempts=0,
+                ),
+            )
+        return None
+
+    def commit_capability(
+        self,
+        context: Any,
+        call: CapabilityCall,
+        invocation: Any,
+        *,
+        summary: str = "",
+    ) -> str:
+        arguments = dict(call.arguments)
+        if invocation.call_id != call.call_id:
+            raise ValidationError("Capability result call_id correlation is invalid")
+        invocation = context.commit_capability_call(invocation)
         if invocation.result.status == "approval_required":
             self.queue(
                 context,
@@ -142,7 +149,7 @@ class StructuredCallDispatcher:
                 [PlannedCapabilityCall(call.capability_id, arguments)],
                 provider_call_id=call.call_id,
             )
-            return False
+            return "waiting"
         if invocation.result.status == "failed":
             error = invocation.result.error
             payload = {
@@ -164,7 +171,7 @@ class StructuredCallDispatcher:
                     "attempts": invocation.result.attempts,
                 },
             )
-            return True
+            return "failed"
 
         payload = {
             "capability_id": call.capability_id,
@@ -177,7 +184,7 @@ class StructuredCallDispatcher:
             payload["covered"] = True
         self.observe(context, "capability", payload)
         context.append_tool_result(invocation.observation_data, call_id=call.call_id)
-        return True
+        return "continue"
 
     def queue_issue_fix(self, context: Any) -> None:
         if context.code_candidate is None or context.change_request is None:
@@ -249,16 +256,12 @@ class StructuredCallDispatcher:
                     call.capability_id, call.arguments
                 )
             )
-            result = context.invoke_approved(
+            invocation = context.invoke_approved(
                 call.capability_id,
                 call.arguments,
                 approval_id=pending.approval_id,
+                call_id=call_id,
             )
-            invocation = context.last_capability_call
-            if invocation is None:
-                raise WorkflowError(
-                    "approved capability invocation did not record its result"
-                )
             if invocation.result.status != "success":
                 error = invocation.result.error
                 if error is None:
@@ -294,15 +297,15 @@ class StructuredCallDispatcher:
                 {
                     "capability_id": call.capability_id,
                     "arguments": dict(call.arguments),
-                    "data": result,
+                    "data": invocation.observation_data,
                 },
             )
-            context.append_tool_result(result, call_id=call_id)
+            context.append_tool_result(invocation.observation_data, call_id=call_id)
         if not self.harness.approvals.complete(pending.approval_id):
             raise WorkflowError("approved mutation plan was not fully consumed")
 
     def _validate_open_call(self, context: Any, call: CapabilityCall) -> None:
-        open_call = context.open_tool_call()
+        open_call = context.unresolved_tool_call(call.call_id)
         if open_call is None:
             raise ValidationError("structured Capability call is missing its assistant message")
         function = open_call.get("function") or {}

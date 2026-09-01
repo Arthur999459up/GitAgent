@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from gitagent.agent_loop.models import WaitForUser
@@ -25,7 +25,7 @@ from gitagent.harness.context.messages import (
     canonical_message,
     tool_result_message,
 )
-from gitagent.harness.file_reads import FileReadLedger
+from gitagent.harness.file_reads import FileReadLedger, PreparedFileRead
 from gitagent.prompts import get_prompt_library
 
 if TYPE_CHECKING:
@@ -36,11 +36,24 @@ _PROMPTS = get_prompt_library()
 
 @dataclass(frozen=True)
 class CapabilityCallRecord:
+    call_id: str
     arguments: dict[str, Any]
     observation_data: Any
     result: CapabilityResult
     cached: bool = False
     covered: bool = False
+    execution_arguments: dict[str, Any] | None = None
+    prepared_file_read: PreparedFileRead | None = None
+
+
+@dataclass(frozen=True)
+class _PreparedCapabilityInvocation:
+    call_id: str
+    capability_id: str
+    arguments: dict[str, Any]
+    execution_arguments: dict[str, Any] | None
+    file_read: PreparedFileRead | None
+    cached_result: dict[str, Any] | None
 
 
 class AgentContext:
@@ -57,7 +70,7 @@ class AgentContext:
         entity_type: str | None = None,
         entity_id: str | None = None,
         guidance: AgentGuidance | None = None,
-        max_steps: int = 20,
+        max_steps: int,
     ) -> None:
         self._harness = harness
         self.spec = spec
@@ -78,7 +91,7 @@ class AgentContext:
         self.model_tools: list[dict[str, Any]] | None = None
         self.pending: Any = None
         self.user_input_request: WaitForUser | None = None
-        self.active_child: AgentContext | None = None
+        self.active_children: dict[str, AgentContext] = {}
         self.last_completed_child: AgentContext | None = None
         self.parent_call_arguments: dict[str, Any] = {}
         self.result: Any = None
@@ -98,7 +111,7 @@ class AgentContext:
         self.read_cache: dict[str, Any] = {}
         self._ephemeral_memory_reads: list[dict[str, str]] = []
         self.file_reads = FileReadLedger()
-        self.last_capability_call: CapabilityCallRecord | None = None
+        self.uncommitted_capability_results: dict[str, CapabilityCallRecord] = {}
         self.error: str | None = None
         self.finished = False
 
@@ -115,13 +128,14 @@ class AgentContext:
         return (
             self.pending is not None
             or self.user_input_request is not None
-            or (self.active_child is not None and self.active_child.waiting)
+            or any(child.waiting for child in self.active_children.values())
         )
 
     @property
     def waiting_question(self) -> str:
-        if self.active_child is not None and self.active_child.waiting:
-            return self.active_child.waiting_question
+        child = self.first_waiting_child()
+        if child is not None:
+            return child.waiting_question
         if self.user_input_request is not None:
             return self.user_input_request.question
         return ""
@@ -130,10 +144,29 @@ class AgentContext:
     def context_window_tokens(self) -> int:
         return self._harness.context_window_for(self.agent)
 
-    def invoke(self, capability_id: str, **arguments: Any) -> Any:
-        """Invoke without approval; model-authored arguments can never supply approval authority."""
+    def first_waiting_child(self) -> AgentContext | None:
+        for provider_call in self.open_tool_calls():
+            child = self.active_children.get(str(provider_call.get("id") or ""))
+            if child is not None and child.waiting:
+                return child
+        return next(
+            (child for child in self.active_children.values() if child.waiting),
+            None,
+        )
 
-        return self._invoke(capability_id, arguments, approval_id=None)
+    def invoke(
+        self,
+        capability_id: str,
+        *,
+        call_id: str,
+        **arguments: Any,
+    ) -> CapabilityCallRecord:
+        """Invoke one explicitly correlated call without approval authority."""
+
+        prepared = self.prepare_capability_call(call_id, capability_id, arguments)
+        return self._harness.execute_capability_invocation(
+            self, prepared, approval_id=None
+        )
 
     def invoke_approved(
         self,
@@ -141,19 +174,25 @@ class AgentContext:
         arguments: dict[str, Any],
         *,
         approval_id: str,
-    ) -> Any:
+        call_id: str,
+    ) -> CapabilityCallRecord:
         """Invoke one exact Harness-owned call after an explicit approval decision."""
 
-        return self._invoke(capability_id, dict(arguments), approval_id=approval_id)
+        prepared = self.prepare_capability_call(
+            call_id, capability_id, dict(arguments)
+        )
+        return self._harness.execute_capability_invocation(
+            self, prepared, approval_id=approval_id
+        )
 
-    def _invoke(
+    def prepare_capability_call(
         self,
+        call_id: str,
         capability_id: str,
         arguments: dict[str, Any],
-        *,
-        approval_id: str | None,
-    ) -> Any:
-        self.last_capability_call = None
+    ) -> _PreparedCapabilityInvocation:
+        if not call_id:
+            raise ValidationError("Capability invocation requires an explicit call_id")
         try:
             prepared = self.file_reads.prepare(
                 capability_id,
@@ -165,25 +204,19 @@ class AgentContext:
         actual_arguments = (
             prepared.actual_arguments if prepared is not None else dict(arguments)
         )
-        if actual_arguments is None:
-            content, observation_data = self.file_reads.complete(prepared, None)
-            result = CapabilityResult(
-                capability_id, "success", "data", content, attempts=0
-            )
-            self.last_capability_call = CapabilityCallRecord(
-                dict(arguments), observation_data, result, cached=True, covered=True
-            )
-            return content
-
         capability = next(
             (item for item in self._harness.discover(self) if item.id == capability_id),
             None,
         )
-        cache_key = json.dumps(
-            [capability_id, actual_arguments],
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+        cache_key = (
+            json.dumps(
+                [capability_id, actual_arguments],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if actual_arguments is not None
+            else None
         )
         cacheable = (
             capability is not None
@@ -191,32 +224,76 @@ class AgentContext:
             and prepared is None
             and not _memory_read(capability_id, actual_arguments)
         )
-        cached = cacheable and cache_key in self.read_cache
-        if cached:
-            cached_result = self.read_cache[cache_key]
-            raw_result = cached_result["content"]
+        cached_result = self.read_cache.get(cache_key) if cacheable else None
+        return _PreparedCapabilityInvocation(
+            call_id,
+            capability_id,
+            dict(arguments),
+            actual_arguments,
+            prepared,
+            dict(cached_result) if cached_result is not None else None,
+        )
+
+    def execute_capability_call(
+        self,
+        prepared: _PreparedCapabilityInvocation,
+        *,
+        approval_id: str | None = None,
+        preflighted: bool = False,
+    ) -> CapabilityCallRecord:
+        actual_arguments = prepared.execution_arguments
+        cached = prepared.cached_result is not None
+        covered = actual_arguments is None
+        if covered:
             invocation_result = CapabilityResult(
-                capability_id,
+                prepared.capability_id, "success", "data", None, attempts=0
+            )
+        elif cached:
+            invocation_result = CapabilityResult(
+                prepared.capability_id,
                 "success",
-                str(cached_result["type"]),
-                raw_result,
+                str(prepared.cached_result["type"]),
+                prepared.cached_result["content"],
                 attempts=0,
             )
         else:
             invocation_result = self._harness.invoke(
-                self, capability_id, actual_arguments, approval_id=approval_id
+                self,
+                prepared.capability_id,
+                actual_arguments,
+                approval_id=approval_id,
+                call_id=prepared.call_id,
+                preflighted=preflighted,
             )
-            raw_result = invocation_result.content
-            if cacheable and invocation_result.status == "success":
-                self.read_cache[cache_key] = {
-                    "type": invocation_result.type,
-                    "content": raw_result,
-                }
+        return CapabilityCallRecord(
+            prepared.call_id,
+            prepared.arguments,
+            invocation_result.content if invocation_result.status == "success" else None,
+            invocation_result,
+            cached=cached or covered,
+            covered=covered or bool(
+                prepared.file_read and prepared.file_read.covered_indexes
+            ),
+            execution_arguments=(
+                dict(actual_arguments) if actual_arguments is not None else None
+            ),
+            prepared_file_read=prepared.file_read,
+        )
 
+    def commit_capability_call(
+        self, invocation: CapabilityCallRecord
+    ) -> CapabilityCallRecord:
+        capability_id = invocation.result.capability_id
+        actual_arguments = invocation.execution_arguments
+        invocation_result = invocation.result
+        raw_result = invocation_result.content
+        prepared = invocation.prepared_file_read
         if invocation_result.status != "success":
             observation_data = None
-            content: Any = invocation_result
-        elif _memory_read(capability_id, actual_arguments):
+            content: Any = raw_result
+        elif actual_arguments is not None and _memory_read(
+            capability_id, actual_arguments
+        ):
             root = str(actual_arguments.get("root") or "")
             path = str(actual_arguments.get("path") or "")
             memory_content = (
@@ -241,17 +318,53 @@ class AgentContext:
                     "capability_id": capability_id,
                     "arguments": actual_arguments,
                 }
-                if cached
+                if invocation.cached
                 else raw_result
             )
-        self.last_capability_call = CapabilityCallRecord(
-            actual_arguments,
-            observation_data,
-            invocation_result,
-            cached=cached,
-            covered=bool(prepared and prepared.covered_indexes),
+        cache_key = (
+            json.dumps(
+                [capability_id, actual_arguments],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if actual_arguments is not None
+            else None
         )
-        return content
+        capability = next(
+            (item for item in self._harness.discover(self) if item.id == capability_id),
+            None,
+        )
+        if (
+            capability is not None
+            and capability.access in {AccessLevel.WRITE, AccessLevel.DESTRUCTIVE}
+            and invocation_result.status == "success"
+        ):
+            self.read_cache.clear()
+            self.file_reads.clear()
+        cacheable = (
+            capability is not None
+            and capability.access == AccessLevel.READ
+            and prepared is None
+            and actual_arguments is not None
+            and not _memory_read(capability_id, actual_arguments)
+        )
+        if (
+            cacheable
+            and not invocation.cached
+            and invocation_result.status == "success"
+            and cache_key is not None
+        ):
+            self.read_cache[cache_key] = {
+                "type": invocation_result.type,
+                "content": raw_result,
+            }
+        result = replace(invocation_result, content=content)
+        committed = replace(
+            invocation, observation_data=observation_data, result=result
+        )
+        self._harness.commit_capability_failure_guard(self, committed)
+        return committed
 
     def start_message_thread(self) -> None:
         if self.messages:
@@ -285,7 +398,7 @@ class AgentContext:
     ) -> list[dict[str, Any]]:
         self.start_message_thread()
         request = self._ephemeral_messages()
-        fitted, _, _, plan = fit_messages_with_plan(
+        fitted, level, stages, plan = fit_messages_with_plan(
             request,
             tools,
             context_window_tokens=self.context_window_tokens,
@@ -293,7 +406,13 @@ class AgentContext:
         if plan.changed:
             sink = self._harness.compaction_sink
             if sink is not None and self.origin_turn_seq > 0:
-                sink(self, plan)
+                sink(
+                    self,
+                    plan,
+                    level,
+                    int(stages[0]["before_tokens"]),
+                    int(stages[-1]["after_tokens"]),
+                )
             durable = [dict(message) for message in fitted]
             if durable and durable[0].get("role") == "system":
                 durable[0] = {"role": "system", "content": self.system_prompt}
@@ -321,25 +440,43 @@ class AgentContext:
         self, capability_id: str, arguments: dict[str, Any]
     ) -> str:
         expected_name = self._harness.function_name(capability_id)
-        open_call = self.open_tool_call()
-        if open_call is not None:
+        matching = []
+        open_calls = self.open_tool_calls()
+        for open_call in open_calls:
             function = open_call.get("function") or {}
             actual_name = (
                 str(function.get("name") or "") if isinstance(function, dict) else ""
             )
-            if actual_name != expected_name:
-                raise ValidationError(
-                    f"open tool call {actual_name or '<unnamed>'} does not match capability {expected_name}"
+            raw_arguments = (
+                function.get("arguments") if isinstance(function, dict) else None
+            )
+            try:
+                actual_arguments = (
+                    json.loads(raw_arguments)
+                    if isinstance(raw_arguments, str)
+                    else dict(raw_arguments or {})
                 )
-            return str(open_call["id"])
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(
+                    "unresolved Capability call arguments are invalid"
+                ) from exc
+            if actual_name == expected_name and actual_arguments == arguments:
+                matching.append(open_call)
+        if len(matching) > 1:
+            raise ValidationError(
+                f"multiple unresolved calls match capability {expected_name}"
+            )
+        if matching:
+            return str(matching[0]["id"])
+        if open_calls:
+            raise ValidationError(
+                "cannot synthesize a Capability call while another provider call is unresolved"
+            )
         call_id = f"call-{uuid.uuid4().hex}"
         self.append_message(assistant_tool_call(call_id, expected_name, arguments))
         return call_id
 
-    def append_tool_result(
-        self, content: Any, *, call_id: str | None = None
-    ) -> dict[str, Any]:
-        call_id = call_id or self.open_tool_call_id()
+    def append_tool_result(self, content: Any, *, call_id: str) -> dict[str, Any]:
         if not call_id:
             raise ValidationError("Domain tool result has no matching assistant call")
         return self.append_message(tool_result_message(call_id, content))
@@ -350,25 +487,30 @@ class AgentContext:
             for message in self.messages
             if message.get("role") == "tool"
         }
-        open_calls: list[dict[str, Any]] = []
-        for message in self.messages:
-            if message.get("role") != "assistant":
-                continue
-            for call in message.get("tool_calls") or []:
-                call_id = str(call.get("id") or "")
-                if call_id and call_id not in resolved:
-                    open_calls.append(call)
-        return open_calls
+        return [
+            call
+            for call in self.provider_tool_calls()
+            if str(call.get("id") or "") not in resolved
+        ]
 
-    def open_tool_call(self) -> dict[str, Any] | None:
-        open_calls = self.open_tool_calls()
-        if len(open_calls) > 1:
-            raise ValidationError("Domain thread has multiple unresolved tool calls")
-        return open_calls[0] if open_calls else None
+    def provider_tool_calls(self) -> list[dict[str, Any]]:
+        return [
+            call
+            for message in self.messages
+            if message.get("role") == "assistant"
+            for call in message.get("tool_calls") or []
+            if str(call.get("id") or "")
+        ]
 
-    def open_tool_call_id(self) -> str:
-        call = self.open_tool_call()
-        return str(call.get("id") or "") if call is not None else ""
+    def unresolved_tool_call(self, call_id: str) -> dict[str, Any] | None:
+        return next(
+            (
+                call
+                for call in self.open_tool_calls()
+                if str(call.get("id") or "") == call_id
+            ),
+            None,
+        )
 
     def complete_text(self, reasoner: Any, *, prompt: str) -> str:
         self.start_message_thread()

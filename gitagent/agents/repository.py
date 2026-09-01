@@ -22,7 +22,7 @@ from gitagent.domain.models import (
     RepositoryResult,
 )
 from gitagent.harness.context.state import AgentContext
-from gitagent.harness.execution import AgentHarness
+from gitagent.harness.execution import AgentHarness, ExecutionProfile
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
 
@@ -46,6 +46,8 @@ REPOSITORY_SPEC = AgentSpec(
     ),
     system_prompt=_PROMPTS.text("system.repository"),
     output_schema=("operation", "answer", "files", "symbols", "reasoning"),
+    agent_depth=1,
+    execution_profile=ExecutionProfile.concurrent(),
 )
 
 
@@ -166,7 +168,7 @@ class RepositoryAgent:
     @staticmethod
     def _text(context: AgentContext, content: str) -> ModelResponse:
         message = context.append_message({"role": "assistant", "content": content})
-        return ModelResponse(content, None, message)
+        return ModelResponse(content, [], message)
 
     @staticmethod
     def _result_operation(

@@ -20,6 +20,85 @@ _CONFIGURABLE_AGENTS = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionConfig:
+    """All scheduling, depth, step, and Runtime retry limits."""
+
+    max_calls_per_turn: int
+    capability_max_concurrency: int
+    provider_concurrency: dict[str, int]
+    domain_agent_max_concurrency: int
+    max_agent_depth: int
+    default_agent_max_steps: int
+    agent_max_steps_overrides: dict[str, int]
+    max_structured_retries: int
+    max_provider_retries: int
+
+    @classmethod
+    def from_value(cls, value: Any) -> ExecutionConfig:
+        if not isinstance(value, dict):
+            raise TypeError("execution 必须是对象")
+        expected = {item.name for item in fields(cls)}
+        actual = set(value)
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        if missing:
+            raise ValueError("execution 缺少字段: " + ", ".join(missing))
+        if unknown:
+            raise ValueError("execution 包含未知字段: " + ", ".join(unknown))
+        config = cls(**dict(value))
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        _positive_integer(self.max_calls_per_turn, "execution.max_calls_per_turn")
+        _positive_integer(
+            self.capability_max_concurrency,
+            "execution.capability_max_concurrency",
+        )
+        _positive_integer(
+            self.domain_agent_max_concurrency,
+            "execution.domain_agent_max_concurrency",
+        )
+        _nonnegative_integer(self.max_agent_depth, "execution.max_agent_depth")
+        _positive_integer(
+            self.default_agent_max_steps,
+            "execution.default_agent_max_steps",
+        )
+        _nonnegative_integer(
+            self.max_structured_retries,
+            "execution.max_structured_retries",
+        )
+        _nonnegative_integer(
+            self.max_provider_retries,
+            "execution.max_provider_retries",
+        )
+        if not isinstance(self.provider_concurrency, dict):
+            raise TypeError("execution.provider_concurrency 必须是对象")
+        for provider_id, limit in self.provider_concurrency.items():
+            _nonempty_string(provider_id, "execution.provider_concurrency key")
+            _positive_integer(
+                limit, f"execution.provider_concurrency.{provider_id}"
+            )
+            if limit > self.capability_max_concurrency:
+                raise ValueError(
+                    f"execution.provider_concurrency.{provider_id} "
+                    "不能大于 capability_max_concurrency"
+                )
+        if not isinstance(self.agent_max_steps_overrides, dict):
+            raise TypeError("execution.agent_max_steps_overrides 必须是对象")
+        unknown_agents = set(self.agent_max_steps_overrides) - _CONFIGURABLE_AGENTS
+        if unknown_agents:
+            raise ValueError(
+                "execution.agent_max_steps_overrides 包含未知 Agent: "
+                + ", ".join(sorted(unknown_agents))
+            )
+        for agent, limit in self.agent_max_steps_overrides.items():
+            _positive_integer(
+                limit, f"execution.agent_max_steps_overrides.{agent}"
+            )
+
+
 @dataclass(slots=True)
 class RuntimeConfig:
     """Validated runtime configuration loaded directly from ``config.json``."""
@@ -38,6 +117,7 @@ class RuntimeConfig:
     memory_path: Path
     event_retention_days: int
     context_window_tokens: dict[str, int]
+    execution: ExecutionConfig
     memory_automation: bool
     context7_api_key: str
     source_path: Path = field(init=False, repr=False)
@@ -66,6 +146,7 @@ class RuntimeConfig:
             raise ValueError("config.json 包含未知字段: " + ", ".join(unknown))
 
         data = dict(value)
+        data["execution"] = ExecutionConfig.from_value(data["execution"])
         for name in ("state_path", "event_path", "memory_path"):
             data[name] = _resolve_path(data[name], name=name, base=config_path.parent)
         config = cls(**data)
@@ -115,6 +196,9 @@ class RuntimeConfig:
             )
         for agent, size in self.context_window_tokens.items():
             _positive_integer(size, f"context_window_tokens.{agent}")
+        if not isinstance(self.execution, ExecutionConfig):
+            raise TypeError("execution 必须是 ExecutionConfig")
+        self.execution.validate()
         if not isinstance(self.memory_automation, bool):
             raise TypeError("memory_automation 必须为布尔值")
         _string(self.context7_api_key, "context7_api_key")

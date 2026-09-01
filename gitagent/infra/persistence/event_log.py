@@ -433,7 +433,7 @@ class SessionEventRecorder:
                 agent=str(trace_event.name),
                 data=common,
             )
-        elif category == "agent" and status in {"completed", "failed"}:
+        elif category == "agent" and status in {"completed", "failed", "cancelled"}:
             self.event_log.append(
                 scope,
                 "agent_completed",

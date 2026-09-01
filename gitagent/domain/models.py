@@ -105,6 +105,8 @@ class AgentSpec:
     role: str
     system_prompt: str
     output_schema: tuple[str, ...]
+    agent_depth: int
+    execution_profile: Any
 
 
 @dataclass(frozen=True)

@@ -153,6 +153,19 @@ class RAGProvider:
         except Exception as exc:
             raise ProviderExecutionError(str(exc)) from exc
 
+    @staticmethod
+    def describe_execution(
+        binding: CapabilityBinding,
+        arguments: dict[str, Any],
+        context: InvocationContext,
+    ) -> Any:
+        del arguments
+        from gitagent.harness.execution import ExecutionProfile
+
+        if not isinstance(binding.target, RAGDefinition):
+            return ExecutionProfile.unknown(repository=context.repository)
+        return ExecutionProfile.concurrent()
+
     def reconnect(self, binding: CapabilityBinding) -> None:
         if not isinstance(binding.target, RAGDefinition):
             raise TypeError("RAG binding target is invalid")

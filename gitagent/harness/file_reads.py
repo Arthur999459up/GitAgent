@@ -143,6 +143,61 @@ class PreparedFileRead:
     actual: tuple[FileReadRequest, ...]
     covered_indexes: tuple[int, ...]
 
+    def to_plain(self) -> dict[str, Any]:
+        return {
+            "capability_id": self.capability_id,
+            "repository": self.repository,
+            "ref": self.ref,
+            "requested_arguments": self.requested_arguments,
+            "actual_arguments": self.actual_arguments,
+            "requested": [
+                {
+                    "path": item.path,
+                    "start_line": item.start_line,
+                    "limit": item.limit,
+                    "explicit_start": item.explicit_start,
+                }
+                for item in self.requested
+            ],
+            "actual": [
+                {
+                    "path": item.path,
+                    "start_line": item.start_line,
+                    "limit": item.limit,
+                    "explicit_start": item.explicit_start,
+                }
+                for item in self.actual
+            ],
+            "covered_indexes": list(self.covered_indexes),
+        }
+
+    @classmethod
+    def from_plain(cls, value: dict[str, Any]) -> PreparedFileRead:
+        def request(item: dict[str, Any]) -> FileReadRequest:
+            return FileReadRequest(
+                safe_repository_path(str(item.get("path") or "")),
+                _positive_int(item.get("start_line"), "start_line"),
+                _positive_int(item.get("limit"), "limit"),
+                bool(item.get("explicit_start")),
+            )
+
+        requested = tuple(request(dict(item)) for item in value.get("requested", []))
+        actual = tuple(request(dict(item)) for item in value.get("actual", []))
+        return cls(
+            capability_id=str(value.get("capability_id") or ""),
+            repository=str(value.get("repository") or ""),
+            ref=str(value["ref"]) if value.get("ref") is not None else None,
+            requested_arguments=dict(value.get("requested_arguments") or {}),
+            actual_arguments=(
+                dict(value["actual_arguments"])
+                if isinstance(value.get("actual_arguments"), dict)
+                else None
+            ),
+            requested=requested,
+            actual=actual,
+            covered_indexes=tuple(int(item) for item in value.get("covered_indexes", [])),
+        )
+
 
 class FileReadLedger:
     """Persist shared line coverage and prevent overlapping repository reads."""
@@ -265,6 +320,9 @@ class FileReadLedger:
         return [
             self._files[key].to_plain() for key in sorted(self._files, key=lambda item: tuple(str(x) for x in item))
         ]
+
+    def clear(self) -> None:
+        self._files.clear()
 
     @classmethod
     def from_plain(cls, value: Any) -> FileReadLedger:

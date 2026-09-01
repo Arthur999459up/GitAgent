@@ -15,7 +15,8 @@ from gitagent.agents import (
     PullRequestAgent,
     RepositoryAgent,
 )
-from gitagent.capability import CapabilityLayer
+from gitagent.capability import CapabilityLayer, CapabilityResult
+from gitagent.capability.errors import CapabilityErrorType, capability_error
 from gitagent.domain.errors import RoutingError, ValidationError, WorkflowError
 from gitagent.domain.models import (
     AgentGuidance,
@@ -47,9 +48,9 @@ from gitagent.harness.context import (
     derive_main_messages,
     fit_messages,
 )
-from gitagent.harness.context.state import AgentContext
+from gitagent.harness.context.state import AgentContext, CapabilityCallRecord
 from gitagent.harness.execution import AgentHarness
-from gitagent.harness.file_reads import FileReadLedger
+from gitagent.harness.file_reads import FileReadLedger, PreparedFileRead
 from gitagent.harness.mutation_plans import (
     code_change_review_package,
     issue_fix_mutation_plan,
@@ -92,11 +93,13 @@ class GitAgentService:
         trace: TraceBus | None = None,
         session_scope: SessionScope | None = None,
         context_window_tokens: Mapping[str, int] | None = None,
+        execution: Mapping[str, Any],
     ) -> None:
         self.harness = AgentHarness(
             capabilities,
             trace=trace,
             context_window_tokens=context_window_tokens,
+            execution=execution,
         )
         self.harness.message_sink = self._persist_agent_message
         self.harness.compaction_sink = self._persist_agent_compaction
@@ -213,7 +216,7 @@ class GitAgentService:
             and target.issue_reply.stage == IssueReplyStage.DRAFT
             and bool(target.issue_reply.draft)
             and target.user_input_request is not None
-            and target.active_child is None
+            and not target.active_children
         ):
             decision = self.classifier.classify(
                 user_input=user_input,
@@ -376,7 +379,7 @@ class GitAgentService:
 
     @staticmethod
     def _domain_context(context: AgentContext) -> AgentContext | None:
-        child = context.active_child or context.last_completed_child
+        child = context.first_waiting_child() or context.last_completed_child
         return child if child is not None and child.agent != "coding" else None
 
     def _runtime_output(self, context: AgentContext) -> Any:
@@ -486,6 +489,7 @@ class GitAgentService:
     def invalidate(self) -> None:
         if not self._invalidated:
             self.harness.approvals.invalidate_all()
+            self.harness.close()
             self._invalidated = True
 
     def _serialize_context(self, context: AgentContext) -> dict[str, Any]:
@@ -515,7 +519,6 @@ class GitAgentService:
             "entity_type": context.entity_type,
             "entity_id": context.entity_id,
             "steps": context.steps,
-            "max_steps": context.max_steps,
             "observations": to_plain(context.observations),
             "pending": pending,
             "waiting_for_user": (
@@ -526,11 +529,14 @@ class GitAgentService:
                 if context.user_input_request is not None
                 else None
             ),
-            "active_child": (
-                self._serialize_context(context.active_child)
-                if context.active_child is not None
-                else None
-            ),
+            "active_children": {
+                call_id: self._serialize_context(child)
+                for call_id, child in context.active_children.items()
+            },
+            "uncommitted_capability_results": {
+                call_id: self._serialize_capability_record(record)
+                for call_id, record in context.uncommitted_capability_results.items()
+            },
             "final_message": context.final_message,
             "code_candidate": to_plain(context.code_candidate),
             "change_request": to_plain(context.change_request),
@@ -550,6 +556,153 @@ class GitAgentService:
             "finished": context.finished,
         }
 
+    @staticmethod
+    def _serialize_capability_record(
+        record: CapabilityCallRecord,
+    ) -> dict[str, Any]:
+        error = record.result.error
+        return {
+            "call_id": record.call_id,
+            "arguments": to_plain(record.arguments),
+            "observation_data": to_plain(record.observation_data),
+            "result": {
+                "capability_id": record.result.capability_id,
+                "status": record.result.status,
+                "type": record.result.type,
+                "content": to_plain(record.result.content),
+                "error": (
+                    {
+                        "type": error.type.value,
+                        "message": error.message,
+                        "details": to_plain(error.details),
+                    }
+                    if error is not None
+                    else None
+                ),
+                "attempts": record.result.attempts,
+            },
+            "cached": record.cached,
+            "covered": record.covered,
+            "execution_arguments": to_plain(record.execution_arguments),
+            "prepared_file_read": (
+                record.prepared_file_read.to_plain()
+                if record.prepared_file_read is not None
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _restore_capability_record(
+        call_id: str, raw: dict[str, Any]
+    ) -> CapabilityCallRecord:
+        expected = {
+            "call_id",
+            "arguments",
+            "observation_data",
+            "result",
+            "cached",
+            "covered",
+            "execution_arguments",
+            "prepared_file_read",
+        }
+        if set(raw) != expected or not isinstance(raw.get("arguments"), dict):
+            raise RoutingError("stored Capability result is invalid")
+        if str(raw.get("call_id") or "") != call_id:
+            raise RoutingError("stored Capability result call_id does not match")
+        result_raw = raw.get("result")
+        if not isinstance(result_raw, dict) or set(result_raw) != {
+            "capability_id",
+            "status",
+            "type",
+            "content",
+            "error",
+            "attempts",
+        }:
+            raise RoutingError("stored Capability result is invalid")
+        capability_id = result_raw.get("capability_id")
+        status = result_raw.get("status")
+        result_type = result_raw.get("type")
+        attempts = result_raw.get("attempts")
+        if not isinstance(capability_id, str) or not capability_id:
+            raise RoutingError("stored Capability result is invalid")
+        if status not in {"success", "failed", "approval_required"}:
+            raise RoutingError("stored Capability result status is invalid")
+        if (
+            not isinstance(result_type, str)
+            or (status == "success" and result_type not in {"data", "context", "retrieval"})
+            or (status != "success" and result_type != "none")
+        ):
+            raise RoutingError("stored Capability result type is invalid")
+        if (
+            not isinstance(attempts, int)
+            or isinstance(attempts, bool)
+            or attempts < 0
+        ):
+            raise RoutingError("stored Capability result attempts are invalid")
+        error_raw = result_raw.get("error")
+        error = None
+        if isinstance(error_raw, dict):
+            if set(error_raw) != {"type", "message", "details"}:
+                raise RoutingError("stored Capability error is invalid")
+            try:
+                error_type = CapabilityErrorType(str(error_raw.get("type") or ""))
+            except ValueError as exc:
+                raise RoutingError("stored Capability error type is invalid") from exc
+            error = capability_error(
+                error_type,
+                str(error_raw.get("message") or ""),
+                details=(
+                    dict(error_raw["details"])
+                    if isinstance(error_raw.get("details"), dict)
+                    else None
+                ),
+            )
+        elif error_raw is not None:
+            raise RoutingError("stored Capability error is invalid")
+        if (status == "failed") != (error is not None):
+            raise RoutingError("stored Capability error/status pair is invalid")
+        if not isinstance(raw.get("cached"), bool) or not isinstance(
+            raw.get("covered"), bool
+        ):
+            raise RoutingError("stored Capability cache flags are invalid")
+        execution_arguments = raw.get("execution_arguments")
+        if execution_arguments is not None and not isinstance(
+            execution_arguments, dict
+        ):
+            raise RoutingError("stored Capability execution arguments are invalid")
+        prepared_raw = raw.get("prepared_file_read")
+        if prepared_raw is not None and not isinstance(prepared_raw, dict):
+            raise RoutingError("stored prepared file read is invalid")
+        try:
+            prepared = (
+                PreparedFileRead.from_plain(prepared_raw)
+                if isinstance(prepared_raw, dict)
+                else None
+            )
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise RoutingError("stored prepared file read is invalid") from exc
+        return CapabilityCallRecord(
+            call_id,
+            dict(raw["arguments"]),
+            raw.get("observation_data"),
+            CapabilityResult(
+                capability_id,
+                status,
+                result_type,
+                result_raw.get("content"),
+                error=error,
+                attempts=attempts,
+            ),
+            cached=raw["cached"],
+            covered=raw["covered"],
+            execution_arguments=(
+                dict(execution_arguments)
+                if isinstance(execution_arguments, dict)
+                else None
+            ),
+            prepared_file_read=prepared,
+        )
+
     def _restore_context(
         self,
         raw: dict[str, Any],
@@ -568,8 +721,7 @@ class GitAgentService:
             or context.error is not None
             or context.pending is not None
             or context.user_input_request is not None
-            or context.active_child is None
-            or not context.waiting
+            or context.first_waiting_child() is None
         ):
             raise RoutingError("stored Main Runtime state is not paused in a child call")
         try:
@@ -606,7 +758,6 @@ class GitAgentService:
             goal=str(raw.get("goal") or ""),
             entity_type=str(raw.get("entity_type") or "") or None,
             entity_id=str(raw.get("entity_id") or "") or None,
-            max_steps=int(raw.get("max_steps") or 20),
         )
         context.run_id = str(raw.get("run_id") or context.run_id)
         context.origin_turn_seq = int(raw.get("origin_turn_seq") or 0)
@@ -649,14 +800,30 @@ class GitAgentService:
                 str(waiting.get("call_id") or "") or None,
             )
             if context.user_input_request.call_id:
-                open_call = context.open_tool_call()
+                open_call = context.unresolved_tool_call(
+                    context.user_input_request.call_id
+                )
                 function = (open_call or {}).get("function") or {}
+                raw_arguments = (
+                    function.get("arguments") if isinstance(function, dict) else None
+                )
+                try:
+                    arguments = (
+                        json.loads(raw_arguments)
+                        if isinstance(raw_arguments, str)
+                        else dict(raw_arguments or {})
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RoutingError(
+                        "stored waiting-for-user arguments are invalid"
+                    ) from exc
                 if (
                     open_call is None
-                    or context.open_tool_call_id()
-                    != context.user_input_request.call_id
                     or str(function.get("name") or "")
                     != "runtime__wait_for_user"
+                    or set(arguments) != {"question"}
+                    or str(arguments.get("question") or "").strip()
+                    != context.user_input_request.question
                 ):
                     raise RoutingError(
                         "stored waiting-for-user call correlation is invalid"
@@ -707,12 +874,30 @@ class GitAgentService:
         context.file_reads = FileReadLedger.from_plain(raw.get("file_reads"))
         context.error = str(raw.get("error")) if raw.get("error") is not None else None
         context.finished = bool(raw.get("finished", False))
-        active_child = raw.get("active_child")
-        if isinstance(active_child, dict):
-            context.active_child = self._restore_agent_context(
-                active_child,
+        active_children = raw.get("active_children")
+        if not isinstance(active_children, dict):
+            raise RoutingError("stored active_children state is invalid")
+        for call_id, child_raw in active_children.items():
+            if not isinstance(call_id, str) or not isinstance(child_raw, dict):
+                raise RoutingError("stored active child entry is invalid")
+            child = self._restore_agent_context(
+                child_raw,
                 repository=repository,
                 parent_agent=agent,
+            )
+            if child.parent_call_id != call_id:
+                raise RoutingError("stored active child call_id does not match")
+            context.active_children[call_id] = child
+        uncommitted = raw.get("uncommitted_capability_results")
+        if not isinstance(uncommitted, dict):
+            raise RoutingError(
+                "stored uncommitted_capability_results state is invalid"
+            )
+        for call_id, value in uncommitted.items():
+            if not isinstance(call_id, str) or not isinstance(value, dict):
+                raise RoutingError("stored uncommitted Capability result is invalid")
+            context.uncommitted_capability_results[call_id] = (
+                self._restore_capability_record(call_id, value)
             )
         pending = raw.get("pending")
         if isinstance(pending, dict):
@@ -1003,7 +1188,12 @@ class GitAgentService:
         )
 
     def _persist_agent_compaction(
-        self, context: AgentContext, plan: MessageCompactionPlan
+        self,
+        context: AgentContext,
+        plan: MessageCompactionPlan,
+        level: str,
+        before_tokens: int,
+        after_tokens: int,
     ) -> None:
         self._require_session_manager().record_message_compaction(
             self._scope(),
@@ -1013,6 +1203,15 @@ class GitAgentService:
             retain_message_indexes=plan.retain_message_indexes,
             tool_replacements=plan.tool_replacements,
             **({"run_id": context.run_id} if context.agent != "main" else {}),
+        )
+        self.harness.trace.emit_auto_compaction(
+            session_id=context.session_id,
+            agent=context.agent,
+            level=level,
+            before_tokens=before_tokens,
+            after_tokens=after_tokens,
+            context_window_tokens=context.context_window_tokens,
+            turn_seq=self._active_turn_seq or context.origin_turn_seq,
         )
 
     def _save_context(self, context: AgentContext) -> None:
@@ -1057,8 +1256,8 @@ class GitAgentService:
             )
         elif context.agent == "coding":
             context.guidance = inherited
-        if context.active_child is not None:
-            self._restore_guidance(context.active_child, context.guidance)
+        for child in context.active_children.values():
+            self._restore_guidance(child, context.guidance)
 
     def _require_pending_context(self) -> tuple[AgentContext, AgentContext]:
         self._require_live()

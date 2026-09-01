@@ -28,6 +28,7 @@ class CapabilityErrorType(str, Enum):
     RATE_LIMITED = "rate_limited"
     EXECUTION_FAILED = "execution_failed"
     EXECUTION_UNCERTAIN = "execution_uncertain"
+    DUPLICATE_CALL = "duplicate_call"
     REPEATED_FAILURE = "repeated_failure"
 
 
