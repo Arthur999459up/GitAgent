@@ -429,14 +429,38 @@ class StructuredCallDispatcher:
             None,
         )
 
-    def emit(self, context: Any, status: str, message: str = "") -> None:
+    def emit(
+        self,
+        context: Any,
+        status: str,
+        message: str = "",
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        event_details = {"steps": context.steps}
+        if details:
+            event_details.update(details)
+        if status == "progress" and "phase" not in event_details:
+            open_calls = context.open_tool_calls()
+            if open_calls:
+                call_names: set[str] = set()
+                for call in open_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function")
+                    if isinstance(function, dict):
+                        call_names.add(str(function.get("name") or ""))
+                event_details["phase"] = "thinking"
+                event_details["has_thinking_text"] = message not in call_names
+            else:
+                event_details["phase"] = "final"
         self.harness.trace.emit(
             session_id=context.session_id,
             category=TraceCategory.AGENT,
             name=context.agent,
             status=TraceStatus(status),
             message=message,
-            details={"steps": context.steps},
+            details=event_details,
         )
 
     @staticmethod

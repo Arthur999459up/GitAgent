@@ -146,6 +146,9 @@ class TerminalUI:
         if event.category == TraceCategory.WORKFLOW and event.name in _MEMORY_WORKFLOWS:
             self._memory_status(event)
             return
+        if event.category == TraceCategory.AGENT and event.status == TraceStatus.PROGRESS:
+            self._agent_progress(event)
+            return
         if event.status == TraceStatus.COMPLETED:
             return
         if event.status == TraceStatus.PROGRESS and not event.message:
@@ -188,6 +191,35 @@ class TerminalUI:
 
         self.console.print(line)
 
+    def _agent_progress(self, event: TraceEvent) -> None:
+        """Render each Agent's own reasoning without exposing Agent hand-off payloads."""
+
+        if (
+            event.details.get("phase") != "thinking"
+            or not event.details.get("has_thinking_text", True)
+            or not event.message.strip()
+        ):
+            return
+
+        agent_name = _AGENT_NAMES.get(
+            event.name,
+            event.name.replace("_", " ").title(),
+        )
+        step = event.details.get("steps")
+        subtitle = Text(f"step {step}", style="dim") if step else None
+        self.console.print(
+            Panel(
+                Markdown(event.message.strip()),
+                title=Text(f"{agent_name} · Thinking...", style="bold cyan"),
+                title_align="left",
+                subtitle=subtitle,
+                subtitle_align="right",
+                border_style="bright_black",
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+        )
+
     def _auto_compaction(self, event: TraceEvent) -> None:
         details = event.details
         self.compaction(
@@ -225,23 +257,26 @@ class TerminalUI:
             after_tokens / context_window_tokens * 100 if context_window_tokens else 0.0
         )
         reduced_percent = reduced / before_tokens * 100 if before_tokens else 0.0
-        trigger = "Auto" if automatic else "Manual"
+        trigger = "AUTO" if automatic else "MANUAL"
+        window = context_window_tokens
         self.console.print(
-            Text(
-                "\n".join(
-                    [
-                        f"{trigger} compact · {agent_name} · {level}",
-                        (
-                            f"Before: {before_tokens:,} / {context_window_tokens:,} "
-                            f"tokens ({before_percent:.1f}%)"
-                        ),
-                        (
-                            f"After:  {after_tokens:,} / {context_window_tokens:,} "
-                            f"tokens ({after_percent:.1f}%)"
-                        ),
-                        f"Reduced: {reduced:,} tokens ({reduced_percent:.1f}%)",
-                    ]
-                )
+            Panel(
+                Text(
+                    "\n".join(
+                        [
+                            f"Before  {_usage_meter(before_tokens, window)}  {before_tokens:>9,}  {before_percent:5.1f}%",
+                            f"After   {_usage_meter(after_tokens, window)}  {after_tokens:>9,}  {after_percent:5.1f}%",
+                            f"Saved   {'':18}  {reduced:>9,}  {reduced_percent:5.1f}%",
+                        ]
+                    )
+                ),
+                title=Text(f"Context compact  {trigger}", style="bold cyan"),
+                title_align="left",
+                subtitle=Text(f"{agent_name} · {level} · window {window:,}", style="dim"),
+                subtitle_align="right",
+                border_style="bright_black",
+                box=box.ROUNDED,
+                padding=(0, 1),
             )
         )
 
@@ -433,6 +468,16 @@ def _single_line(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _usage_meter(tokens: int, capacity: int, width: int = 18) -> str:
+    """Return a compact fixed-width context meter for aligned terminal output."""
+
+    if capacity <= 0:
+        return "─" * width
+    ratio = max(0.0, min(1.0, tokens / capacity))
+    filled = min(width, max(0, round(ratio * width)))
+    return "━" * filled + "─" * (width - filled)
 
 
 def _duration(duration_ms: float) -> str:
