@@ -152,11 +152,6 @@ class StreamableHTTPTransport:
         return value
 
 
-class Context7Client(StreamableHTTPTransport):
-    def __init__(self, *, api_key: str = "", timeout: float = 30.0) -> None:
-        super().__init__("https://mcp.context7.com/mcp", api_key=api_key, timeout=timeout)
-
-
 def _content_text(content: Any) -> str:
     if not isinstance(content, list):
         return ""

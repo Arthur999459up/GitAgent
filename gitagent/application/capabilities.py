@@ -6,18 +6,14 @@ import sysconfig
 from pathlib import Path
 from typing import Any
 
-from gitagent.capability import CapabilityLayer, PermissionPolicy
+from gitagent.capability import CapabilityCatalog, CapabilityLayer, PermissionPolicy
 from gitagent.capability.providers import (
     MCPProvider,
-    MCPServerDefinition,
     NativeProvider,
     RAGProvider,
-    SkillDefinition,
     SkillProvider,
-    context7_tool_definitions,
-    github_tool_definitions,
 )
-from gitagent.infra.mcp import Context7Client
+from gitagent.infra.mcp import StreamableHTTPTransport
 
 
 def build_capability_layer(
@@ -31,47 +27,37 @@ def build_capability_layer(
     memory_roots: dict[str, Path] | None = None,
 ) -> CapabilityLayer:
     resource_root = _resource_root()
-    policy = PermissionPolicy.from_file(resource_root / "capabilities.yaml")
+    catalog = CapabilityCatalog.from_file(resource_root / "capabilities.yaml")
+    policy = PermissionPolicy(catalog.agents)
+    policy.validate_structure()
     layer = CapabilityLayer(policy=policy, trace=trace)
     native = NativeProvider(
         workspace_root or Path.cwd(),
+        definitions=catalog.for_provider("native"),
         memory_roots=memory_roots,
         blocked_paths=blocked_paths,
         secret_values=secret_values,
     )
-    context7 = Context7Client(api_key=context7_api_key)
+    mcp_clients: dict[str, Any] = {}
+    for server in catalog.mcp_servers:
+        if server.transport == "local_adapter":
+            mcp_clients[server.id] = github
+        elif server.transport == "streamable_http":
+            mcp_clients[server.id] = StreamableHTTPTransport(
+                str(server.config["endpoint"]), api_key=context7_api_key
+            )
     layer.add_provider(native)
     layer.add_provider(
         MCPProvider(
-            [
-                MCPServerDefinition(
-                    "github", "local_adapter", {"inject_repository": True}
-                ),
-                MCPServerDefinition(
-                    "context7", "streamable_http", {"endpoint": context7.endpoint}
-                ),
-            ],
-            [*github_tool_definitions(github), *context7_tool_definitions()],
-            clients={"github": github, "context7": context7},
+            catalog.mcp_servers,
+            catalog.for_provider("mcp"),
+            clients=mcp_clients,
         )
     )
     skills_root = resource_root / "skills"
     layer.add_provider(
         SkillProvider(
-            [
-                SkillDefinition(
-                    "skill.code-review",
-                    "Load the fixed, read-only code review workflow context.",
-                    "skill",
-                    "code-review/SKILL.md",
-                ),
-                SkillDefinition(
-                    "skill.debug",
-                    "Load the fixed causal debugging workflow context.",
-                    "skill",
-                    "debug/SKILL.md",
-                ),
-            ],
+            catalog.for_provider("skill"),
             trusted_root=skills_root,
         )
     )

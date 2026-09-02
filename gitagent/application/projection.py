@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
+from gitagent.capability import AccessLevel
 from gitagent.domain.errors import ValidationError
 from gitagent.domain.models import (
     DraftResult,
@@ -279,17 +280,11 @@ def _last_write_like_observation(context: AgentContext) -> Any | None:
             continue
         payload = observation.get("payload") or {}
         capability_id = str(payload.get("capability_id") or "")
-        if capability_id.startswith("github.") and capability_id not in {
-            "github.list_issues",
-            "github.get_issue",
-            "github.get_issue_comments",
-            "github.list_pull_requests",
-            "github.get_pr",
-            "github.get_pr_comments",
-            "github.get_pr_reviews",
-            "github.get_workflow_runs",
-            "github.get_job_logs",
-        }:
+        if (
+            capability_id.startswith("github.")
+            and payload.get("access")
+            in {AccessLevel.WRITE.value, AccessLevel.DESTRUCTIVE.value}
+        ):
             return payload
     return None
 

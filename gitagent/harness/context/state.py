@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from gitagent.agent_loop.models import WaitForUser
-from gitagent.capability import AccessLevel, CapabilityResult
+from gitagent.capability import AccessLevel, CapabilityKind, CapabilityResult
 from gitagent.capability.errors import CapabilityErrorType, capability_error
 from gitagent.domain.errors import ValidationError
 from gitagent.domain.models import (
@@ -385,7 +385,12 @@ class AgentContext:
         if workspace is not None:
             if (
                 invocation_result.status == "success"
-                and capability_id in {"native.write", "native.edit", "native.delete"}
+                and capability is not None
+                and capability.kind == CapabilityKind.NATIVE_TOOL
+                and capability.access in {AccessLevel.WRITE, AccessLevel.DESTRUCTIVE}
+                and isinstance(capability.input_schema, dict)
+                and isinstance(capability.input_schema.get("properties"), dict)
+                and "path" in capability.input_schema["properties"]
                 and isinstance(raw_result, dict)
                 and bool(raw_result.get("changed"))
             ):

@@ -1,7 +1,8 @@
-"""MCP capability definitions, local/remote client ownership, and dispatch."""
+"""MCP runtime bindings, local/remote client ownership, and dispatch."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from inspect import Parameter, signature
 from types import UnionType
@@ -14,6 +15,7 @@ from gitagent.domain.errors import (
     ValidationError,
 )
 
+from ..catalog import CapabilityDefinition, MCPServerDefinition
 from ..errors import (
     CapabilityInternalError,
     ProviderAuthenticationError,
@@ -35,22 +37,11 @@ from ..models import (
 
 
 @dataclass(frozen=True)
-class MCPServerDefinition:
-    id: str
-    transport: str
-    config: dict[str, Any]
-    enabled: bool = True
-
-
-@dataclass(frozen=True)
-class MCPToolDefinition:
-    id: str
-    server_id: str
-    remote_name: str
+class MCPToolBinding:
+    definition: CapabilityDefinition
     description: str
-    input_schema: dict[str, Any]
+    input_schema: dict[str, Any] | None
     output_schema: dict[str, Any] | None
-    access: AccessLevel
 
 
 class MCPProvider:
@@ -58,41 +49,48 @@ class MCPProvider:
 
     def __init__(
         self,
-        servers: list[MCPServerDefinition],
-        tools: list[MCPToolDefinition],
+        servers: Iterable[MCPServerDefinition],
+        definitions: Iterable[CapabilityDefinition],
         *,
         clients: dict[str, Any],
     ) -> None:
         self._servers = {server.id: server for server in servers}
-        self._tools = list(tools)
         self._clients = dict(clients)
+        self._tools = [
+            self._build_binding(definition) for definition in definitions
+        ]
 
     def load(self) -> list[CapabilityRegistration]:
         registrations: list[CapabilityRegistration] = []
-        for definition in self._tools:
+        for binding in self._tools:
+            definition = binding.definition
+            if definition.server_id is None:
+                raise CapabilityInternalError(
+                    f"MCP capability has no server binding: {definition.id}"
+                )
             server = self._servers[definition.server_id]
             client = self._clients.get(definition.server_id)
             available = (
-                server.enabled
-                and client is not None
+                client is not None
                 and bool(getattr(client, "available", True))
             )
-            source_id = definition.id.rsplit(".", 1)[0]
             registrations.append(
                 CapabilityRegistration(
                     Capability(
                         definition.id,
                         CapabilityKind.MCP_TOOL,
-                        definition.description,
-                        source_id,
-                        CapabilityStatus.AVAILABLE
+                        binding.description,
+                        definition.source_id,
+                        CapabilityStatus.DISABLED
+                        if not definition.enabled or not server.enabled
+                        else CapabilityStatus.AVAILABLE
                         if available
                         else CapabilityStatus.UNAVAILABLE,
                         definition.access,
-                        definition.input_schema,
-                        definition.output_schema,
+                        binding.input_schema,
+                        binding.output_schema,
                     ),
-                    CapabilityBinding(definition.id, self.id, definition),
+                    CapabilityBinding(definition.id, self.id, binding),
                 )
             )
         return registrations
@@ -103,9 +101,12 @@ class MCPProvider:
         arguments: dict[str, Any],
         context: InvocationContext,
     ) -> Any:
-        definition = binding.target
-        if not isinstance(definition, MCPToolDefinition):
+        tool = binding.target
+        if not isinstance(tool, MCPToolBinding):
             raise CapabilityInternalError("MCP binding target is invalid")
+        definition = tool.definition
+        if definition.server_id is None or definition.remote_name is None:
+            raise CapabilityInternalError("MCP binding is incomplete")
         client = self._clients.get(definition.server_id)
         if client is None:
             raise ProviderUnavailableError(
@@ -135,20 +136,22 @@ class MCPProvider:
         del arguments
         from gitagent.harness.execution import ExecutionProfile
 
-        definition = binding.target
-        if not isinstance(definition, MCPToolDefinition):
+        tool = binding.target
+        if not isinstance(tool, MCPToolBinding):
             return ExecutionProfile.unknown(repository=context.repository)
+        definition = tool.definition
         if definition.access != AccessLevel.READ:
             scope = context.repository.strip() or "<unscoped>"
             return ExecutionProfile.exclusive(write=(f"repo:{scope}",))
-        if definition.server_id in {"github", "context7"}:
-            return ExecutionProfile.concurrent()
-        return ExecutionProfile.unknown(repository=context.repository)
+        return ExecutionProfile.concurrent()
 
     def reconnect(self, binding: CapabilityBinding) -> None:
-        definition = binding.target
-        if not isinstance(definition, MCPToolDefinition):
+        tool = binding.target
+        if not isinstance(tool, MCPToolBinding):
             raise CapabilityInternalError("MCP binding target is invalid")
+        definition = tool.definition
+        if definition.server_id is None:
+            raise CapabilityInternalError("MCP binding has no server")
         client = self._clients.get(definition.server_id)
         if client is not None and hasattr(client, "reconnect"):
             try:
@@ -157,9 +160,13 @@ class MCPProvider:
                 self._raise_normalized_transport(exc, mutation=False)
 
     def refresh(self) -> None:
-        refreshed: list[MCPToolDefinition] = []
+        refreshed: list[MCPToolBinding] = []
         for server_id in self._servers:
-            server_tools = [item for item in self._tools if item.server_id == server_id]
+            server_tools = [
+                item
+                for item in self._tools
+                if item.definition.server_id == server_id
+            ]
             client = self._clients.get(server_id)
             if client is None or not hasattr(client, "list_tools"):
                 refreshed.extend(server_tools)
@@ -170,17 +177,21 @@ class MCPProvider:
                 self._raise_normalized_transport(exc, mutation=False)
             discovered = {str(item.get("name")): item for item in listed_tools}
             for definition in server_tools:
-                remote = discovered.get(definition.remote_name)
+                remote = discovered.get(definition.definition.remote_name)
                 if remote is None:
                     continue
                 refreshed.append(
                     replace(
                         definition,
-                        description=str(
-                            remote.get("description") or definition.description
+                        description=(
+                            str(remote["description"])
+                            if remote.get("description") is not None
+                            else definition.description
                         ),
-                        input_schema=dict(
-                            remote.get("inputSchema") or definition.input_schema
+                        input_schema=(
+                            dict(remote["inputSchema"])
+                            if isinstance(remote.get("inputSchema"), dict)
+                            else None
                         ),
                         output_schema=(
                             dict(remote["outputSchema"])
@@ -190,6 +201,47 @@ class MCPProvider:
                     )
                 )
         self._tools = refreshed
+
+    def _build_binding(self, definition: CapabilityDefinition) -> MCPToolBinding:
+        if definition.provider_id != self.id:
+            raise ValidationError(
+                f"MCP provider received a foreign capability: {definition.id}"
+            )
+        if definition.server_id is None or definition.remote_name is None:
+            raise ValidationError(f"MCP capability binding is incomplete: {definition.id}")
+        try:
+            server = self._servers[definition.server_id]
+        except KeyError as exc:
+            raise ValidationError(
+                f"MCP capability {definition.id} references unknown server "
+                f"{definition.server_id}"
+            ) from exc
+        client = self._clients.get(definition.server_id)
+        if server.transport == "local_adapter" and client is not None:
+            handler = getattr(client, definition.remote_name, None)
+            if not callable(handler):
+                raise ValidationError(
+                    f"MCP local adapter has no handler for {definition.id}: "
+                    f"{definition.remote_name}"
+                )
+            excluded = (
+                frozenset({"repository"})
+                if server.config.get("inject_repository")
+                else frozenset()
+            )
+            input_schema = callable_schema(handler, exclude=excluded)
+            output_schema = _annotation_schema(
+                get_type_hints(handler).get("return", Any)
+            )
+        else:
+            input_schema = {"type": "object"}
+            output_schema = None
+        return MCPToolBinding(
+            definition,
+            definition.description,
+            input_schema,
+            output_schema,
+        )
 
     @staticmethod
     def _raise_normalized_transport(exc: Exception, *, mutation: bool) -> None:
@@ -229,150 +281,6 @@ class MCPProvider:
         ):
             raise exc
         raise ProviderExecutionError(str(exc)) from exc
-
-
-_READ_IDS = frozenset(
-    {
-        "repository.get_default_branch",
-        "repository.get_file_status",
-        "repository.get_repo_tree",
-        "repository.search_code",
-        "repository.read_file",
-        "repository.read_files",
-        "repository.find_symbol",
-        "repository.find_references",
-        "repository.get_pr_diff",
-        "repository.get_changed_files",
-        "repository.get_file_history",
-        "github.get_issue",
-        "github.list_issues",
-        "github.get_issue_comments",
-        "github.list_milestones",
-        "github.get_pr",
-        "github.list_pull_requests",
-        "github.get_pr_comments",
-        "github.get_pr_reviews",
-        "github.get_workflow_runs",
-        "github.get_job_logs",
-    }
-)
-_WRITE_IDS = frozenset(
-    {
-        "github.post_comment",
-        "github.create_issue",
-        "github.update_issue",
-        "github.set_issue_lock",
-        "github.update_pr",
-        "github.create_branch",
-        "github.push",
-        "github.create_draft_pr",
-        "github.post_review",
-    }
-)
-_DESTRUCTIVE_IDS = frozenset(
-    {"github.commit", "github.commit_to_default_branch", "github.merge"}
-)
-
-_DESCRIPTIONS = {
-    "repository.get_default_branch": "Return the default branch name and its current commit SHA; use when an exact base ref is required.",
-    "repository.get_file_status": "Return which supplied paths exist or are missing at one ref; use to validate ADD/MODIFY/DELETE targets, not to read content.",
-    "repository.get_repo_tree": "Return a bounded list of repository paths at a ref; use for structural discovery, not content search.",
-    "repository.search_code": "Return bounded literal content matches with paths, lines, snippets, coverage, and ref; use to locate text across files.",
-    "repository.read_file": "Return one bounded source line range with truncation metadata; use when one exact path is known.",
-    "repository.read_files": "Return bounded source ranges for several known paths in one call; use after targets are identified.",
-    "repository.find_symbol": "Return likely definition locations for one code symbol; use for definitions rather than general text occurrences.",
-    "repository.find_references": "Return bounded textual occurrences of one known symbol; use for callers and impact after identifying the symbol.",
-    "repository.get_pr_diff": "Return the bounded patch for one PR; use to inspect actual line changes, not merely changed path names.",
-    "repository.get_changed_files": "Return paths changed by one PR; use for scope discovery before targeted reads, not line-level analysis.",
-    "repository.get_file_history": "Return bounded commits affecting one exact repository path; use for historical questions after the path is known.",
-    "github.get_issue": "Return current metadata and body for one Issue; use before updating that numbered Issue.",
-    "github.list_issues": "Return a bounded, filterable Issue collection; use for lists, searches, and summaries rather than one known Issue.",
-    "github.get_issue_comments": "Return bounded discussion comments for one Issue; use when the conversation matters beyond its body.",
-    "github.list_milestones": "Return repository Milestones and numeric IDs; use before assigning a Milestone named by the user.",
-    "github.get_pr": "Return current metadata, branches, state, and head SHA for one PR; use before PR-scoped writes or merge checks.",
-    "github.list_pull_requests": "Return a bounded, filterable PR collection; use for lists, searches, and summaries rather than one known PR.",
-    "github.get_pr_comments": "Return bounded PR discussion comments; distinct from formal Review events.",
-    "github.get_pr_reviews": "Return formal PR Review events and states; use for dialogue and merge-readiness checks.",
-    "github.get_workflow_runs": "Return workflow-run status metadata for a PR or run; fetch job logs separately for failure details.",
-    "github.get_job_logs": "Return bounded job metadata and logs for one workflow run; use after identifying a relevant failed run.",
-    "github.post_comment": "Post an issue or pull-request comment.",
-    "github.create_issue": "Create a GitHub issue.",
-    "github.update_issue": "Update GitHub issue fields.",
-    "github.set_issue_lock": "Lock or unlock an issue discussion.",
-    "github.update_pr": "Update pull-request state.",
-    "github.create_branch": "Create a GitHub branch.",
-    "github.commit": "Commit exact file additions, modifications, and deletions.",
-    "github.commit_to_default_branch": "Commit exact changes to the default branch.",
-    "github.push": "Confirm a prepared GitHub branch is published.",
-    "github.create_draft_pr": "Create a draft pull request.",
-    "github.post_review": "Publish a pull-request review.",
-    "github.merge": "Merge a pull request at an exact reviewed head.",
-}
-
-
-def github_tool_definitions(
-    client: Any, *, server_id: str = "github"
-) -> list[MCPToolDefinition]:
-    definitions: list[MCPToolDefinition] = []
-    for capability_id in sorted(_READ_IDS | _WRITE_IDS | _DESTRUCTIVE_IDS):
-        remote_name = capability_id.split(".", 1)[1]
-        handler = getattr(client, remote_name)
-        access = (
-            AccessLevel.READ
-            if capability_id in _READ_IDS
-            else AccessLevel.WRITE
-            if capability_id in _WRITE_IDS
-            else AccessLevel.DESTRUCTIVE
-        )
-        definitions.append(
-            MCPToolDefinition(
-                capability_id,
-                server_id,
-                remote_name,
-                _DESCRIPTIONS[capability_id],
-                callable_schema(handler, exclude=frozenset({"repository"})),
-                _annotation_schema(get_type_hints(handler).get("return", Any)),
-                access,
-            )
-        )
-    return definitions
-
-
-def context7_tool_definitions(
-    *, server_id: str = "context7"
-) -> list[MCPToolDefinition]:
-    return [
-        MCPToolDefinition(
-            "context7.resolve-library-id",
-            server_id,
-            "resolve-library-id",
-            "Resolve a library name to the Context7 ID required by query-docs; call this before querying documentation when the ID is unknown.",
-            _object_schema(
-                {
-                    "libraryName": {"type": "string", "minLength": 1},
-                    "query": {"type": "string", "minLength": 1},
-                },
-                ["libraryName", "query"],
-            ),
-            None,
-            AccessLevel.READ,
-        ),
-        MCPToolDefinition(
-            "context7.query-docs",
-            server_id,
-            "query-docs",
-            "Return current documentation passages for one resolved Context7 library ID and a focused question; use for external library APIs, not repository source.",
-            _object_schema(
-                {
-                    "libraryId": {"type": "string", "minLength": 1},
-                    "query": {"type": "string", "minLength": 1},
-                },
-                ["libraryId", "query"],
-            ),
-            None,
-            AccessLevel.READ,
-        ),
-    ]
 
 
 def callable_schema(

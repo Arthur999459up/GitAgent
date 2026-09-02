@@ -1,5 +1,6 @@
 """The only Agent-visible capability API."""
 
+from .catalog import CapabilityCatalog, CapabilityDefinition, MCPServerDefinition
 from .errors import CapabilityError, CapabilityErrorType, CapabilityInternalError
 from .layer import CapabilityLayer, FailureGuard
 from .models import (
@@ -21,6 +22,8 @@ __all__ = [
     "AccessLevel",
     "BashCommandPolicy",
     "Capability",
+    "CapabilityCatalog",
+    "CapabilityDefinition",
     "CapabilityBinding",
     "CapabilityError",
     "CapabilityErrorType",
@@ -35,6 +38,7 @@ __all__ = [
     "CapabilityTraceEvent",
     "FailureGuard",
     "InvocationContext",
+    "MCPServerDefinition",
     "PermissionDecision",
     "PermissionPolicy",
     "validate_schema",

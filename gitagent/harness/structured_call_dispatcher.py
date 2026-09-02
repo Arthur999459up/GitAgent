@@ -373,9 +373,14 @@ class StructuredCallDispatcher:
                 "successful Capability result contains an error"
             )
 
+        visible = next(
+            (item for item in self.harness.discover(context) if item.id == call.capability_id),
+            None,
+        )
         payload = {
             "capability_id": call.capability_id,
             "arguments": arguments,
+            "access": visible.access.value if visible is not None else None,
             "data": invocation.observation_data,
         }
         if invocation.cached:

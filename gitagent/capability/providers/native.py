@@ -15,6 +15,7 @@ from typing import Any
 
 from gitagent.domain.errors import PermissionDenied, ValidationError
 
+from ..catalog import CapabilityDefinition
 from ..errors import (
     CapabilityInternalError,
     ProviderConflictError,
@@ -33,10 +34,8 @@ from ..models import (
 
 
 @dataclass(frozen=True)
-class NativeToolDefinition:
-    id: str
-    description: str
-    access: AccessLevel
+class NativeToolBinding:
+    definition: CapabilityDefinition
     handler: Callable[[dict[str, Any], InvocationContext], Any]
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None = None
@@ -61,6 +60,7 @@ class NativeProvider:
         self,
         workspace_root: str | Path,
         *,
+        definitions: Iterable[CapabilityDefinition],
         memory_roots: Mapping[str, str | Path] | None = None,
         blocked_paths: Iterable[str | Path] = (),
         secret_values: Iterable[str] = (),
@@ -80,24 +80,26 @@ class NativeProvider:
             self.read_roots[name] = path
         self.blocked_paths = frozenset(Path(value).resolve() for value in blocked_paths)
         self.secret_values = tuple(value for value in secret_values if value)
-        self._definitions = self._build_definitions()
+        self._bindings = self._build_bindings(tuple(definitions))
 
     def load(self) -> list[CapabilityRegistration]:
         return [
             CapabilityRegistration(
                 Capability(
-                    definition.id,
+                    binding.definition.id,
                     CapabilityKind.NATIVE_TOOL,
-                    definition.description,
-                    "native",
-                    CapabilityStatus.AVAILABLE,
-                    definition.access,
-                    definition.input_schema,
-                    definition.output_schema,
+                    binding.definition.description,
+                    binding.definition.source_id,
+                    CapabilityStatus.AVAILABLE
+                    if binding.definition.enabled
+                    else CapabilityStatus.DISABLED,
+                    binding.definition.access,
+                    binding.input_schema,
+                    binding.output_schema,
                 ),
-                CapabilityBinding(definition.id, self.id, definition),
+                CapabilityBinding(binding.definition.id, self.id, binding),
             )
-            for definition in self._definitions
+            for binding in self._bindings
         ]
 
     def invoke(
@@ -107,7 +109,7 @@ class NativeProvider:
         context: InvocationContext,
     ) -> Any:
         definition = binding.target
-        if not isinstance(definition, NativeToolDefinition):
+        if not isinstance(definition, NativeToolBinding):
             raise CapabilityInternalError("native binding target is invalid")
         return definition.handler(arguments, context)
 
@@ -121,20 +123,19 @@ class NativeProvider:
         from gitagent.harness.execution import ExecutionProfile
 
         definition = binding.target
-        if not isinstance(definition, NativeToolDefinition):
+        if not isinstance(definition, NativeToolBinding):
             return ExecutionProfile.unknown(repository=context.repository)
-        if definition.access == AccessLevel.READ:
+        if definition.definition.access == AccessLevel.READ:
             return ExecutionProfile.concurrent()
         scope = context.repository.strip() or "<unscoped>"
         return ExecutionProfile.exclusive(write=(f"workspace:{scope}",))
 
-    def _build_definitions(self) -> tuple[NativeToolDefinition, ...]:
+    def _build_bindings(
+        self, definitions: tuple[CapabilityDefinition, ...]
+    ) -> tuple[NativeToolBinding, ...]:
         object_output = {"type": "object"}
-        return (
-            NativeToolDefinition(
-                "native.read",
-                "Read a UTF-8 file from the workspace or an authorized read-only Memory root.",
-                AccessLevel.READ,
+        implementations = {
+            "read": (
                 self._read,
                 _object_schema(
                     {
@@ -150,10 +151,7 @@ class NativeProvider:
                 ),
                 object_output,
             ),
-            NativeToolDefinition(
-                "native.glob",
-                "Find workspace files matching a glob pattern, bounded to 100 results.",
-                AccessLevel.READ,
+            "glob": (
                 self._glob,
                 _object_schema(
                     {
@@ -164,10 +162,7 @@ class NativeProvider:
                 ),
                 object_output,
             ),
-            NativeToolDefinition(
-                "native.grep",
-                "Search workspace text with a regular expression and return bounded line matches.",
-                AccessLevel.READ,
+            "grep": (
                 self._grep,
                 _object_schema(
                     {
@@ -179,18 +174,12 @@ class NativeProvider:
                 ),
                 object_output,
             ),
-            NativeToolDefinition(
-                "native.now",
-                "Return the current local date and time.",
-                AccessLevel.READ,
+            "now": (
                 self._now,
                 _object_schema({}, []),
                 object_output,
             ),
-            NativeToolDefinition(
-                "native.write",
-                "Create or completely overwrite one workspace text file.",
-                AccessLevel.WRITE,
+            "write": (
                 self._write,
                 _object_schema(
                     {
@@ -201,10 +190,7 @@ class NativeProvider:
                 ),
                 object_output,
             ),
-            NativeToolDefinition(
-                "native.edit",
-                "Replace one exact, unique text occurrence in an existing workspace file.",
-                AccessLevel.WRITE,
+            "edit": (
                 self._edit,
                 _object_schema(
                     {
@@ -216,10 +202,7 @@ class NativeProvider:
                 ),
                 object_output,
             ),
-            NativeToolDefinition(
-                "native.delete",
-                "Delete one ordinary file from the active invocation workspace.",
-                AccessLevel.DESTRUCTIVE,
+            "delete": (
                 self._delete,
                 _object_schema(
                     {"path": {"type": "string", "minLength": 1}},
@@ -227,10 +210,7 @@ class NativeProvider:
                 ),
                 object_output,
             ),
-            NativeToolDefinition(
-                "native.bash",
-                "Execute one policy-approved command in the active invocation workspace.",
-                AccessLevel.WRITE,
+            "bash": (
                 self._bash,
                 _object_schema(
                     {
@@ -241,6 +221,37 @@ class NativeProvider:
                 ),
                 object_output,
             ),
+        }
+        configured: dict[str, CapabilityDefinition] = {}
+        for definition in definitions:
+            if definition.provider_id != self.id or definition.source_id != self.id:
+                raise ValidationError(
+                    f"native provider received invalid capability: {definition.id}"
+                )
+            if definition.handler_name is None:
+                raise ValidationError(
+                    f"native capability has no handler binding: {definition.id}"
+                )
+            if definition.handler_name in configured:
+                raise ValidationError(
+                    f"native handler is bound more than once: {definition.handler_name}"
+                )
+            configured[definition.handler_name] = definition
+        if set(configured) != set(implementations):
+            missing = sorted(set(implementations) - set(configured))
+            unknown = sorted(set(configured) - set(implementations))
+            details = []
+            if missing:
+                details.append("missing " + ", ".join(missing))
+            if unknown:
+                details.append("unknown " + ", ".join(unknown))
+            raise ValidationError(
+                "native capability catalog does not match implementations: "
+                + "; ".join(details)
+            )
+        return tuple(
+            NativeToolBinding(configured[name], *implementations[name])
+            for name in configured
         )
 
     def _safe_path(

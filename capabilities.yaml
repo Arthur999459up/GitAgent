@@ -2,6 +2,415 @@ defaults:
   discover: deny
   invoke: deny
 
+mcp_servers:
+  - id: github
+    transport: local_adapter
+    enabled: true
+    config:
+      inject_repository: true
+
+  - id: context7
+    transport: streamable_http
+    enabled: true
+    config:
+      endpoint: https://mcp.context7.com/mcp
+
+capabilities:
+  - id: native.read
+    provider: native
+    source: native
+    handler: read
+    description: Read a UTF-8 file from the workspace or an authorized read-only Memory root.
+    access: READ
+    enabled: true
+
+  - id: native.glob
+    provider: native
+    source: native
+    handler: glob
+    description: Find workspace files matching a glob pattern, bounded to 100 results.
+    access: READ
+    enabled: true
+
+  - id: native.grep
+    provider: native
+    source: native
+    handler: grep
+    description: Search workspace text with a regular expression and return bounded line matches.
+    access: READ
+    enabled: true
+
+  - id: native.now
+    provider: native
+    source: native
+    handler: now
+    description: Return the current local date and time.
+    access: READ
+    enabled: true
+
+  - id: native.write
+    provider: native
+    source: native
+    handler: write
+    description: Create or completely overwrite one workspace text file.
+    access: WRITE
+    enabled: true
+
+  - id: native.edit
+    provider: native
+    source: native
+    handler: edit
+    description: Replace one exact, unique text occurrence in an existing workspace file.
+    access: WRITE
+    enabled: true
+
+  - id: native.delete
+    provider: native
+    source: native
+    handler: delete
+    description: Delete one ordinary file from the active invocation workspace.
+    access: DESTRUCTIVE
+    enabled: true
+
+  - id: native.bash
+    provider: native
+    source: native
+    handler: bash
+    description: Execute one policy-approved command in the active invocation workspace.
+    access: WRITE
+    enabled: true
+
+  - id: repository.get_default_branch
+    provider: mcp
+    source: repository
+    server: github
+    remote_name: get_default_branch
+    description: Return the default branch name and its current commit SHA; use when an exact base ref is required.
+    access: READ
+    enabled: true
+
+  - id: repository.get_file_status
+    provider: mcp
+    source: repository
+    server: github
+    remote_name: get_file_status
+    description: Return which supplied paths exist or are missing at one ref; use to validate ADD/MODIFY/DELETE targets, not to read content.
+    access: READ
+    enabled: true
+
+  - id: repository.get_repo_tree
+    provider: mcp
+    source: repository
+    server: github
+    remote_name: get_repo_tree
+    description: Return a bounded list of repository paths at a ref; use for structural discovery, not content search.
+    access: READ
+    enabled: true
+
+  - id: repository.search_code
+    provider: mcp
+    source: repository
+    server: github
+    remote_name: search_code
+    description: Return bounded literal content matches with paths, lines, snippets, coverage, and ref; use to locate text across files.
+    access: READ
+    enabled: true
+
+  - id: repository.read_file
+    provider: mcp
+    source: repository
+    server: github
+    remote_name: read_file
+    description: Return one bounded source line range with truncation metadata; use when one exact path is known.
+    access: READ
+    enabled: true
+
+  - id: repository.read_files
+    provider: mcp
+    source: repository
+    server: github
+    remote_name: read_files
+    description: Return bounded source ranges for several known paths in one call; use after targets are identified.
+    access: READ
+    enabled: true
+
+  - id: repository.find_symbol
+    provider: mcp
+    source: repository
+    server: github
+    remote_name: find_symbol
+    description: Return likely definition locations for one code symbol; use for definitions rather than general text occurrences.
+    access: READ
+    enabled: true
+
+  - id: repository.find_references
+    provider: mcp
+    source: repository
+    server: github
+    remote_name: find_references
+    description: Return bounded textual occurrences of one known symbol; use for callers and impact after identifying the symbol.
+    access: READ
+    enabled: true
+
+  - id: repository.get_pr_diff
+    provider: mcp
+    source: repository
+    server: github
+    remote_name: get_pr_diff
+    description: Return the bounded patch for one PR; use to inspect actual line changes, not merely changed path names.
+    access: READ
+    enabled: true
+
+  - id: repository.get_changed_files
+    provider: mcp
+    source: repository
+    server: github
+    remote_name: get_changed_files
+    description: Return paths changed by one PR; use for scope discovery before targeted reads, not line-level analysis.
+    access: READ
+    enabled: true
+
+  - id: repository.get_file_history
+    provider: mcp
+    source: repository
+    server: github
+    remote_name: get_file_history
+    description: Return bounded commits affecting one exact repository path; use for historical questions after the path is known.
+    access: READ
+    enabled: true
+
+  - id: github.get_issue
+    provider: mcp
+    source: github
+    server: github
+    remote_name: get_issue
+    description: Return current metadata and body for one Issue; use before updating that numbered Issue.
+    access: READ
+    enabled: true
+
+  - id: github.list_issues
+    provider: mcp
+    source: github
+    server: github
+    remote_name: list_issues
+    description: Return a bounded, filterable Issue collection; use for lists, searches, and summaries rather than one known Issue.
+    access: READ
+    enabled: true
+
+  - id: github.get_issue_comments
+    provider: mcp
+    source: github
+    server: github
+    remote_name: get_issue_comments
+    description: Return bounded discussion comments for one Issue; use when the conversation matters beyond its body.
+    access: READ
+    enabled: true
+
+  - id: github.list_milestones
+    provider: mcp
+    source: github
+    server: github
+    remote_name: list_milestones
+    description: Return repository Milestones and numeric IDs; use before assigning a Milestone named by the user.
+    access: READ
+    enabled: true
+
+  - id: github.get_pr
+    provider: mcp
+    source: github
+    server: github
+    remote_name: get_pr
+    description: Return current metadata, branches, state, and head SHA for one PR; use before PR-scoped writes or merge checks.
+    access: READ
+    enabled: true
+
+  - id: github.list_pull_requests
+    provider: mcp
+    source: github
+    server: github
+    remote_name: list_pull_requests
+    description: Return a bounded, filterable PR collection; use for lists, searches, and summaries rather than one known PR.
+    access: READ
+    enabled: true
+
+  - id: github.get_pr_comments
+    provider: mcp
+    source: github
+    server: github
+    remote_name: get_pr_comments
+    description: Return bounded PR discussion comments; distinct from formal Review events.
+    access: READ
+    enabled: true
+
+  - id: github.get_pr_reviews
+    provider: mcp
+    source: github
+    server: github
+    remote_name: get_pr_reviews
+    description: Return formal PR Review events and states; use for dialogue and merge-readiness checks.
+    access: READ
+    enabled: true
+
+  - id: github.get_workflow_runs
+    provider: mcp
+    source: github
+    server: github
+    remote_name: get_workflow_runs
+    description: Return workflow-run status metadata for a PR or run; fetch job logs separately for failure details.
+    access: READ
+    enabled: true
+
+  - id: github.get_job_logs
+    provider: mcp
+    source: github
+    server: github
+    remote_name: get_job_logs
+    description: Return bounded job metadata and logs for one workflow run; use after identifying a relevant failed run.
+    access: READ
+    enabled: true
+
+  - id: github.post_comment
+    provider: mcp
+    source: github
+    server: github
+    remote_name: post_comment
+    description: Post an issue or pull-request comment.
+    access: WRITE
+    enabled: true
+
+  - id: github.create_issue
+    provider: mcp
+    source: github
+    server: github
+    remote_name: create_issue
+    description: Create a GitHub issue.
+    access: WRITE
+    enabled: true
+
+  - id: github.update_issue
+    provider: mcp
+    source: github
+    server: github
+    remote_name: update_issue
+    description: Update GitHub issue fields.
+    access: WRITE
+    enabled: true
+
+  - id: github.set_issue_lock
+    provider: mcp
+    source: github
+    server: github
+    remote_name: set_issue_lock
+    description: Lock or unlock an issue discussion.
+    access: WRITE
+    enabled: true
+
+  - id: github.update_pr
+    provider: mcp
+    source: github
+    server: github
+    remote_name: update_pr
+    description: Update pull-request state.
+    access: WRITE
+    enabled: true
+
+  - id: github.create_branch
+    provider: mcp
+    source: github
+    server: github
+    remote_name: create_branch
+    description: Create a GitHub branch.
+    access: WRITE
+    enabled: true
+
+  - id: github.push
+    provider: mcp
+    source: github
+    server: github
+    remote_name: push
+    description: Confirm a prepared GitHub branch is published.
+    access: WRITE
+    enabled: true
+
+  - id: github.create_draft_pr
+    provider: mcp
+    source: github
+    server: github
+    remote_name: create_draft_pr
+    description: Create a draft pull request.
+    access: WRITE
+    enabled: true
+
+  - id: github.post_review
+    provider: mcp
+    source: github
+    server: github
+    remote_name: post_review
+    description: Publish a pull-request review.
+    access: WRITE
+    enabled: true
+
+  - id: github.commit
+    provider: mcp
+    source: github
+    server: github
+    remote_name: commit
+    description: Commit exact file additions, modifications, and deletions.
+    access: DESTRUCTIVE
+    enabled: true
+
+  - id: github.commit_to_default_branch
+    provider: mcp
+    source: github
+    server: github
+    remote_name: commit_to_default_branch
+    description: Commit exact changes to the default branch.
+    access: DESTRUCTIVE
+    enabled: true
+
+  - id: github.merge
+    provider: mcp
+    source: github
+    server: github
+    remote_name: merge
+    description: Merge a pull request at an exact reviewed head.
+    access: DESTRUCTIVE
+    enabled: true
+
+  - id: context7.resolve-library-id
+    provider: mcp
+    source: context7
+    server: context7
+    remote_name: resolve-library-id
+    description: Resolve a library name to the Context7 ID required by query-docs; call this before querying documentation when the ID is unknown.
+    access: READ
+    enabled: true
+
+  - id: context7.query-docs
+    provider: mcp
+    source: context7
+    server: context7
+    remote_name: query-docs
+    description: Return current documentation passages for one resolved Context7 library ID and a focused question; use for external library APIs, not repository source.
+    access: READ
+    enabled: true
+
+  - id: skill.code-review
+    provider: skill
+    source: skill
+    path: code-review/SKILL.md
+    description: Load the fixed, read-only code review workflow context.
+    access: READ
+    enabled: true
+
+  - id: skill.debug
+    provider: skill
+    source: skill
+    path: debug/SKILL.md
+    description: Load the fixed causal debugging workflow context.
+    access: READ
+    enabled: true
+
 agents:
   main:
     discover:

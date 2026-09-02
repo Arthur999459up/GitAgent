@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 from gitagent.domain.errors import PermissionDenied, ValidationError
 
+from ..catalog import CapabilityDefinition
 from ..errors import CapabilityInternalError
 from ..models import (
-    AccessLevel,
     Capability,
     CapabilityBinding,
     CapabilityKind,
@@ -20,21 +20,19 @@ from ..models import (
 )
 
 
-@dataclass(frozen=True)
-class SkillDefinition:
-    id: str
-    description: str
-    source_id: str
-    path: str
-    enabled: bool = True
-
-
 class SkillProvider:
     id = "skill"
 
-    def __init__(self, definitions: list[SkillDefinition], *, trusted_root: str | Path) -> None:
+    def __init__(
+        self,
+        definitions: Iterable[CapabilityDefinition],
+        *,
+        trusted_root: str | Path,
+    ) -> None:
         self.trusted_root = Path(trusted_root).resolve()
-        self._definitions = definitions
+        self._definitions = tuple(definitions)
+        if any(definition.provider_id != self.id for definition in self._definitions):
+            raise ValidationError("skill provider received a foreign capability")
 
     def load(self) -> list[CapabilityRegistration]:
         registrations = []
@@ -55,7 +53,7 @@ class SkillProvider:
                         definition.description,
                         definition.source_id,
                         status,
-                        AccessLevel.READ,
+                        definition.access,
                     ),
                     CapabilityBinding(definition.id, self.id, definition),
                 )
@@ -70,11 +68,13 @@ class SkillProvider:
     ) -> str:
         del arguments, context
         definition = binding.target
-        if not isinstance(definition, SkillDefinition):
+        if not isinstance(definition, CapabilityDefinition):
             raise CapabilityInternalError("Skill binding target is invalid")
         return self._path(definition).read_text(encoding="utf-8")
 
-    def _path(self, definition: SkillDefinition) -> Path:
+    def _path(self, definition: CapabilityDefinition) -> Path:
+        if definition.path is None:
+            raise CapabilityInternalError("Skill binding has no configured path")
         path = (self.trusted_root / definition.path).resolve(strict=False)
         try:
             path.relative_to(self.trusted_root)

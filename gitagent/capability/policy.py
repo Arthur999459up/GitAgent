@@ -10,12 +10,10 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, ClassVar
 
-import yaml
-
 from gitagent.domain.errors import ApprovalRequired, ValidationError
 from gitagent.harness.constraints import ApprovalStore
 
-from .models import AccessLevel, Capability, InvocationContext
+from .models import AccessLevel, Capability, CapabilityKind, InvocationContext
 
 
 class PermissionDecision(str, Enum):
@@ -209,7 +207,6 @@ class PermissionPolicy:
     _AGENT_KEYS = frozenset({"discover", "invoke", "bash_profile"})
     _INVOKE_KEYS = frozenset({"allow", "ask", "deny"})
     _BASH_PROFILES = frozenset({"coding"})
-    _CODING_WORKSPACE_MUTATIONS = frozenset({"native.write", "native.edit", "native.delete"})
 
     def __init__(
         self,
@@ -221,25 +218,6 @@ class PermissionPolicy:
         self._agents = agents
         self.approvals = approvals or ApprovalStore()
         self.bash = bash or BashCommandPolicy()
-
-    @classmethod
-    def from_file(
-        cls,
-        path: str | Path,
-        *,
-        approvals: ApprovalStore | None = None,
-        bash: BashCommandPolicy | None = None,
-    ) -> PermissionPolicy:
-        with Path(path).open("r", encoding="utf-8") as stream:
-            value = yaml.safe_load(stream)
-        if not isinstance(value, dict) or not isinstance(value.get("agents"), dict):
-            raise ValidationError("capabilities policy must contain an agents mapping")
-        defaults = value.get("defaults") or {}
-        if defaults.get("discover", "deny") != "deny" or defaults.get("invoke", "deny") != "deny":
-            raise ValidationError("capabilities policy defaults must be deny")
-        policy = cls(dict(value["agents"]), approvals=approvals, bash=bash)
-        policy.validate_structure()
-        return policy
 
     def validate_structure(self) -> None:
         """Reject unsupported or ambiguous policy syntax before capability execution starts."""
@@ -270,8 +248,8 @@ class PermissionPolicy:
             for capability in capabilities:
                 in_allow = capability.id in buckets["allow"]
                 in_ask = capability.id in buckets["ask"]
-                coding_workspace_mutation = (
-                    agent_id == "coding" and capability.id in self._CODING_WORKSPACE_MUTATIONS
+                coding_workspace_mutation = self._is_coding_workspace_mutation(
+                    agent_id, capability
                 )
                 if (
                     in_allow
@@ -303,8 +281,8 @@ class PermissionPolicy:
                     raise ValidationError(
                         f"agent {agent_id} discovers native.bash without command-level invoke.allow"
                     )
-                coding_workspace_mutation = (
-                    agent_id == "coding" and capability.id in self._CODING_WORKSPACE_MUTATIONS
+                coding_workspace_mutation = self._is_coding_workspace_mutation(
+                    agent_id, capability
                 )
                 if (
                     capability.access in {AccessLevel.WRITE, AccessLevel.DESTRUCTIVE}
@@ -338,8 +316,8 @@ class PermissionPolicy:
         if self._matches(capability.id, invocation.get("deny") or []):
             return Authorization(PermissionDecision.DENY, "capability is denied by the agent invoke policy")
 
-        coding_workspace_mutation = (
-            context.agent_id == "coding" and capability.id in self._CODING_WORKSPACE_MUTATIONS
+        coding_workspace_mutation = self._is_coding_workspace_mutation(
+            context.agent_id, capability
         )
         if coding_workspace_mutation:
             if not context.workspace_root:
@@ -408,6 +386,21 @@ class PermissionPolicy:
             return False
         profile = str(config.get("bash_profile") or "") or None
         return self.bash.is_real_verification(command, profile)
+
+    @staticmethod
+    def _is_coding_workspace_mutation(agent_id: str, capability: Capability) -> bool:
+        properties = (
+            capability.input_schema.get("properties", {})
+            if isinstance(capability.input_schema, dict)
+            else {}
+        )
+        return (
+            agent_id == "coding"
+            and capability.kind == CapabilityKind.NATIVE_TOOL
+            and capability.access in {AccessLevel.WRITE, AccessLevel.DESTRUCTIVE}
+            and isinstance(properties, dict)
+            and "path" in properties
+        )
 
     @classmethod
     def _config_error(cls, agent_id: str, config: Any) -> str:

@@ -1,3 +1,3 @@
-from .transport import Context7Client, MCPTransportError, StreamableHTTPTransport
+from .transport import MCPTransportError, StreamableHTTPTransport
 
-__all__ = ["Context7Client", "MCPTransportError", "StreamableHTTPTransport"]
+__all__ = ["MCPTransportError", "StreamableHTTPTransport"]
