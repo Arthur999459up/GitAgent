@@ -16,6 +16,7 @@ from typing import Any
 from gitagent.domain.errors import PermissionDenied, ValidationError
 
 from ..errors import (
+    CapabilityInternalError,
     ProviderConflictError,
     ProviderExecutionError,
     ProviderTimeoutError,
@@ -107,7 +108,7 @@ class NativeProvider:
     ) -> Any:
         definition = binding.target
         if not isinstance(definition, NativeToolDefinition):
-            raise TypeError("native binding target is invalid")
+            raise CapabilityInternalError("native binding target is invalid")
         return definition.handler(arguments, context)
 
     @staticmethod

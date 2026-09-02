@@ -15,6 +15,7 @@ from gitagent.domain.errors import (
 )
 
 from ..errors import (
+    CapabilityInternalError,
     ProviderAuthenticationError,
     ProviderConflictError,
     ProviderExecutionError,
@@ -104,7 +105,7 @@ class MCPProvider:
     ) -> Any:
         definition = binding.target
         if not isinstance(definition, MCPToolDefinition):
-            raise TypeError("MCP binding target is invalid")
+            raise CapabilityInternalError("MCP binding target is invalid")
         client = self._clients.get(definition.server_id)
         if client is None:
             raise ProviderUnavailableError(
@@ -147,7 +148,7 @@ class MCPProvider:
     def reconnect(self, binding: CapabilityBinding) -> None:
         definition = binding.target
         if not isinstance(definition, MCPToolDefinition):
-            raise TypeError("MCP binding target is invalid")
+            raise CapabilityInternalError("MCP binding target is invalid")
         client = self._clients.get(definition.server_id)
         if client is not None and hasattr(client, "reconnect"):
             try:

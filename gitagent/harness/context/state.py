@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from gitagent.agent_loop.models import WaitForUser
 from gitagent.capability import AccessLevel, CapabilityResult
+from gitagent.capability.errors import CapabilityErrorType, capability_error
 from gitagent.domain.errors import ValidationError
 from gitagent.domain.models import (
     AgentGuidance,
@@ -25,7 +26,11 @@ from gitagent.harness.context.messages import (
     canonical_message,
     tool_result_message,
 )
-from gitagent.harness.file_reads import FileReadLedger, PreparedFileRead
+from gitagent.harness.file_reads import (
+    FileReadLedger,
+    FileReadOutputValidationError,
+    PreparedFileRead,
+)
 from gitagent.prompts import get_prompt_library
 
 if TYPE_CHECKING:
@@ -297,7 +302,10 @@ class AgentContext:
         )
 
     def commit_capability_call(
-        self, invocation: CapabilityCallRecord
+        self,
+        invocation: CapabilityCallRecord,
+        *,
+        approval_id: str | None = None,
     ) -> CapabilityCallRecord:
         capability_id = invocation.result.capability_id
         actual_arguments = invocation.execution_arguments
@@ -325,7 +333,14 @@ class AgentContext:
                 "path": path,
             }
         elif prepared is not None:
-            content, observation_data = self.file_reads.complete(prepared, raw_result)
+            try:
+                content, observation_data = self.file_reads.complete(
+                    prepared, raw_result
+                )
+            except FileReadOutputValidationError as exc:
+                invocation_result = self._invalid_output_result(invocation, exc)
+                content = None
+                observation_data = None
         else:
             content = raw_result
             observation_data = (
@@ -431,7 +446,49 @@ class AgentContext:
             invocation, observation_data=observation_data, result=result
         )
         self._harness.commit_capability_failure_guard(self, committed)
+        self._harness.audit_capability_result(
+            self, committed, approval_id=approval_id
+        )
         return committed
+
+    def _invalid_output_result(
+        self, invocation: CapabilityCallRecord, error: Exception
+    ) -> CapabilityResult:
+        capability_error_result = capability_error(
+            CapabilityErrorType.INVALID_OUTPUT,
+            str(error),
+            details={
+                "provider_executed": True,
+                "side_effect_possible": False,
+            },
+        )
+        result = CapabilityResult(
+            invocation.result.capability_id,
+            "failed",
+            "none",
+            error=capability_error_result,
+            attempts=invocation.result.attempts,
+        )
+        from gitagent.infra.observability import TraceCategory, TraceStatus
+
+        try:
+            self._harness.trace.emit(
+                session_id=self.session_id,
+                category=TraceCategory.CAPABILITY,
+                name=invocation.result.capability_id,
+                status=TraceStatus.FAILED,
+                details={
+                    "agent": self.agent,
+                    "run_id": self.run_id,
+                    "call_id": invocation.call_id,
+                    "event": "output_validation.failed",
+                    "error": CapabilityErrorType.INVALID_OUTPUT.value,
+                    **(capability_error_result.details or {}),
+                },
+            )
+        except Exception:  # noqa: BLE001, S110 - observability is best effort
+            pass
+        return result
 
     def start_message_thread(self) -> None:
         if self.messages:

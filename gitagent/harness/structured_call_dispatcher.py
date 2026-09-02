@@ -6,7 +6,11 @@ from typing import Any
 
 from gitagent.agent_loop.models import AgentCall, CapabilityCall, PendingCall
 from gitagent.capability import CapabilityResult
-from gitagent.capability.errors import CapabilityErrorType, capability_error
+from gitagent.capability.errors import (
+    CapabilityErrorType,
+    CapabilityInternalError,
+    capability_error,
+)
 from gitagent.domain.errors import ValidationError, WorkflowError
 from gitagent.domain.models import (
     ApprovalIntent,
@@ -95,8 +99,19 @@ class StructuredCallDispatcher:
         call: CapabilityCall,
     ) -> Any | None:
         arguments = dict(call.arguments)
-        self.validate_protected_capability(context, call.capability_id, arguments)
         self._validate_open_call(context, call)
+        try:
+            self.validate_protected_capability(
+                context, call.capability_id, arguments
+            )
+        except ValidationError as exc:
+            return self._failure_record(
+                call, CapabilityErrorType.INVALID_INPUT, str(exc)
+            )
+        except WorkflowError as exc:
+            return self._failure_record(
+                call, CapabilityErrorType.PERMISSION_DENIED, str(exc)
+            )
 
         previous = self._latest_capability_attempt(context)
         previous_payload = (previous or {}).get("payload") or {}
@@ -114,26 +129,15 @@ class StructuredCallDispatcher:
         ):
             already_corrected = previous_payload.get("error") == "duplicate_call"
             if already_corrected:
-                raise WorkflowError(
-                    "agent repeated an identical capability call after correction"
+                return self._failure_record(
+                    call,
+                    CapabilityErrorType.REPEATED_FAILURE,
+                    "The identical capability call was repeated after correction.",
                 )
-            error = capability_error(
+            return self._failure_record(
+                call,
                 CapabilityErrorType.DUPLICATE_CALL,
                 "The identical capability call was just attempted; choose another call.",
-            )
-            from gitagent.harness.context.state import CapabilityCallRecord
-
-            return CapabilityCallRecord(
-                call.call_id,
-                arguments,
-                None,
-                CapabilityResult(
-                    call.capability_id,
-                    "failed",
-                    "none",
-                    error=error,
-                    attempts=0,
-                ),
             )
         return None
 
@@ -231,10 +235,13 @@ class StructuredCallDispatcher:
                 {"status": "cancelled", "reason": reason},
                 call_id=call.call_id,
             )
-            self.observe(
+            self.observe_call_cancelled(
                 context,
-                "call_cancelled",
-                {"call_id": call.call_id, "reason": reason},
+                {
+                    "call_id": call.call_id,
+                    "capability_id": call.capability_id,
+                    "reason": reason,
+                },
             )
 
         return self.harness.coordinator.execute(
@@ -248,6 +255,9 @@ class StructuredCallDispatcher:
             lane_for=lambda call: "capability",
             provider_for=lambda call: self.harness.provider_id(call.capability_id),
             owner=context,
+            observe_failure=lambda call, profile, action: (
+                self.observe_failure_scope(context, call, profile, action)
+            ),
         )
 
     @staticmethod
@@ -259,10 +269,27 @@ class StructuredCallDispatcher:
             and hasattr(outcome, "result")
         ):
             return outcome
+        if isinstance(outcome, CapabilityInternalError):
+            raise outcome
+        if isinstance(outcome, Exception):
+            raise CapabilityInternalError(
+                "Capability execution escaped its structured result boundary"
+            ) from outcome
+        raise CapabilityInternalError(
+            "Capability execution returned an invalid Runtime outcome"
+        )
+
+    @staticmethod
+    def _failure_record(
+        call: CapabilityCall,
+        error_type: CapabilityErrorType,
+        message: str,
+    ) -> Any:
         from gitagent.harness.context.state import CapabilityCallRecord
 
-        message = str(outcome) if isinstance(outcome, Exception) else "capability failed"
-        error = capability_error(CapabilityErrorType.EXECUTION_FAILED, message)
+        error = capability_error(
+            error_type, message, details={"stage": "dispatcher_preflight"}
+        )
         return CapabilityCallRecord(
             call.call_id,
             dict(call.arguments),
@@ -286,9 +313,25 @@ class StructuredCallDispatcher:
     ) -> str:
         arguments = dict(call.arguments)
         if invocation.call_id != call.call_id:
-            raise ValidationError("Capability result call_id correlation is invalid")
+            raise CapabilityInternalError(
+                "Capability result call_id correlation is invalid"
+            )
+        if invocation.result.capability_id != call.capability_id:
+            raise CapabilityInternalError(
+                "Capability result identity does not match its call"
+            )
         invocation = context.commit_capability_call(invocation)
+        if invocation.result.status not in {
+            "success",
+            "failed",
+            "approval_required",
+        }:
+            raise CapabilityInternalError("Capability result status is invalid")
         if invocation.result.status == "approval_required":
+            if invocation.result.error is not None:
+                raise CapabilityInternalError(
+                    "approval-required Capability result contains an error"
+                )
             self.queue(
                 context,
                 summary or f"执行 {call.capability_id}",
@@ -298,13 +341,19 @@ class StructuredCallDispatcher:
             return "waiting"
         if invocation.result.status == "failed":
             error = invocation.result.error
+            if error is None:
+                raise CapabilityInternalError(
+                    "failed Capability result has no structured error"
+                )
             payload = {
                 "status": "failed",
                 "capability_id": invocation.result.capability_id,
-                "error": error.type.value if error is not None else "unknown",
-                "message": error.message if error is not None else "capability failed",
+                "error": error.type.value,
+                "message": error.message,
             }
             context.append_tool_result(payload, call_id=call.call_id)
+            if (error.details or {}).get("stage") == "dispatcher_preflight":
+                self._trace_preflight_failure(context, call, invocation)
             self.observe(
                 context,
                 "capability_error",
@@ -313,11 +362,16 @@ class StructuredCallDispatcher:
                     "arguments": arguments,
                     "error": payload["error"],
                     "message": payload["message"],
-                    "details": error.details if error is not None else {},
+                    "details": error.details or {},
                     "attempts": invocation.result.attempts,
                 },
             )
             return "failed"
+
+        if invocation.result.error is not None:
+            raise CapabilityInternalError(
+                "successful Capability result contains an error"
+            )
 
         payload = {
             "capability_id": call.capability_id,
@@ -453,14 +507,77 @@ class StructuredCallDispatcher:
     def _validate_open_call(self, context: Any, call: CapabilityCall) -> None:
         open_call = context.unresolved_tool_call(call.call_id)
         if open_call is None:
-            raise ValidationError("structured Capability call is missing its assistant message")
+            raise CapabilityInternalError(
+                "structured Capability call is missing its assistant message"
+            )
         function = open_call.get("function") or {}
         name = str(function.get("name") or "") if isinstance(function, dict) else ""
         expected = self.harness.function_name(call.capability_id)
         if str(open_call.get("id") or "") != call.call_id or name != expected:
-            raise ValidationError(
+            raise CapabilityInternalError(
                 "structured Capability call does not match the open provider call"
             )
+
+    def observe_failure_scope(
+        self,
+        context: Any,
+        call: CapabilityCall | AgentCall,
+        profile: Any,
+        action: str,
+    ) -> None:
+        payload = {
+            "call_id": call.call_id,
+            "call_type": "capability" if isinstance(call, CapabilityCall) else "agent",
+            "target": (
+                call.capability_id
+                if isinstance(call, CapabilityCall)
+                else call.agent_id
+            ),
+            "failure_scope": profile.failure_scope.value,
+            "action": action,
+        }
+        self.observe(context, "failure_scope", payload)
+        self.harness.trace.emit(
+            session_id=context.session_id,
+            category=TraceCategory.WORKFLOW,
+            name="failure_propagation",
+            status=TraceStatus.COMPLETED,
+            details={"agent": context.agent, **payload},
+        )
+
+    def _trace_preflight_failure(
+        self, context: Any, call: CapabilityCall, invocation: Any
+    ) -> None:
+        error = invocation.result.error
+        try:
+            self.harness.trace.emit(
+                session_id=context.session_id,
+                category=TraceCategory.CAPABILITY,
+                name=call.capability_id,
+                status=TraceStatus.FAILED,
+                details={
+                    "agent": context.agent,
+                    "run_id": context.run_id,
+                    "call_id": call.call_id,
+                    "event": "preflight.failed",
+                    "failure_domain": "capability",
+                    "error": error.type.value,
+                },
+            )
+        except Exception:  # noqa: BLE001, S110 - observability is best effort
+            pass
+
+    def observe_call_cancelled(
+        self, context: Any, payload: dict[str, Any]
+    ) -> None:
+        self.observe(context, "call_cancelled", payload)
+        self.harness.trace.emit(
+            session_id=context.session_id,
+            category=TraceCategory.WORKFLOW,
+            name="call_cancelled",
+            status=TraceStatus.CANCELLED,
+            details={"agent": context.agent, **payload},
+        )
 
     @staticmethod
     def validate_protected_capability(

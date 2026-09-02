@@ -90,7 +90,11 @@ class AgentLoop:
         except Exception as exc:  # noqa: BLE001 - loop boundary records failures
             if self._stop_if_cancelled(context):
                 return context
-            self._fail(context, f"user decision failed: {exc}")
+            self._fail(
+                context,
+                f"user decision failed: {exc}",
+                error_type=type(exc).__name__,
+            )
             return context
         if not context.waiting and not self._continue_open_batch(context, agent):
             self.dispatcher.emit(context, "waiting", context.waiting_question)
@@ -184,7 +188,11 @@ class AgentLoop:
             if self._stop_if_cancelled(context):
                 return
             if context.steps >= context.max_steps:
-                self._fail(context, f"达到步数上限（{context.max_steps}）")
+                self._fail(
+                    context,
+                    f"达到步数上限（{context.max_steps}）",
+                    error_type="StepLimitExceeded",
+                )
                 return
             context.steps += 1
             try:
@@ -274,6 +282,7 @@ class AgentLoop:
                         context,
                         "模型连续返回无效响应；已达到结构化响应重试上限。"
                         f" 最后错误：{exc}",
+                        error_type=type(exc).__name__,
                     )
                     return
                 if not open_calls:
@@ -301,6 +310,7 @@ class AgentLoop:
                         context,
                         "模型提供方连续失败；已达到提供方重试上限。"
                         f" 最后错误：{exc}",
+                        error_type=type(exc).__name__,
                     )
                     return
                 continue
@@ -319,12 +329,18 @@ class AgentLoop:
                         "breakdown": exc.breakdown,
                     },
                 )
-                self._fail(context, str(exc))
+                self._fail(
+                    context, str(exc), error_type=type(exc).__name__
+                )
                 return
             except Exception as exc:  # noqa: BLE001 - loop boundary records failures
                 if self._stop_if_cancelled(context):
                     return
-                self._fail(context, f"agent step failed: {exc}")
+                self._fail(
+                    context,
+                    f"agent step failed: {exc}",
+                    error_type=type(exc).__name__,
+                )
                 return
             except BaseException as exc:
                 self._cancel_context(
@@ -503,10 +519,22 @@ class AgentLoop:
                 {"status": "cancelled", "reason": reason},
                 call_id=call.call_id,
             )
-            self.dispatcher.observe(
+            self.dispatcher.observe_call_cancelled(
                 context,
-                "call_cancelled",
-                {"call_id": call.call_id, "reason": reason},
+                {
+                    "call_id": call.call_id,
+                    "call_type": (
+                        "capability"
+                        if isinstance(call, CapabilityCall)
+                        else "agent"
+                    ),
+                    "target": (
+                        call.capability_id
+                        if isinstance(call, CapabilityCall)
+                        else call.agent_id
+                    ),
+                    "reason": reason,
+                },
             )
 
         completed = self.harness.coordinator.execute(
@@ -530,6 +558,11 @@ class AgentLoop:
                 else None
             ),
             owner=context,
+            observe_failure=lambda call, profile, action: (
+                self.dispatcher.observe_failure_scope(
+                    context, call, profile, action
+                )
+            ),
         )
         if not completed and not context.waiting:
             self._cancel_context(context)
@@ -538,8 +571,6 @@ class AgentLoop:
     def _continue_open_batch(
         self, context: Any, agent: AgentLoopAgent
     ) -> bool:
-        from gitagent.harness.execution import FailureScope
-
         schemas = getattr(agent, "agent_schemas", dict)()
         while True:
             open_calls = context.open_tool_calls()
@@ -568,7 +599,15 @@ class AgentLoop:
                         profile = self.harness.describe_agent_execution(
                             context, resolved
                         )
-                        if profile.failure_scope == FailureScope.FENCE:
+                        if self.harness.coordinator.failure_stops_batch(
+                            resolved,
+                            profile,
+                            observe_failure=lambda call, profile, action: (
+                                self.dispatcher.observe_failure_scope(
+                                    context, call, profile, action
+                                )
+                            ),
+                        ):
                             self._cancel_remaining_open_calls(
                                 context,
                                 "stopped after a resumed Agent fence failed",
@@ -592,7 +631,15 @@ class AgentLoop:
                         profile = self.harness.describe_capability_execution(
                             context, resolved
                         )
-                        if profile.failure_scope == FailureScope.FENCE:
+                        if self.harness.coordinator.failure_stops_batch(
+                            resolved,
+                            profile,
+                            observe_failure=lambda call, profile, action: (
+                                self.dispatcher.observe_failure_scope(
+                                    context, call, profile, action
+                                )
+                            ),
+                        ):
                             self._cancel_remaining_open_calls(
                                 context,
                                 "stopped after a resumed execution fence failed",
@@ -820,12 +867,22 @@ class AgentLoop:
     def _cancel_remaining_open_calls(self, context: Any, reason: str) -> None:
         for call in context.open_tool_calls():
             call_id = str(call.get("id") or "")
+            function = call.get("function") or {}
+            name = (
+                str(function.get("name") or "")
+                if isinstance(function, dict)
+                else ""
+            )
             child = context.active_children.pop(call_id, None)
             if child is not None:
                 self._cancel_context(child, reason=reason)
             context.uncommitted_capability_results.pop(call_id, None)
             context.append_tool_result(
                 {"status": "cancelled", "reason": reason}, call_id=call_id
+            )
+            self.dispatcher.observe_call_cancelled(
+                context,
+                {"call_id": call_id, "target": name, "reason": reason},
             )
 
     @staticmethod
@@ -835,7 +892,13 @@ class AgentLoop:
                 payload, call_id=str(call.get("id") or "")
             )
 
-    def _fail(self, context: Any, error: str | Exception) -> None:
+    def _fail(
+        self,
+        context: Any,
+        error: str | Exception,
+        *,
+        error_type: str | None = None,
+    ) -> None:
         self._cleanup_coding_workspace(context)
         self._close_open_calls(
             context, {"status": "failed", "reason": str(error)}
@@ -846,7 +909,15 @@ class AgentLoop:
         context.uncommitted_capability_results.clear()
         context.error = str(error)
         context.finished = True
-        self.dispatcher.emit(context, "failed", str(error))
+        self.dispatcher.emit(
+            context,
+            "failed",
+            str(error),
+            details={
+                "failure_domain": "agent",
+                "error_type": error_type or type(error).__name__,
+            },
+        )
 
     def _cancel_context(
         self, context: Any, *, reason: str = "execution was cancelled"

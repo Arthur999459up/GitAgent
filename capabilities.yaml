@@ -6,9 +6,13 @@ agents:
   main:
     discover:
       - native.read
+      - context7.*
+      - rag.*
     invoke:
       allow:
         - native.read
+        - context7.*
+        - rag.*
       ask: []
       deny: []
 

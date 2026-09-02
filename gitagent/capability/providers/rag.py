@@ -13,6 +13,7 @@ from gitagent.capability.rag import (
 from gitagent.domain.errors import ResourceNotFoundError, ValidationError
 
 from ..errors import (
+    CapabilityInternalError,
     ProviderExecutionError,
     ProviderTimeoutError,
     ProviderUnavailableError,
@@ -130,7 +131,7 @@ class RAGProvider:
         del context
         definition = binding.target
         if not isinstance(definition, RAGDefinition):
-            raise TypeError("RAG binding target is invalid")
+            raise CapabilityInternalError("RAG binding target is invalid")
         if definition.status == KnowledgeBaseStatus.ERROR:
             reason = definition.unavailable_reason or "knowledge base is unavailable"
             raise ProviderUnavailableError(reason)
@@ -168,5 +169,5 @@ class RAGProvider:
 
     def reconnect(self, binding: CapabilityBinding) -> None:
         if not isinstance(binding.target, RAGDefinition):
-            raise TypeError("RAG binding target is invalid")
+            raise CapabilityInternalError("RAG binding target is invalid")
         self.manager.reset_runtime()

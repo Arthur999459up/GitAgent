@@ -20,7 +20,7 @@ from gitagent.capability import (
     InvocationContext,
 )
 from gitagent.capability.schema import validate_schema, validate_schema_definition
-from gitagent.domain.errors import ValidationError
+from gitagent.domain.errors import StructuredOutputError, ValidationError
 from gitagent.domain.models import AgentGuidance, AgentSpec, VerificationReport
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.validation.output import validate_agent_output
@@ -283,6 +283,10 @@ class ExecutionCoordinator:
         lane_for: Callable[[CapabilityCall | AgentCall], str],
         provider_for: Callable[[CapabilityCall | AgentCall], str | None],
         owner: object,
+        observe_failure: Callable[
+            [CapabilityCall | AgentCall, ExecutionProfile, str], None
+        ]
+        | None = None,
     ) -> bool:
         if len(calls) != len(profiles):
             raise ValidationError("calls and execution profiles must stay aligned")
@@ -355,9 +359,10 @@ class ExecutionCoordinator:
                             suspend_call(suspended_call, suspended_outcome)
                         return False
                     settled.add(call.call_id)
-                    if (
-                        decision == "failed"
-                        and profile.failure_scope == FailureScope.FENCE
+                    if decision == "failed" and self.failure_stops_batch(
+                        call,
+                        profile,
+                        observe_failure=observe_failure,
                     ):
                         cancel_unsettled(
                             calls[position + offset + 1 :],
@@ -382,6 +387,27 @@ class ExecutionCoordinator:
             raise
         finally:
             self._unregister_cancellation(owner, cancellation, parent)
+
+    @staticmethod
+    def failure_stops_batch(
+        call: CapabilityCall | AgentCall,
+        profile: ExecutionProfile,
+        *,
+        observe_failure: Callable[
+            [CapabilityCall | AgentCall, ExecutionProfile, str], None
+        ]
+        | None = None,
+    ) -> bool:
+        """Own the one decision that propagates a settled call failure."""
+
+        stops_batch = profile.failure_scope == FailureScope.FENCE
+        if observe_failure is not None:
+            observe_failure(
+                call,
+                profile,
+                "cancel_siblings" if stops_batch else "isolate",
+            )
+        return stops_batch
 
     @staticmethod
     def _group_end(profiles: Sequence[ExecutionProfile], start: int) -> int:
@@ -513,9 +539,7 @@ class ExecutionCoordinator:
         if cancellation.cancelled.is_set():
             raise _ExecutionCancelled
         provider_slot = None
-        if isinstance(call, CapabilityCall):
-            if provider_id is None:
-                raise ValidationError("Capability execution has no provider binding")
+        if isinstance(call, CapabilityCall) and provider_id is not None:
             provider_slot = self._provider_slots.get(provider_id)
             if provider_slot is None:
                 raise ValidationError(
@@ -830,14 +854,26 @@ class AgentHarness:
         invocation = self.invocation_context(
             context, approval_id=approval_id, call_id=call_id
         )
-        visible = next(
-            (item for item in self.discover(context) if item.id == capability_id), None
-        )
-        result = self._capabilities.invoke(
+        return self._capabilities.invoke(
             capability_id,
             arguments,
             invocation,
             preflighted=preflighted,
+        )
+
+    def audit_capability_result(
+        self,
+        context: AgentContext,
+        record: Any,
+        *,
+        approval_id: str | None = None,
+    ) -> None:
+        """Record the authoritative outcome after Harness post-processing."""
+
+        result = record.result
+        capability_id = result.capability_id
+        visible = next(
+            (item for item in self.discover(context) if item.id == capability_id), None
         )
         audit_result = (
             "OK"
@@ -846,7 +882,13 @@ class AgentHarness:
             if result.status == "approval_required"
             else "FAILED"
         )
+        arguments = (
+            record.execution_arguments
+            if record.execution_arguments is not None
+            else record.arguments
+        )
         details: dict[str, Any] = {
+            "call_id": record.call_id,
             "argument_keys": sorted(arguments),
             "attempts": result.attempts,
         }
@@ -862,7 +904,6 @@ class AgentHarness:
             result=audit_result,
             details=details,
         )
-        return result
 
     def discover(self, context: AgentContext) -> tuple[Any, ...]:
         return self._capabilities.discover(self.invocation_context(context))
@@ -915,21 +956,28 @@ class AgentHarness:
         if call.name.startswith("capability__"):
             capability_id = self.resolve_llm_name(call.name, context)
             if capability_id == call.name:
-                raise ValidationError(f"unknown Capability function: {call.name}")
+                raise StructuredOutputError(
+                    f"unknown Capability function: {call.name}"
+                )
             return CapabilityCall(call.call_id, capability_id, dict(call.arguments))
         if call.name.startswith("agent__"):
             agent_id = call.name.removeprefix("agent__")
             schemas = agent_schemas or {}
             schema = schemas.get(agent_id)
             if schema is None:
-                raise ValidationError(f"Agent call is not allowed here: {call.name}")
-            validate_schema(
-                call.arguments,
-                schema,
-                label=f"{call.name} arguments",
-            )
+                raise StructuredOutputError(
+                    f"Agent call is not allowed here: {call.name}"
+                )
+            try:
+                validate_schema(
+                    call.arguments,
+                    schema,
+                    label=f"{call.name} arguments",
+                )
+            except ValidationError as exc:
+                raise StructuredOutputError(str(exc)) from exc
             return AgentCall(call.call_id, agent_id, dict(call.arguments))
-        raise ValidationError(
+        raise StructuredOutputError(
             "structured function name must use capability__ or agent__ namespace"
         )
 
@@ -980,10 +1028,10 @@ class AgentHarness:
             record.result,
         )
 
-    def provider_id(self, capability_id: str) -> str:
+    def provider_id(self, capability_id: str) -> str | None:
         registration = self._capabilities.registry.resolve(capability_id)
         if registration is None:
-            raise ValidationError(f"Capability does not exist: {capability_id}")
+            return None
         return registration.binding.provider_id
 
     def execute_capability_invocation(
@@ -1012,7 +1060,9 @@ class AgentHarness:
         def commit(_: CapabilityCall | AgentCall, record: Any) -> str:
             if isinstance(record, Exception):
                 raise record
-            outcome.append(context.commit_capability_call(record))
+            outcome.append(
+                context.commit_capability_call(record, approval_id=approval_id)
+            )
             return "continue"
 
         self.coordinator.execute(

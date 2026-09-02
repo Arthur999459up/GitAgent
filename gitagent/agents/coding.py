@@ -798,16 +798,6 @@ class CodingAgent:
                     raise WorkflowError(
                         "CodingAgent evidence gathering may use only visible READ capabilities"
                     )
-                try:
-                    permission = self.harness.capability_permission_decision(
-                        context, resolved
-                    )
-                except ValidationError as exc:
-                    raise StructuredOutputError(str(exc)) from exc
-                if permission != "ALLOW":
-                    raise WorkflowError(
-                        "CodingAgent evidence capability is not directly permitted"
-                    )
                 resolved_calls.append(resolved)
 
             try:

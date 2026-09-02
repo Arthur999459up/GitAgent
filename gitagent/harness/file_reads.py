@@ -9,6 +9,10 @@ from gitagent.domain.errors import ValidationError
 from gitagent.harness.file_access import parse_file_read_requests, safe_repository_path
 
 
+class FileReadOutputValidationError(ValidationError):
+    """A file-read Provider result violates the ledger's output contract."""
+
+
 @dataclass(frozen=True)
 class FileReadRequest:
     path: str
@@ -287,11 +291,7 @@ class FileReadLedger:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         repository = prepared.repository
         ref = prepared.ref
-        fresh = (
-            [result]
-            if prepared.capability_id == "repository.read_file" and result is not None
-            else list((result or {}).get("files", []))
-        )
+        fresh = self._validated_fresh_results(prepared, result)
         for request, item in zip(prepared.actual, fresh, strict=True):
             coverage = self._coverage(repository, request.path, ref)
             coverage.add(item)
@@ -312,6 +312,59 @@ class FileReadLedger:
         if prepared.capability_id == "repository.read_file":
             return returned[0], observation_files[0]
         return {"files": returned}, {"files": observation_files}
+
+    @staticmethod
+    def _validated_fresh_results(
+        prepared: PreparedFileRead,
+        result: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        if not prepared.actual:
+            return []
+        if not isinstance(result, dict):
+            raise FileReadOutputValidationError(
+                "file read Capability returned a non-object result"
+            )
+        if prepared.capability_id == "repository.read_file":
+            fresh = [result]
+        else:
+            files = result.get("files")
+            if not isinstance(files, list):
+                raise FileReadOutputValidationError(
+                    "read_files Capability result has no files array"
+                )
+            if any(not isinstance(item, dict) for item in files):
+                raise FileReadOutputValidationError(
+                    "read_files Capability returned a non-object file"
+                )
+            fresh = files
+        if len(fresh) != len(prepared.actual):
+            raise FileReadOutputValidationError(
+                "file read Capability result count does not match its request"
+            )
+        for request, item in zip(prepared.actual, fresh, strict=True):
+            if str(item.get("path") or "") != request.path:
+                raise FileReadOutputValidationError(
+                    "file read Capability result path does not match its request"
+                )
+            start = item.get("start_line")
+            end = item.get("end_line")
+            content = item.get("content")
+            if (
+                not isinstance(start, int)
+                or isinstance(start, bool)
+                or start < 1
+                or not isinstance(end, int)
+                or isinstance(end, bool)
+                or end < 0
+                or not isinstance(content, str)
+                or bool(content)
+                and end < start
+                or not isinstance(item.get("truncated"), bool)
+            ):
+                raise FileReadOutputValidationError(
+                    "file read Capability returned invalid range metadata"
+                )
+        return fresh
 
     def summaries(self) -> list[dict[str, Any]]:
         return [self._files[key].summary() for key in sorted(self._files, key=lambda item: tuple(str(x) for x in item))]
@@ -350,4 +403,8 @@ def _positive_int(value: Any, name: str) -> int:
     return value
 
 
-__all__ = ["FileReadLedger", "PreparedFileRead"]
+__all__ = [
+    "FileReadLedger",
+    "FileReadOutputValidationError",
+    "PreparedFileRead",
+]

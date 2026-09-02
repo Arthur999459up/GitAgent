@@ -8,6 +8,7 @@ from typing import Any
 
 from gitagent.domain.errors import PermissionDenied, ValidationError
 
+from ..errors import CapabilityInternalError
 from ..models import (
     AccessLevel,
     Capability,
@@ -70,7 +71,7 @@ class SkillProvider:
         del arguments, context
         definition = binding.target
         if not isinstance(definition, SkillDefinition):
-            raise TypeError("Skill binding target is invalid")
+            raise CapabilityInternalError("Skill binding target is invalid")
         return self._path(definition).read_text(encoding="utf-8")
 
     def _path(self, definition: SkillDefinition) -> Path:
@@ -82,4 +83,3 @@ class SkillProvider:
         if path.name != "SKILL.md":
             raise ValidationError("Skill definitions must target a SKILL.md file")
         return path
-

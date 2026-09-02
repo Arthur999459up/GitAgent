@@ -8,7 +8,7 @@ import uuid
 from threading import Lock, RLock
 from typing import Any
 
-from gitagent.domain.errors import ValidationError
+from gitagent.domain.errors import PermissionDenied, ValidationError
 
 from .errors import (
     CapabilityError,
@@ -99,6 +99,7 @@ class CapabilityLayer:
         snapshots = {provider_id: provider.load() for provider_id, provider in providers}
         owners: dict[str, str] = {}
         for provider_id, registrations in snapshots.items():
+            self._validate_provider_snapshot(provider_id, registrations)
             for source_id in {item.capability.source_id for item in registrations}:
                 if source_id in owners:
                     raise ValidationError(f"multiple providers attempted to load source: {source_id}")
@@ -125,6 +126,7 @@ class CapabilityLayer:
             if hasattr(provider, "refresh"):
                 provider.refresh()
             registrations = provider.load()
+            self._validate_provider_snapshot(current_provider_id, registrations)
             current_sources = {item.capability.source_id for item in registrations}
             with self._control_lock:
                 other_sources = {
@@ -147,6 +149,17 @@ class CapabilityLayer:
                 self._provider_sources[current_provider_id] = current_sources
         self.policy.validate_capabilities(self.registry.list())
 
+    @staticmethod
+    def _validate_provider_snapshot(
+        provider_id: str, registrations: Any
+    ) -> None:
+        for registration in registrations:
+            if registration.binding.provider_id != provider_id:
+                raise CapabilityInternalError(
+                    "provider snapshot contains a foreign binding: "
+                    f"{registration.binding.provider_id}"
+                )
+
     def discover(self, context: InvocationContext) -> tuple[Capability, ...]:
         return tuple(
             capability
@@ -168,13 +181,14 @@ class CapabilityLayer:
         capability = registration.capability
         if capability.status != CapabilityStatus.AVAILABLE:
             return PermissionDecision.DENY.value
-        if capability.input_schema is not None:
-            validate_schema(
-                arguments,
-                capability.input_schema,
-                label=f"{capability_id} arguments",
-            )
-        return self.policy.authorize(capability, arguments, context).decision.value
+        if not isinstance(arguments, dict):
+            return PermissionDecision.DENY.value
+        try:
+            return self.policy.authorize(
+                capability, arguments, context
+            ).decision.value
+        except PermissionDenied:
+            return PermissionDecision.DENY.value
 
     def describe_execution(
         self,
@@ -213,9 +227,22 @@ class CapabilityLayer:
         *,
         preflighted: bool = False,
     ) -> CapabilityResult:
-        if not isinstance(arguments, dict):
-            raise CapabilityInternalError("CapabilityLayer.invoke arguments must be a dict")
         call_id = context.call_id or f"call-{uuid.uuid4().hex}"
+        if not isinstance(arguments, dict):
+            self._emit(
+                context,
+                call_id,
+                capability_id,
+                "call.started",
+                {"argument_type": type(arguments).__name__},
+            )
+            error = capability_error(
+                CapabilityErrorType.INVALID_INPUT,
+                "Capability arguments must be an object",
+            )
+            return self._finish_failure(
+                context, call_id, capability_id, error, attempts=0
+            )
         identity = self.failure_guard.call_identity(context.agent_id, capability_id, arguments)
         self._emit(
             context,
@@ -255,7 +282,13 @@ class CapabilityLayer:
             error = capability_error(CapabilityErrorType.INVALID_INPUT, str(exc))
             return self._finish_failure(context, call_id, capability_id, error, attempts=0)
 
-        authorization = self.policy.authorize(capability, arguments, context)
+        try:
+            authorization = self.policy.authorize(capability, arguments, context)
+        except PermissionDenied as exc:
+            error = capability_error(CapabilityErrorType.PERMISSION_DENIED, str(exc))
+            return self._finish_failure(
+                context, call_id, capability_id, error, attempts=0
+            )
         if authorization.decision == PermissionDecision.DENY:
             error = capability_error(CapabilityErrorType.PERMISSION_DENIED, authorization.reason)
             return self._finish_failure(context, call_id, capability_id, error, attempts=0)
@@ -274,6 +307,10 @@ class CapabilityLayer:
             provider = self._providers.get(registration.binding.provider_id)
         if provider is None:
             raise CapabilityInternalError(f"provider is not loaded: {registration.binding.provider_id}")
+        if str(getattr(provider, "id", "")) != registration.binding.provider_id:
+            raise CapabilityInternalError(
+                f"provider binding is invalid: {registration.binding.provider_id}"
+            )
         mutation = capability.access in {AccessLevel.WRITE, AccessLevel.DESTRUCTIVE}
         attempts = 0
         while attempts < 2:
@@ -442,7 +479,12 @@ class CapabilityLayer:
             call_id,
             capability_id,
             "call.failed",
-            {"attempts": attempts, "error": error.type.value},
+            {
+                "attempts": attempts,
+                "failure_domain": "capability",
+                "error": error.type.value,
+                "error_details": error.details or {},
+            },
         )
         return result
 
