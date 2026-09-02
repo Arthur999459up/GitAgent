@@ -59,6 +59,7 @@ class InvocationContext:
     repository: str = ""
     approval_id: str | None = None
     call_id: str | None = None
+    workspace_root: str | None = None
 
 
 @dataclass(frozen=True)

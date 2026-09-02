@@ -131,6 +131,15 @@ class GitHubClient:
             raise ExternalExecutionError(f"GitHub returned no commit SHA for {repository}:{branch}")
         return {"repository": repository, "branch": branch, "commit_sha": commit_sha}
 
+    def get_clone_url(self, repository: str) -> str:
+        """Return the canonical HTTPS clone URL for a repository visible to this client."""
+        repository = self._repository(repository)
+        value = self._request("GET", f"/repos/{repository}")
+        clone_url = str(value.get("clone_url") or "")
+        if not clone_url:
+            raise ExternalExecutionError(f"GitHub returned no clone URL for {repository}")
+        return clone_url
+
     def get_file_status(
         self,
         repository: str,

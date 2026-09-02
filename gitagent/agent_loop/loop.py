@@ -223,6 +223,8 @@ class AgentLoop:
                     or (response.calls[0].name if response.calls else "model response"),
                 )
                 if not response.calls:
+                    if self._unfinished_coding_patch(context):
+                        continue
                     context.final_message = response.text
                     context.result = agent.build_result(context)
                     context.finished = True
@@ -385,10 +387,7 @@ class AgentLoop:
                 summary=summary,
             )
             if not completed and not context.waiting:
-                context.final_message = "execution cancelled"
-                context.error = context.final_message
-                context.finished = True
-                self.dispatcher.emit(context, "cancelled", context.final_message)
+                self._cancel_context(context)
             return completed
 
         from gitagent.harness.execution import ExecutionProfile
@@ -452,7 +451,7 @@ class AgentLoop:
                 )
             child = context.active_children[call.call_id]
             self.start(child, self._child_agent(call.agent_id))
-            if child.waiting and child.agent == "coding" and not child.coding_task_completed:
+            if child.waiting and self._unfinished_coding_patch(child):
                 raise WorkflowError(
                     "workspace-sensitive Coding work paused before producing its artifact"
                 )
@@ -533,10 +532,7 @@ class AgentLoop:
             owner=context,
         )
         if not completed and not context.waiting:
-            context.final_message = "execution cancelled"
-            context.error = context.final_message
-            context.finished = True
-            self.dispatcher.emit(context, "cancelled", context.final_message)
+            self._cancel_context(context)
         return completed
 
     def _continue_open_batch(
@@ -840,6 +836,7 @@ class AgentLoop:
             )
 
     def _fail(self, context: Any, error: str | Exception) -> None:
+        self._cleanup_coding_workspace(context)
         self._close_open_calls(
             context, {"status": "failed", "reason": str(error)}
         )
@@ -854,6 +851,7 @@ class AgentLoop:
     def _cancel_context(
         self, context: Any, *, reason: str = "execution was cancelled"
     ) -> None:
+        self._cleanup_coding_workspace(context)
         already_cancelled = context.finished and context.error == "execution cancelled"
         self._cancel_remaining_open_calls(context, reason)
         context.pending = None
@@ -871,6 +869,26 @@ class AgentLoop:
             return False
         self._cancel_context(context)
         return True
+
+    @staticmethod
+    def _unfinished_coding_patch(context: Any) -> bool:
+        task = getattr(context, "coding_task", None)
+        return bool(
+            getattr(context, "agent", "") == "coding"
+            and task is not None
+            and getattr(task, "mode", None) == "patch"
+            and not getattr(context, "coding_task_completed", False)
+        )
+
+    @staticmethod
+    def _cleanup_coding_workspace(context: Any) -> None:
+        workspace = getattr(context, "coding_workspace", None)
+        if workspace is None:
+            return
+        try:
+            workspace.cleanup(suppress_errors=True)
+        finally:
+            context.coding_workspace = None
 
 
 def rejection_feedback(context: Any) -> str | None:

@@ -1083,6 +1083,7 @@ class AgentHarness:
         approval_id: str | None = None,
         call_id: str | None = None,
     ) -> InvocationContext:
+        workspace = context.coding_workspace
         return InvocationContext(
             run_id=context.run_id,
             session_id=context.session_id,
@@ -1090,6 +1091,12 @@ class AgentHarness:
             repository=context.repository,
             approval_id=approval_id,
             call_id=call_id,
+            workspace_root=str(workspace.root) if workspace is not None else None,
+        )
+
+    def is_bash_verification(self, context: AgentContext, command: str) -> bool:
+        return self._capabilities.policy.is_bash_verification(
+            command, self.invocation_context(context)
         )
 
     def spec(self, agent_name: str) -> AgentSpec:

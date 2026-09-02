@@ -56,7 +56,6 @@ from gitagent.harness.mutation_plans import (
     issue_fix_mutation_plan,
     repository_change_mutation_plan,
 )
-from gitagent.harness.validation.static import StaticVerifier
 from gitagent.infra.observability import TraceBus
 from gitagent.infra.persistence import SessionManager
 from gitagent.memory import MemoryPageStore, MemorySearch, MemoryStopHooks
@@ -84,6 +83,7 @@ class GitAgentService:
         self,
         capabilities: CapabilityLayer,
         *,
+        github: Any,
         main_reasoner: Reasoner,
         agent_reasoner: Reasoner | None = None,
         session_manager: SessionManager | None = None,
@@ -104,8 +104,7 @@ class GitAgentService:
         self.harness.message_sink = self._persist_agent_message
         self.harness.compaction_sink = self._persist_agent_compaction
         domain_reasoner = agent_reasoner or main_reasoner
-        self.verifier = StaticVerifier(self.harness)
-        self.coding = CodingAgent(self.harness, domain_reasoner, self.verifier)
+        self.coding = CodingAgent(self.harness, domain_reasoner, github)
         self.repository_agent = RepositoryAgent(self.harness, domain_reasoner)
         self.pull_request_agent = PullRequestAgent(self.harness, domain_reasoner)
         self.issue_agent = IssueAgent(self.harness, domain_reasoner)
@@ -1028,7 +1027,6 @@ class GitAgentService:
             deleted_files=[str(item) for item in raw.get("deleted_files", [])],
             patch=str(raw.get("patch") or ""),
             files={str(key): str(value) for key, value in dict(raw.get("files") or {}).items()},
-            static_checks=[str(item) for item in raw.get("static_checks", [])],
             risks=[str(item) for item in raw.get("risks", [])],
             verification_required=[str(item) for item in raw.get("verification_required", [])],
         )

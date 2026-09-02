@@ -185,7 +185,6 @@ class CandidatePatch:
     deleted_files: list[str]
     patch: str
     files: dict[str, str]
-    static_checks: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
     verification_required: list[str] = field(default_factory=list)
 
@@ -194,21 +193,13 @@ class CandidatePatch:
         return sorted({*self.added_files, *self.modified_files, *self.deleted_files})
 
 
-@dataclass(frozen=True)
-class CandidatePreparationResult:
-    candidate: CandidatePatch | None
-    verification: VerificationReport | None = None
-    message: str = ""
-    capability_error: dict[str, Any] | None = None
-
-
 @dataclass
 class HumanReviewPackage:
     change_summary: str
     root_cause: str
     files_changed: list[str]
     important_diff: str
-    static_verification: VerificationReport
+    verification: VerificationReport
     potential_risks: list[str]
     suggested_pr_title: str
     suggested_pr_description: str

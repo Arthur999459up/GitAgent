@@ -156,6 +156,7 @@ agents:
       - native.now
       - native.write
       - native.edit
+      - native.delete
       - native.bash
       - context7.*
       - rag.*
@@ -175,29 +176,14 @@ agents:
         - native.glob
         - native.grep
         - native.now
+        - native.write
+        - native.edit
+        - native.delete
         - native.bash
         - context7.*
         - rag.*
         - skill.code-review
         - skill.debug
-      ask:
-        - native.write
-        - native.edit
-      deny: []
-    bash_profile: coding
-
-  static_verifier:
-    discover:
-      - native.read
-      - native.glob
-      - native.grep
-      - native.bash
-    invoke:
-      allow:
-        - native.read
-        - native.glob
-        - native.grep
-        - native.bash
       ask: []
       deny: []
-    bash_profile: static_only
+    bash_profile: coding

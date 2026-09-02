@@ -199,7 +199,7 @@ class PullRequestAgent:
         if mode != "patch" or context.code_candidate is None:
             return
         if context.verification is None or not context.verification.passed:
-            raise WorkflowError("static verification failed; refusing a PR write proposal")
+            raise WorkflowError("verification failed; refusing a PR write proposal")
         if context.change_request is None or not context.change_request.source_ref:
             raise WorkflowError("PR write proposal is missing its candidate head SHA")
         pull_request = self._last_capability(context, "github.get_pr") or {}

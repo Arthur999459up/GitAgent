@@ -15,7 +15,6 @@ _CONFIGURABLE_AGENTS = frozenset(
         "coding",
         "issues",
         "pull_requests",
-        "static_verifier",
     }
 )
 

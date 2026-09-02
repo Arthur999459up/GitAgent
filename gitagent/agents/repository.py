@@ -136,7 +136,7 @@ class RepositoryAgent:
             return
         if context.verification is None or not context.verification.passed:
             raise WorkflowError(
-                "static verification failed; refusing a default-branch proposal"
+                "verification failed; refusing a default-branch proposal"
             )
         dispatcher.queue_repository_change(context)
 

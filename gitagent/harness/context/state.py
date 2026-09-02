@@ -29,6 +29,7 @@ from gitagent.harness.file_reads import FileReadLedger, PreparedFileRead
 from gitagent.prompts import get_prompt_library
 
 if TYPE_CHECKING:
+    from gitagent.harness.coding_workspace import CodingWorkspace
     from gitagent.harness.execution import AgentHarness
 
 _PROMPTS = get_prompt_library()
@@ -101,6 +102,7 @@ class AgentContext:
         self.verification: VerificationReport | None = None
         self.issue_reply: IssueReplyWorkflow | None = None
         self.coding_task: CodingTask | None = None
+        self.coding_workspace: CodingWorkspace | None = None
         self.coding_task_completed = False
         self.code_explanation: Any = None
         self.code_review: Any = None
@@ -257,14 +259,28 @@ class AgentContext:
                 attempts=0,
             )
         else:
-            invocation_result = self._harness.invoke(
-                self,
-                prepared.capability_id,
-                actual_arguments,
-                approval_id=approval_id,
-                call_id=prepared.call_id,
-                preflighted=preflighted,
+            workspace = self.coding_workspace
+            bash_state = (
+                workspace.worktree_state()
+                if workspace is not None and prepared.capability_id == "native.bash"
+                else None
             )
+            try:
+                invocation_result = self._harness.invoke(
+                    self,
+                    prepared.capability_id,
+                    actual_arguments,
+                    approval_id=approval_id,
+                    call_id=prepared.call_id,
+                    preflighted=preflighted,
+                )
+            finally:
+                if bash_state is not None and workspace is not None:
+                    current_state = workspace.worktree_state()
+                    if current_state != bash_state:
+                        workspace.record_mutation()
+                        self.read_cache.clear()
+                        self.file_reads.clear()
         return CapabilityCallRecord(
             prepared.call_id,
             prepared.arguments,
@@ -342,6 +358,57 @@ class AgentContext:
         ):
             self.read_cache.clear()
             self.file_reads.clear()
+        workspace = self.coding_workspace
+        verification_command = bool(
+            workspace is not None
+            and capability_id == "native.bash"
+            and actual_arguments is not None
+            and self._harness.is_bash_verification(
+                self, str(actual_arguments.get("command") or "")
+            )
+        )
+        if workspace is not None:
+            if (
+                invocation_result.status == "success"
+                and capability_id in {"native.write", "native.edit", "native.delete"}
+                and isinstance(raw_result, dict)
+                and bool(raw_result.get("changed"))
+            ):
+                workspace.record_mutation()
+            if (
+                verification_command
+                and invocation_result.status == "success"
+                and isinstance(raw_result, dict)
+            ):
+                workspace.record_validation()
+                self.observations.append(
+                    {
+                        "kind": "coding_verification",
+                        "payload": {
+                            "revision": workspace.revision,
+                            "command": str(actual_arguments.get("command") or ""),
+                            "exit_code": int(raw_result.get("exit_code", 1)),
+                            "stdout_tail": str(raw_result.get("stdout_tail") or ""),
+                            "stderr_tail": str(raw_result.get("stderr_tail") or ""),
+                        },
+                    }
+                )
+            elif verification_command and invocation_result.status == "failed":
+                error = invocation_result.error
+                self.observations.append(
+                    {
+                        "kind": "coding_verification",
+                        "payload": {
+                            "revision": workspace.revision,
+                            "command": str(actual_arguments.get("command") or ""),
+                            "unavailable_reason": (
+                                f"{error.type.value}: {error.message}"
+                                if error is not None
+                                else "verification command could not execute"
+                            ),
+                        },
+                    }
+                )
         cacheable = (
             capability is not None
             and capability.access == AccessLevel.READ

@@ -109,25 +109,25 @@ def code_change_review_package(
     risks = "\n".join(f"- {risk}" for risk in candidate.risks) or "- No specific static risk identified."
     follow_up = (
         "\n".join(f"- {item}" for item in candidate.verification_required)
-        or "- Run the repository test suite and complete human review."
+        or "- No additional verification required."
     )
     related_issue = f"\n\n## Related issue\n#{request.issue_number}" if request.issue_number is not None else ""
     body = (
         f"## Summary\n{candidate.summary}\n\n"
         f"## Root cause\n{candidate.root_cause}\n\n"
         f"## Changed files\n{files}\n\n"
-        f"## Static verification\n{checks}\n\n"
+        f"## Verification\n{checks}\n\n"
         f"## Risks\n{risks}\n\n"
         f"## Verification still required\n{follow_up}"
         f"{related_issue}\n\n"
-        "> This pull request is intentionally a draft. GitAgent performed only the static checks listed above."
+        "> This pull request is intentionally a draft. Review the validation evidence listed above before merging."
     )
     return HumanReviewPackage(
         change_summary=candidate.summary,
         root_cause=candidate.root_cause,
         files_changed=candidate.changed_files,
         important_diff=candidate.patch[:30_000],
-        static_verification=report,
+        verification=report,
         potential_risks=candidate.risks,
         suggested_pr_title=title,
         suggested_pr_description=body,
@@ -135,7 +135,7 @@ def code_change_review_package(
 
 
 def issue_fix_approval_summary(request: ChangeRequest, review: HumanReviewPackage) -> str:
-    checks = ", ".join(f"{check.name}={check.status}" for check in review.static_verification.checks)
+    checks = ", ".join(f"{check.name}={check.status}" for check in review.verification.checks)
     return (
         "What will happen: create a branch, commit the reviewed candidate, push it, and create a Draft PR.\n"
         f"Affected repository: {request.repository}\n"

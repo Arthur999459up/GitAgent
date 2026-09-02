@@ -474,6 +474,7 @@ class LiveApplication:
                 if scope
                 else None,
             ),
+            github=self.github,
             main_reasoner=self.reasoner,
             agent_reasoner=self.reasoner,
             session_manager=self.sessions,
@@ -657,6 +658,7 @@ def build_live_application(config: RuntimeConfig) -> LiveApplication:
             blocked_paths=(config.source_path,),
             secret_values=config.secret_values,
         ),
+        github=github,
         main_reasoner=reasoner,
         agent_reasoner=reasoner,
         session_manager=sessions,

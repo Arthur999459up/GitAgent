@@ -142,7 +142,7 @@ class IssueAgent:
             return
         if context.verification is None or not context.verification.passed:
             raise WorkflowError(
-                "static verification failed; refusing an Issue fix proposal"
+                "verification failed; refusing an Issue fix proposal"
             )
         dispatcher.queue_issue_fix(context)
 

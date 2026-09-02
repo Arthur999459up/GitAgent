@@ -216,8 +216,19 @@ class NativeProvider:
                 object_output,
             ),
             NativeToolDefinition(
+                "native.delete",
+                "Delete one ordinary file from the active invocation workspace.",
+                AccessLevel.DESTRUCTIVE,
+                self._delete,
+                _object_schema(
+                    {"path": {"type": "string", "minLength": 1}},
+                    ["path"],
+                ),
+                object_output,
+            ),
+            NativeToolDefinition(
                 "native.bash",
-                "Execute one policy-approved command in the fixed workspace directory.",
+                "Execute one policy-approved command in the active invocation workspace.",
                 AccessLevel.WRITE,
                 self._bash,
                 _object_schema(
@@ -232,10 +243,19 @@ class NativeProvider:
         )
 
     def _safe_path(
-        self, value: str, *, must_exist: bool = False, root: str = "workspace"
+        self,
+        value: str,
+        *,
+        context: InvocationContext,
+        must_exist: bool = False,
+        root: str = "workspace",
     ) -> Path:
         try:
-            authorized_root = self.read_roots[root]
+            authorized_root = (
+                self._invocation_workspace(context)
+                if root == "workspace"
+                else self.read_roots[root]
+            )
         except KeyError as exc:
             raise PermissionDenied(
                 f"read root is not authorized for this Session: {root}"
@@ -262,8 +282,16 @@ class NativeProvider:
             raise FileNotFoundError(value)
         return resolved
 
-    def _relative(self, path: Path) -> str:
-        return path.relative_to(self.workspace_root).as_posix()
+    def _relative(self, path: Path, context: InvocationContext) -> str:
+        return path.relative_to(self._invocation_workspace(context)).as_posix()
+
+    def _invocation_workspace(self, context: InvocationContext) -> Path:
+        if not context.workspace_root:
+            return self.workspace_root
+        root = Path(context.workspace_root).resolve()
+        if not root.is_dir():
+            raise PermissionDenied("active invocation workspace is unavailable")
+        return root
 
     def _memory_root_for(self, path: Path) -> str | None:
         for name, root in self.read_roots.items():
@@ -276,8 +304,10 @@ class NativeProvider:
             return name
         return None
 
-    def _safe_mutation_path(self, value: str, *, must_exist: bool = False) -> Path:
-        path = self._safe_path(value, must_exist=must_exist)
+    def _safe_mutation_path(
+        self, value: str, *, context: InvocationContext, must_exist: bool = False
+    ) -> Path:
+        path = self._safe_path(value, context=context, must_exist=must_exist)
         if self._memory_root_for(path) is not None:
             raise PermissionDenied("authorized Memory roots are read-only")
         return path
@@ -285,16 +315,20 @@ class NativeProvider:
     def _read(
         self, arguments: dict[str, Any], context: InvocationContext
     ) -> dict[str, Any]:
-        del context
         root = str(arguments.get("root") or "workspace")
-        path = self._safe_path(str(arguments["path"]), must_exist=True, root=root)
+        path = self._safe_path(
+            str(arguments["path"]), context=context, must_exist=True, root=root
+        )
         if not path.is_file():
             raise ValidationError(f"path is not a file: {arguments['path']}")
         offset = int(arguments.get("offset", 1))
         limit = int(arguments.get("limit", 2000))
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         selected = lines[offset - 1 : offset - 1 + limit]
-        relative = path.relative_to(self.read_roots[root]).as_posix()
+        authorized_root = (
+            self._invocation_workspace(context) if root == "workspace" else self.read_roots[root]
+        )
+        relative = path.relative_to(authorized_root).as_posix()
         return {
             "root": root,
             "path": relative,
@@ -310,8 +344,10 @@ class NativeProvider:
     def _glob(
         self, arguments: dict[str, Any], context: InvocationContext
     ) -> dict[str, Any]:
-        del context
-        base = self._safe_path(str(arguments.get("path") or "."), must_exist=True)
+        workspace_root = self._invocation_workspace(context)
+        base = self._safe_path(
+            str(arguments.get("path") or "."), context=context, must_exist=True
+        )
         if not base.is_dir():
             raise ValidationError(
                 f"glob path is not a directory: {arguments.get('path')}"
@@ -325,7 +361,7 @@ class NativeProvider:
         for path in base.glob(pattern.as_posix()):
             resolved = path.resolve(strict=False)
             try:
-                relative = resolved.relative_to(self.workspace_root)
+                relative = resolved.relative_to(workspace_root)
             except ValueError:
                 continue
             if (
@@ -338,19 +374,21 @@ class NativeProvider:
             hits.append(resolved)
         hits.sort(key=lambda item: item.stat().st_mtime, reverse=True)
         return {
-            "matches": [self._relative(item) for item in hits[:100]],
+            "matches": [self._relative(item, context) for item in hits[:100]],
             "truncated": len(hits) > 100,
         }
 
     def _grep(
         self, arguments: dict[str, Any], context: InvocationContext
     ) -> dict[str, Any]:
-        del context
+        workspace_root = self._invocation_workspace(context)
         try:
             expression = re.compile(str(arguments["pattern"]))
         except re.error as exc:
             raise ValidationError(f"invalid regular expression: {exc}") from exc
-        base = self._safe_path(str(arguments.get("path") or "."), must_exist=True)
+        base = self._safe_path(
+            str(arguments.get("path") or "."), context=context, must_exist=True
+        )
         include = arguments.get("include")
         include_path = Path(str(include or "*"))
         if include_path.is_absolute() or any(
@@ -376,7 +414,7 @@ class NativeProvider:
             ):
                 continue
             try:
-                resolved.relative_to(self.workspace_root)
+                resolved.relative_to(workspace_root)
             except ValueError:
                 continue
             scanned += 1
@@ -390,7 +428,7 @@ class NativeProvider:
                 if expression.search(line):
                     matches.append(
                         {
-                            "path": self._relative(resolved),
+                            "path": self._relative(resolved, context),
                             "line": line_number,
                             "text": line[:1000],
                         }
@@ -408,24 +446,26 @@ class NativeProvider:
     def _write(
         self, arguments: dict[str, Any], context: InvocationContext
     ) -> dict[str, Any]:
-        del context
-        path = self._safe_mutation_path(str(arguments["path"]))
+        path = self._safe_mutation_path(str(arguments["path"]), context=context)
         if path.exists() and not path.is_file():
             raise ValidationError(f"path is not a file: {arguments['path']}")
         content = str(arguments["content"])
+        previous = path.read_text(encoding="utf-8") if path.is_file() else None
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return {
-            "path": self._relative(path),
+            "path": self._relative(path, context),
             "lines": len(content.splitlines()),
             "written": True,
+            "changed": previous != content,
         }
 
     def _edit(
         self, arguments: dict[str, Any], context: InvocationContext
     ) -> dict[str, Any]:
-        del context
-        path = self._safe_mutation_path(str(arguments["path"]), must_exist=True)
+        path = self._safe_mutation_path(
+            str(arguments["path"]), context=context, must_exist=True
+        )
         if not path.is_file():
             raise ValidationError(f"path is not a file: {arguments['path']}")
         content = path.read_text(encoding="utf-8")
@@ -437,26 +477,39 @@ class NativeProvider:
             )
         new_content = content.replace(old_text, str(arguments["new_text"]), 1)
         path.write_text(new_content, encoding="utf-8")
+        relative = self._relative(path, context)
         diff = "".join(
             difflib.unified_diff(
                 content.splitlines(keepends=True),
                 new_content.splitlines(keepends=True),
-                fromfile=f"a/{self._relative(path)}",
-                tofile=f"b/{self._relative(path)}",
+                fromfile=f"a/{relative}",
+                tofile=f"b/{relative}",
                 n=3,
             )
         )
         return {
-            "path": self._relative(path),
+            "path": relative,
             "edited": True,
+            "changed": content != new_content,
             "diff": diff[:5000],
             "truncated": len(diff) > 5000,
         }
 
+    def _delete(
+        self, arguments: dict[str, Any], context: InvocationContext
+    ) -> dict[str, Any]:
+        path = self._safe_mutation_path(
+            str(arguments["path"]), context=context, must_exist=True
+        )
+        if path.is_symlink() or not path.is_file():
+            raise ValidationError(f"delete target must be an ordinary file: {arguments['path']}")
+        relative = self._relative(path, context)
+        path.unlink()
+        return {"path": relative, "deleted": True, "changed": True}
+
     def _bash(
         self, arguments: dict[str, Any], context: InvocationContext
     ) -> dict[str, Any]:
-        del context
         command = str(arguments["command"])
         try:
             argv = shlex.split(command, posix=True)
@@ -480,7 +533,7 @@ class NativeProvider:
         try:
             completed = subprocess.run(
                 argv,
-                cwd=self.workspace_root,
+                cwd=self._invocation_workspace(context),
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -495,16 +548,11 @@ class NativeProvider:
             ) from exc
         except OSError as exc:
             raise ProviderExecutionError(f"command could not start: {exc}") from exc
-        details = {
+        return {
             "exit_code": completed.returncode,
             "stdout_tail": self._redact(completed.stdout[-4000:]),
             "stderr_tail": self._redact(completed.stderr[-4000:]),
         }
-        if completed.returncode != 0:
-            raise ProviderExecutionError(
-                f"command exited with code {completed.returncode}", details=details
-            )
-        return details
 
     def _redact(self, value: str) -> str:
         redacted = value

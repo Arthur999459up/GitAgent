@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import difflib
 import json
+from dataclasses import asdict
 from typing import Any
 
 from gitagent.agent_loop import (
@@ -16,7 +16,6 @@ from gitagent.agent_loop import (
 from gitagent.capability import AccessLevel
 from gitagent.capability.schema import validate_schema
 from gitagent.domain.errors import (
-    LLMProviderError,
     StructuredOutputError,
     ValidationError,
     WorkflowError,
@@ -25,51 +24,31 @@ from gitagent.domain.models import (
     AgentGuidance,
     AgentSpec,
     CandidatePatch,
-    CandidatePreparationResult,
     ChangeRequest,
     CodeExplanationResult,
     CodePlanResult,
     CodeReviewResult,
     CodingTask,
     Recommendation,
+    VerificationCheck,
+    VerificationReport,
 )
 from gitagent.domain.reviews import canonical_review_event
+from gitagent.harness.coding_workspace import CodingWorkspace
 from gitagent.harness.context.state import AgentContext
 from gitagent.harness.execution import (
     AgentHarness,
     ExecutionProfile,
     ResourceClaims,
 )
-from gitagent.harness.file_access import safe_repository_path
 from gitagent.harness.structured_call_dispatcher import StructuredCallDispatcher
+from gitagent.harness.validation.code import deterministic_code_checks
 from gitagent.model import Reasoner, structured_tools
 from gitagent.prompts import get_prompt_library
 
 from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
-
-_CHANGE_PLAN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "changes": {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 20,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["ADD", "MODIFY", "DELETE"]},
-                    "path": {"type": "string", "minLength": 1, "maxLength": 500},
-                },
-                "required": ["action", "path"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["changes"],
-    "additionalProperties": False,
-}
 
 _EXPLANATION_SCHEMA = {
     "type": "object",
@@ -164,22 +143,22 @@ _CI_SCHEMA = {
     "additionalProperties": False,
 }
 
-_EVIDENCE_READY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
+_FINISH_PATCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "runtime__finish_coding_patch",
+        "description": (
+            "Finish the patch only after the worktree has real changes and the current "
+            "revision has been covered by a real validation command."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
     },
-    "required": ["summary"],
-    "additionalProperties": False,
 }
-
-
-class _CodingCapabilityFailure(Exception):
-    def __init__(self, payload: dict[str, Any]) -> None:
-        super().__init__(
-            str(payload.get("message") or payload.get("error") or "capability failed")
-        )
-        self.payload = payload
 
 
 CODING_SPEC = AgentSpec(
@@ -200,11 +179,11 @@ class CodingAgent:
         self,
         harness: AgentHarness,
         reasoner: Reasoner | None = None,
-        verifier: Any | None = None,
+        github: Any | None = None,
     ) -> None:
         self.harness = harness
         self.reasoner = reasoner
-        self.verifier = verifier
+        self.github = github
         self.dispatcher = StructuredCallDispatcher(harness)
         harness.register(CODING_SPEC)
 
@@ -214,7 +193,9 @@ class CodingAgent:
         task = context.coding_task
         if task is None:
             raise WorkflowError("Coding context is missing its typed task")
-        if not context.coding_task_completed:
+        if task.mode == "patch":
+            return self._step_patch(context, task)
+        if not self._nonpatch_prepared(context, task.mode):
             claims = ResourceClaims(write=(f"workspace:{context.repository}",))
             with self.harness.coordinator.claim_resources(claims):
                 artifact = self._run_task(context, task)
@@ -229,6 +210,16 @@ class CodingAgent:
     @staticmethod
     def build_result(context: AgentContext) -> str:
         return context.final_message
+
+    @staticmethod
+    def _nonpatch_prepared(context: AgentContext, mode: str) -> bool:
+        return {
+            "explain": context.code_explanation is not None,
+            "review": context.code_review is not None,
+            "plan": context.code_plan is not None,
+            "review_dialogue": context.review_dialogue is not None,
+            "ci": context.ci_analysis is not None,
+        }.get(mode, False)
 
     def _run_task(self, context: AgentContext, task: CodingTask) -> Any:
         mode = task.mode
@@ -246,30 +237,11 @@ class CodingAgent:
             return self._analyze_ci(
                 context, task.task, task.evidence, context.guidance
             )
-        if mode == "patch":
-            if task.change_request is None or self.verifier is None:
-                raise WorkflowError(
-                    "Coding patch call requires a ChangeRequest and StaticVerifier"
-                )
-            context.change_request = task.change_request
-            return self._prepare_verified_in_context(
-                context,
-                task.change_request,
-                self.verifier,
-                context.guidance,
-            )
         raise ValidationError(f"unknown Coding Agent mode: {mode}")
 
     @staticmethod
     def _store_artifact(context: AgentContext, mode: str, artifact: Any) -> None:
-        if isinstance(artifact, CandidatePreparationResult):
-            context.code_candidate = artifact.candidate
-            context.verification = artifact.verification
-            if artifact.capability_error:
-                context.observations.append(
-                    {"kind": "capability_error", "payload": artifact.capability_error}
-                )
-        elif isinstance(artifact, CodeExplanationResult):
+        if isinstance(artifact, CodeExplanationResult):
             context.code_explanation = artifact
         elif isinstance(artifact, CodeReviewResult):
             context.code_review = artifact
@@ -280,38 +252,215 @@ class CodingAgent:
         elif mode == "ci" and isinstance(artifact, dict):
             context.ci_analysis = artifact
 
-    def _prepare_verified_in_context(
-        self,
-        context: AgentContext,
-        request: ChangeRequest,
-        verifier: Any,
-        guidance: AgentGuidance | None,
-    ) -> CandidatePreparationResult:
-        try:
-            prepared = self._create(context, request, guidance)
-        except _CodingCapabilityFailure as failure:
-            return CandidatePreparationResult(None, capability_error=failure.payload)
-        if prepared.candidate is None:
-            return prepared
-        candidate = prepared.candidate
-        report = verifier.verify(candidate, session_id=context.session_id, attempts=1)
-        if not report.passed:
-            failures = [
-                check.details for check in report.checks if check.status == "FAIL"
-            ]
-            try:
-                repaired = self._repair(
-                    context, request, candidate, failures, guidance
-                )
-            except _CodingCapabilityFailure as failure:
-                return CandidatePreparationResult(None, capability_error=failure.payload)
-            if repaired.candidate is None:
-                return repaired
-            candidate = repaired.candidate
-            report = verifier.verify(
-                candidate, session_id=context.session_id, attempts=2
+    def _step_patch(self, context: AgentContext, task: CodingTask) -> ModelResponse:
+        if self.reasoner is None:
+            raise WorkflowError("Coding patch calls require a configured reasoner")
+        request = task.change_request
+        if request is None:
+            raise WorkflowError("Coding patch call requires a ChangeRequest")
+        if context.coding_task_completed:
+            message = context.append_message(
+                {"role": "assistant", "content": "Patch workspace already finalized."}
             )
-        return CandidatePreparationResult(candidate, report)
+            return ModelResponse("Patch workspace already finalized.", [], message)
+        if context.coding_workspace is None:
+            self._initialize_patch_workspace(context, request)
+
+        tools = [*self.harness.llm_tools(context), _FINISH_PATCH_TOOL]
+        response = context.reason(self.reasoner, tools=tools)
+        finish_calls = [
+            call for call in response.calls if call.name == "runtime__finish_coding_patch"
+        ]
+        if finish_calls:
+            if len(response.calls) != 1:
+                raise StructuredOutputError(
+                    "runtime__finish_coding_patch must be the only structured call in its response"
+                )
+            call = finish_calls[0]
+            if call.arguments:
+                raise StructuredOutputError(
+                    "runtime__finish_coding_patch accepts no arguments"
+                )
+            rejection = self._finalize_patch(context, request)
+            if rejection is not None:
+                context.append_tool_result(
+                    {"status": "rejected", "reason": rejection}, call_id=call.call_id
+                )
+                context.append_message(
+                    {
+                        "role": "user",
+                        "content": f"Runtime patch finalization rejected: {rejection}",
+                    }
+                )
+                return ModelResponse("", [], {"role": "assistant", "content": ""})
+            context.append_tool_result(
+                {"status": "accepted"}, call_id=call.call_id
+            )
+            terminal = "Patch workspace finalized and cleaned up."
+            message = context.append_message({"role": "assistant", "content": terminal})
+            return ModelResponse(terminal, [], message)
+
+        if not response.calls:
+            context.append_message(
+                {
+                    "role": "user",
+                    "content": (
+                        "Patch mode is not complete. Continue using the available worktree tools, "
+                        "then call runtime__finish_coding_patch after validating the current revision."
+                    ),
+                }
+            )
+        return response
+
+    def _initialize_patch_workspace(
+        self, context: AgentContext, request: ChangeRequest
+    ) -> None:
+        if self.github is None:
+            raise WorkflowError("Coding patch calls require the configured GitHub client")
+        context.change_request = request
+        if request.source_ref is None:
+            default = self._initialization_capability(
+                context, "repository.get_default_branch", {}
+            )
+            request.base_branch = str(default["branch"])
+            request.source_ref = str(default["commit_sha"])
+        context.coding_workspace = CodingWorkspace.create(
+            self.github,
+            repository=request.repository,
+            source_ref=str(request.source_ref),
+            task_id=context.run_id,
+            coordinator=self.harness.coordinator,
+        )
+        context.append_message(
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "runtime_patch_request": asdict(request),
+                        "instruction": (
+                            "Work only through the available tools. Inspect before editing, make the smallest "
+                            "change, run relevant real validation, fix failures in the same loop, and finish "
+                            "with runtime__finish_coding_patch. Do not request approval during this patch stage."
+                        ),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            }
+        )
+
+    @staticmethod
+    def _initialization_capability(
+        context: AgentContext, capability_id: str, arguments: dict[str, Any]
+    ) -> Any:
+        call_id = context.ensure_capability_tool_call(capability_id, arguments)
+        record = context.invoke(capability_id, call_id=call_id, **arguments)
+        if record.result.status != "success":
+            error = record.result.error
+            context.append_tool_result(
+                {
+                    "status": record.result.status,
+                    "message": error.message if error is not None else "capability failed",
+                },
+                call_id=call_id,
+            )
+            raise WorkflowError(
+                error.message if error is not None else f"{capability_id} failed"
+            )
+        context.append_tool_result(record.observation_data, call_id=call_id)
+        return record.result.content
+
+    def _finalize_patch(
+        self, context: AgentContext, request: ChangeRequest
+    ) -> str | None:
+        workspace = context.coding_workspace
+        if workspace is None:
+            raise WorkflowError("Coding patch finalization has no active workspace")
+        snapshot = workspace.snapshot()
+        if not snapshot["changed_files"]:
+            return "the worktree has no real changes"
+        validation_events = [
+            dict(observation.get("payload") or {})
+            for observation in context.observations
+            if observation.get("kind") == "coding_verification"
+        ]
+        current_validation_events = [
+            event
+            for event in validation_events
+            if int(event.get("revision", -1)) == workspace.revision
+        ]
+        if not current_validation_events:
+            return "the current revision has no recorded real validation result"
+        unavailable_validation = any(
+            bool(event.get("unavailable_reason")) for event in current_validation_events
+        )
+        if (
+            workspace.last_validated_revision != workspace.revision
+            and not unavailable_validation
+        ):
+            return (
+                f"revision {workspace.revision} is not covered by a real validation command; "
+                "run a relevant test, lint, type-check, or build command after the last edit"
+            )
+
+        checks: list[VerificationCheck] = []
+        skipped: list[str] = []
+        for index, event in enumerate(validation_events, start=1):
+            unavailable = str(event.get("unavailable_reason") or "")
+            exit_code = event.get("exit_code")
+            event_revision = int(event.get("revision", -1))
+            current_revision = event_revision == workspace.revision
+            passed = not unavailable and exit_code == 0
+            command = str(event.get("command") or "")
+            details = unavailable or (
+                f"revision={event_revision}; command={command!r}; exit_code={exit_code}; "
+                f"stdout={str(event.get('stdout_tail') or '')[-1200:]}; "
+                f"stderr={str(event.get('stderr_tail') or '')[-1200:]}"
+            )
+            if not current_revision and not passed:
+                details = f"superseded by later edits; {details}"
+            status = "PASS" if passed else ("FAIL" if current_revision else "WARN")
+            checks.append(
+                VerificationCheck(
+                    name=f"real_validation_{index}",
+                    status=status,
+                    details=details,
+                    files=list(snapshot["changed_files"]),
+                )
+            )
+            if unavailable:
+                skipped.append(f"{command}: {unavailable}")
+        checks.extend(deterministic_code_checks(snapshot["files"]))
+        report = VerificationReport(
+            passed=all(check.status != "FAIL" for check in checks),
+            checks=checks,
+            skipped=skipped,
+            attempts=len(validation_events),
+        )
+        follow_up = [
+            f"Resolve failing validation: {check.name}"
+            for check in checks
+            if check.status == "FAIL"
+        ]
+        candidate = CandidatePatch(
+            summary=request.suggested_title or request.description,
+            root_cause=request.description,
+            added_files=list(snapshot["added_files"]),
+            modified_files=list(snapshot["modified_files"]),
+            deleted_files=list(snapshot["deleted_files"]),
+            patch=str(snapshot["patch"]),
+            files=dict(snapshot["files"]),
+            risks=["Model-authored changes require review before remote mutation."],
+            verification_required=follow_up,
+        )
+        request.target_files = list(snapshot["changed_files"])
+
+        workspace.cleanup()
+        context.coding_workspace = None
+        context.code_candidate = candidate
+        context.verification = report
+        context.coding_task_completed = True
+        return None
 
     def _explain(
         self,
@@ -673,472 +822,6 @@ class CodingAgent:
                 raise WorkflowError("CodingAgent evidence gathering was cancelled")
         raise WorkflowError(
             f"CodingAgent exceeded the {context.max_steps}-step evidence limit"
-        )
-
-    @staticmethod
-    def _invoke_capability(
-        context: AgentContext,
-        capability_id: str,
-        *,
-        call_id: str,
-        **arguments: Any,
-    ) -> Any:
-        record = context.invoke(
-            capability_id, call_id=call_id, **arguments
-        )
-        if record.result.status == "failed":
-            error = record.result.error
-            if error is None:
-                raise WorkflowError(
-                    "Coding capability failed without a structured error"
-                )
-            context.append_tool_result(
-                {
-                    "status": "failed",
-                    "capability_id": record.result.capability_id,
-                    "error": error.type.value,
-                    "message": error.message,
-                },
-                call_id=call_id,
-            )
-            context.observations.append(
-                {
-                    "kind": "capability_error",
-                    "payload": {
-                        "capability_id": record.result.capability_id,
-                        "arguments": dict(arguments),
-                        "error": error.type.value,
-                        "message": error.message,
-                        "details": error.details,
-                        "attempts": record.result.attempts,
-                    },
-                }
-            )
-            raise _CodingCapabilityFailure(
-                {
-                    "capability_id": record.result.capability_id,
-                    "arguments": dict(arguments),
-                    "error": error.type.value,
-                    "message": error.message,
-                    "details": error.details,
-                    "attempts": record.result.attempts,
-                }
-            )
-        if record.result.status != "success":
-            raise WorkflowError(
-                f"Coding capability returned unsupported status: {record.result.status}"
-            )
-        context.append_tool_result(record.observation_data, call_id=call_id)
-        context.observations.append(
-            {
-                "kind": "capability",
-                "payload": {
-                    "capability_id": capability_id,
-                    "arguments": dict(arguments),
-                    "data": record.observation_data,
-                },
-            }
-        )
-        return record.result.content
-
-    def _create(
-        self,
-        context: AgentContext,
-        request: ChangeRequest,
-        guidance: AgentGuidance | None,
-    ) -> CandidatePreparationResult:
-        if request.source_ref is None:
-            default = self._invoke_capability(context, "repository.get_default_branch")
-            request.base_branch = str(default["branch"])
-            request.source_ref = str(default["commit_sha"])
-        explicit_request = bool(
-            request.proposed_files or request.replacements or request.deleted_files
-        )
-        if explicit_request:
-            explicit_paths = list(
-                dict.fromkeys(
-                    [
-                        *request.proposed_files,
-                        *[item.path for item in request.replacements],
-                        *request.deleted_files,
-                    ]
-                )
-            )
-            existing_files = self._existing_files(context, request, explicit_paths)
-            planned_changes = self._explicit_change_plan(request, existing_files)
-        elif self.reasoner is not None:
-            planned_changes = self._reasoned_change_plan(context, request, guidance)
-            existing_files = self._existing_files(
-                context,
-                request,
-                [change["path"] for change in planned_changes],
-            )
-        else:
-            raise WorkflowError(
-                "coding without a reasoner requires explicit replacements, proposed_files, or deleted_files"
-            )
-        self._validate_change_plan(planned_changes, existing_files)
-
-        request.target_files = [change["path"] for change in planned_changes]
-        existing_paths = [
-            change["path"] for change in planned_changes if change["action"] != "ADD"
-        ]
-        fetched = (
-            self._invoke_capability(
-                context,
-                "repository.read_files",
-                requests=[{"path": path, "limit": 400} for path in existing_paths],
-                ref=request.source_ref,
-            )["files"]
-            if existing_paths
-            else []
-        )
-        if any(item.get("truncated") for item in fetched):
-            raise WorkflowError(
-                "a target file exceeds the safe fetch bound; refusing to risk a truncated overwrite"
-            )
-        originals = {item["path"]: item["content"] for item in fetched}
-
-        deleted_files = [
-            change["path"] for change in planned_changes if change["action"] == "DELETE"
-        ]
-        if explicit_request:
-            new_files = dict(request.proposed_files)
-            for replacement in request.replacements:
-                if replacement.path not in originals:
-                    raise WorkflowError(
-                        f"replacement target was not fetched: {replacement.path}"
-                    )
-                content = new_files.get(replacement.path, originals[replacement.path])
-                count = content.count(replacement.old)
-                if count != 1:
-                    raise WorkflowError(
-                        f"replacement anchor in {replacement.path} must match exactly once; found {count}"
-                    )
-                new_files[replacement.path] = content.replace(
-                    replacement.old, replacement.new, 1
-                )
-        else:
-            planned_operations = [
-                {
-                    "id": f"change-{index}",
-                    "action": change["action"],
-                    "path": change["path"],
-                }
-                for index, change in enumerate(planned_changes, start=1)
-            ]
-            writable_operations = [
-                operation
-                for operation in planned_operations
-                if operation["action"] in {"ADD", "MODIFY"}
-            ]
-            evidence = self._capability_evidence(context)
-            new_files = {}
-            for operation in writable_operations:
-                try:
-                    content = context.complete_text(
-                        self.reasoner,
-                        prompt=_PROMPTS.render(
-                            "agents.coding_create",
-                            repository=request.repository,
-                            description=request.description,
-                            operation=json.dumps(operation, ensure_ascii=False),
-                            current_content=originals.get(operation["path"], ""),
-                            evidence=json.dumps(evidence, ensure_ascii=False),
-                            guidance=guidance_section(guidance),
-                        ),
-                    )
-                except LLMProviderError as exc:
-                    raise LLMProviderError(f"候选文件生成阶段失败：{exc}") from exc
-                if not content:
-                    return CandidatePreparationResult(
-                        None,
-                        message=(
-                            f"模型没有为 `{operation['path']}` 返回文件内容，本次未生成审批，也没有写入仓库。"
-                            "请补充文件要求后重试。"
-                        ),
-                    )
-                new_files[operation["path"]] = content
-
-        return CandidatePreparationResult(
-            self._candidate(
-                originals,
-                new_files,
-                deleted_files=deleted_files,
-                summary=request.suggested_title or request.description,
-                root_cause=request.description,
-                risks=["模型生成的文件内容需要人工审阅。"],
-                verification_required=["人工审阅", "提交默认分支后运行项目测试"],
-            )
-        )
-
-    def _reasoned_change_plan(
-        self,
-        context: AgentContext,
-        request: ChangeRequest,
-        guidance: AgentGuidance | None,
-    ) -> list[dict[str, Any]]:
-        if self.reasoner is None:
-            raise WorkflowError("repository change planning requires a reasoner")
-        mentioned = list(
-            dict.fromkeys(safe_repository_path(path) for path in request.target_files)
-        )
-        value = self._complete_structured_task(
-            context,
-            prompt=json.dumps(
-                {
-                    "request": request.description,
-                    "source_ref": request.source_ref,
-                    "mentioned_paths": mentioned,
-                    "guidance": guidance_section(guidance),
-                    "instruction": (
-                        "Use the available read-only capabilities autonomously until you can return every requested "
-                        "file operation in one plan. ADD is only for a new path; MODIFY and DELETE target existing "
-                        "files. Keep explicitly supplied paths; path existence is validated deterministically next."
-                    ),
-                },
-                ensure_ascii=False,
-            ),
-            schema=_CHANGE_PLAN_SCHEMA,
-            tool_name="plan_repository_file_changes",
-        )
-        changes: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for raw in value.get("changes", []):
-            path = safe_repository_path(str(raw.get("path") or ""))
-            action = str(raw.get("action") or "")
-            if path in seen:
-                raise ValidationError(
-                    f"repository change plan contains duplicate path: {path}"
-                )
-            seen.add(path)
-            changes.append(
-                {
-                    "action": action,
-                    "path": path,
-                }
-            )
-        return changes
-
-    @staticmethod
-    def _explicit_change_plan(
-        request: ChangeRequest, existing_files: set[str]
-    ) -> list[dict[str, str]]:
-        actions: dict[str, str] = {}
-
-        def add(path: str, action: str) -> None:
-            safe = safe_repository_path(path)
-            previous = actions.get(safe)
-            if previous is not None and previous != action:
-                raise ValidationError(
-                    f"conflicting repository operations for {safe}: {previous} and {action}"
-                )
-            actions[safe] = action
-
-        for path in request.proposed_files:
-            add(path, "MODIFY" if path in existing_files else "ADD")
-        for replacement in request.replacements:
-            add(replacement.path, "MODIFY")
-        for path in request.deleted_files:
-            add(path, "DELETE")
-        return [{"action": action, "path": path} for path, action in actions.items()]
-
-    @staticmethod
-    def _existing_files(
-        context: AgentContext,
-        request: ChangeRequest,
-        paths: list[str],
-    ) -> set[str]:
-        status = CodingAgent._invoke_capability(
-            context,
-            "repository.get_file_status",
-            paths=paths,
-            ref=request.source_ref,
-        )
-        return {str(path) for path in status.get("existing_files", [])}
-
-    @staticmethod
-    def _validate_change_plan(
-        changes: list[dict[str, Any]], existing_files: set[str]
-    ) -> None:
-        for change in changes:
-            action = change["action"]
-            path = change["path"]
-            if action == "ADD" and path in existing_files:
-                raise ValidationError(
-                    f"repository change plan cannot add an existing file: {path}"
-                )
-            if action in {"MODIFY", "DELETE"} and path not in existing_files:
-                raise ValidationError(
-                    f"repository change plan cannot {action.casefold()} a missing file: {path}"
-                )
-
-    @staticmethod
-    def _capability_evidence(context: AgentContext) -> list[dict[str, Any]]:
-        return [
-            dict(observation.get("payload") or {})
-            for observation in context.observations
-            if observation.get("kind") in {"capability", "capability_error"}
-        ][-40:]
-
-    def _repair(
-        self,
-        context: AgentContext,
-        request: ChangeRequest,
-        candidate: CandidatePatch,
-        errors: list[str],
-        guidance: AgentGuidance | None,
-    ) -> CandidatePreparationResult:
-        self._complete_structured_task(
-            context,
-            prompt=json.dumps(
-                {
-                    "task": (
-                        "Inspect any additional read-only repository, RAG, Context7, or Skill evidence needed "
-                        "to repair this verified candidate. Finish when the reported errors can be addressed."
-                    ),
-                    "request": request.description,
-                    "changed_files": candidate.changed_files,
-                    "verification_errors": errors,
-                },
-                ensure_ascii=False,
-            ),
-            schema=_EVIDENCE_READY_SCHEMA,
-            tool_name="record_repair_evidence",
-        )
-        evidence = self._capability_evidence(context)
-        writable_operations = [
-            {
-                "id": f"change-{index}",
-                "action": "ADD" if path in candidate.added_files else "MODIFY",
-                "path": path,
-                "content": content,
-            }
-            for index, (path, content) in enumerate(candidate.files.items(), start=1)
-        ]
-        repaired: dict[str, str] = {}
-        for operation in writable_operations:
-            content = context.complete_text(
-                self.reasoner,
-                prompt=_PROMPTS.render(
-                    "agents.coding_repair",
-                    description=request.description,
-                    operation=json.dumps(
-                        {key: operation[key] for key in ("id", "action", "path")},
-                        ensure_ascii=False,
-                    ),
-                    current_content=operation["content"],
-                    errors=json.dumps(errors, ensure_ascii=False),
-                    evidence=json.dumps(evidence, ensure_ascii=False),
-                    guidance=guidance_section(guidance),
-                ),
-            )
-            if not content:
-                return CandidatePreparationResult(
-                    None,
-                    message=(
-                        f"模型没有为 `{operation['path']}` 返回修复后的文件内容，本次未生成审批，"
-                        "也没有写入仓库。请补充文件要求后重试。"
-                    ),
-                )
-            repaired[operation["path"]] = content
-        existing_paths = [*candidate.modified_files, *candidate.deleted_files]
-        fetched = (
-            self._invoke_capability(
-                context,
-                "repository.read_files",
-                requests=[{"path": path, "limit": 400} for path in existing_paths],
-                ref=request.source_ref,
-            )["files"]
-            if existing_paths
-            else []
-        )
-        if any(item.get("truncated") for item in fetched):
-            raise WorkflowError(
-                "a target file exceeds the safe fetch bound; refusing a truncated repair"
-            )
-        originals = {item["path"]: item["content"] for item in fetched}
-        return CandidatePreparationResult(
-            self._candidate(
-                originals,
-                repaired,
-                deleted_files=candidate.deleted_files,
-                summary=candidate.summary,
-                root_cause=candidate.root_cause,
-                risks=candidate.risks,
-                verification_required=candidate.verification_required,
-            )
-        )
-
-    @staticmethod
-    def _candidate(
-        originals: dict[str, str],
-        proposed: dict[str, str],
-        *,
-        deleted_files: list[str],
-        summary: str,
-        root_cause: str,
-        risks: list[str],
-        verification_required: list[str],
-    ) -> CandidatePatch:
-        deleted = sorted(set(deleted_files))
-        missing_deletions = set(deleted) - set(originals)
-        if missing_deletions:
-            raise WorkflowError(
-                f"deletion target was not fetched: {', '.join(sorted(missing_deletions))}"
-            )
-        overlap = set(proposed) & set(deleted)
-        if overlap:
-            raise ValidationError(
-                f"candidate cannot write and delete the same file: {', '.join(sorted(overlap))}"
-            )
-        added = sorted(path for path in proposed if path not in originals)
-        modified = sorted(
-            path
-            for path, content in proposed.items()
-            if path in originals and originals[path] != content
-        )
-        unchanged = sorted(
-            path
-            for path in proposed
-            if path in originals and originals[path] == proposed[path]
-        )
-        if unchanged:
-            raise WorkflowError(
-                f"candidate does not modify the requested file(s): {', '.join(unchanged)}"
-            )
-        if not (added or modified or deleted):
-            raise WorkflowError("candidate patch does not change any file")
-        chunks = []
-        for path in [*added, *modified]:
-            chunks.extend(
-                difflib.unified_diff(
-                    originals.get(path, "").splitlines(keepends=True),
-                    proposed[path].splitlines(keepends=True),
-                    fromfile="/dev/null" if path in added else f"a/{path}",
-                    tofile=f"b/{path}",
-                )
-            )
-        for path in deleted:
-            chunks.extend(
-                difflib.unified_diff(
-                    originals[path].splitlines(keepends=True),
-                    [],
-                    fromfile=f"a/{path}",
-                    tofile="/dev/null",
-                )
-            )
-        return CandidatePatch(
-            summary=summary,
-            root_cause=root_cause,
-            added_files=added,
-            modified_files=modified,
-            deleted_files=deleted,
-            patch="".join(chunks),
-            files={path: proposed[path] for path in [*added, *modified]},
-            static_checks=[],
-            risks=risks,
-            verification_required=verification_required,
         )
 
     @staticmethod

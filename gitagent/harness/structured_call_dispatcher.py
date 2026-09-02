@@ -100,8 +100,15 @@ class StructuredCallDispatcher:
 
         previous = self._latest_capability_attempt(context)
         previous_payload = (previous or {}).get("payload") or {}
+        repeatable_verification = (
+            call.capability_id == "native.bash"
+            and self.harness.is_bash_verification(
+                context, str(arguments.get("command") or "")
+            )
+        )
         if (
-            previous is not None
+            not repeatable_verification
+            and previous is not None
             and previous_payload.get("capability_id") == call.capability_id
             and previous_payload.get("arguments") == arguments
         ):
@@ -331,7 +338,7 @@ class StructuredCallDispatcher:
                 "issue fix requires a verified candidate and change request"
             )
         if context.verification is None or not context.verification.passed:
-            raise WorkflowError("static verification failed; GitHub mutation is forbidden")
+            raise WorkflowError("verification failed; GitHub mutation is forbidden")
         review = code_change_review_package(
             context.change_request, context.code_candidate, context.verification
         )
@@ -353,7 +360,7 @@ class StructuredCallDispatcher:
             )
         if context.verification is None or not context.verification.passed:
             raise WorkflowError(
-                "static verification failed; default-branch mutation is forbidden"
+                "verification failed; default-branch mutation is forbidden"
             )
         self.queue(
             context,
