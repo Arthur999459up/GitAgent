@@ -6,7 +6,11 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from gitagent.domain.errors import ContextWindowExceeded, ValidationError
+from gitagent.domain.errors import (
+    ContextWindowExceeded,
+    StructuredOutputError,
+    ValidationError,
+)
 from gitagent.domain.models import SessionScope
 from gitagent.harness.context import compact_messages
 from gitagent.infra.persistence import SessionManager
@@ -176,10 +180,18 @@ class MemoryExtractor:
         memory: MemoryPageStore,
         *,
         context_window_tokens: int,
+        max_structured_retries: int = 1,
     ) -> None:
+        if (
+            not isinstance(max_structured_retries, int)
+            or isinstance(max_structured_retries, bool)
+            or max_structured_retries < 0
+        ):
+            raise ValueError("max_structured_retries must be a non-negative integer")
         self.reasoner = reasoner
         self.memory = memory
         self.context_window_tokens = context_window_tokens
+        self.max_structured_retries = max_structured_retries
 
     def extract(self, context: MemoryExtractionContext) -> MemoryExtractionResult:
         final_tools = structured_tools(
@@ -223,13 +235,37 @@ class MemoryExtractor:
                 if removable is None:
                     raise
                 units = units[:removable] + units[removable + 1 :]
-        raw = self.reasoner.complete_structured_messages(
-            messages=messages,
-            schema=_CANDIDATE_SCHEMA,
-            tool_name="extract_persistent_memories",
-            final_tools=final_tools,
-            context_window_tokens=self.context_window_tokens,
-        )
+        structured_failures = 0
+        while True:
+            attempt_messages = messages
+            if structured_failures:
+                attempt_messages = compact_messages(
+                    [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "Previous structured output was invalid. Return exactly one "
+                                "extract_persistent_memories call matching its schema."
+                            ),
+                        },
+                    ],
+                    final_tools,
+                    context_window_tokens=self.context_window_tokens,
+                ).messages
+            try:
+                raw = self.reasoner.complete_structured_messages(
+                    messages=attempt_messages,
+                    schema=_CANDIDATE_SCHEMA,
+                    tool_name="extract_persistent_memories",
+                    final_tools=final_tools,
+                    context_window_tokens=self.context_window_tokens,
+                )
+                break
+            except StructuredOutputError:
+                structured_failures += 1
+                if structured_failures > self.max_structured_retries:
+                    raise
         candidates = _candidates(raw)
         tools = MemoryTools(
             self.memory, context.scope.account_key, context.scope.repository_key
@@ -265,13 +301,8 @@ class MemoryExtractor:
 
 
 def _candidates(raw: dict[str, Any]) -> tuple[MemoryCandidate, ...]:
-    values = raw.get("candidates") if isinstance(raw, dict) else None
-    if not isinstance(values, list):
-        raise ValidationError("Memory Extractor must return a candidates list")
     result: list[MemoryCandidate] = []
-    for item in values:
-        if not isinstance(item, dict):
-            raise ValidationError("Memory candidate must be an object")
+    for item in raw["candidates"]:
         result.append(
             MemoryCandidate(
                 name=str(item["name"]),

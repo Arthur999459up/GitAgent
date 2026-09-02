@@ -17,4 +17,4 @@
 - `related_changes`: connect failures to the supplied Diff, changed files, tests, or dependency changes only when the evidence supports the relationship.
 - `actions`: propose focused diagnostic or corrective next steps; do not claim they were run.
 
-Do not collapse missing evidence into a diagnosis, perform a write, or imply CI passed when results are incomplete.{{guidance}}
+Never upgrade an inference into a confirmed fact. If the direct log or test evidence needed to establish a cause is unavailable, preserve that uncertainty explicitly. Do not collapse missing evidence into a diagnosis, perform a write, or imply CI passed when results are incomplete.{{guidance}}

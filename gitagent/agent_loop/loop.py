@@ -13,8 +13,6 @@ from gitagent.agent_loop.models import (
     StructuredCall,
     WaitForUser,
 )
-from gitagent.capability import CapabilityResult
-from gitagent.capability.errors import CapabilityErrorType, capability_error
 from gitagent.domain.errors import (
     ContextWindowExceeded,
     LLMProviderError,
@@ -251,6 +249,7 @@ class AgentLoop:
                 if self._stop_if_cancelled(context):
                     return
                 structured_failures += 1
+                open_calls = context.open_tool_calls()
                 self._close_open_calls(
                     context,
                     {
@@ -275,6 +274,16 @@ class AgentLoop:
                         f" 最后错误：{exc}",
                     )
                     return
+                if not open_calls:
+                    context.append_message(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Previous response was invalid. Follow the active "
+                                "structured-call contract exactly."
+                            ),
+                        }
+                    )
                 continue
             except LLMProviderError as exc:
                 if self._stop_if_cancelled(context):
@@ -365,6 +374,23 @@ class AgentLoop:
         *,
         summary: str,
     ) -> bool:
+        if calls and all(isinstance(call, CapabilityCall) for call in calls):
+            validate = getattr(agent, "validate_capability", None)
+            if callable(validate):
+                for call in calls:
+                    validate(context, call.capability_id)
+            completed = self.dispatcher.execute_capability_batch(
+                context,
+                calls,  # type: ignore[arg-type]
+                summary=summary,
+            )
+            if not completed and not context.waiting:
+                context.final_message = "execution cancelled"
+                context.error = context.final_message
+                context.finished = True
+                self.dispatcher.emit(context, "cancelled", context.final_message)
+            return completed
+
         from gitagent.harness.execution import ExecutionProfile
 
         profiles: list[Any] = []
@@ -432,19 +458,11 @@ class AgentLoop:
                 )
             return child
 
-        def capability_record(call: CapabilityCall, outcome: Any) -> Any:
-            return (
-                outcome
-                if getattr(outcome, "call_id", None) == call.call_id
-                and hasattr(outcome, "result")
-                else self._failed_capability_record(call, outcome)
-            )
-
         def suspend_call(call: CapabilityCall | AgentCall, outcome: Any) -> None:
             if not isinstance(call, CapabilityCall):
                 return
             context.uncommitted_capability_results[call.call_id] = (
-                capability_record(call, outcome)
+                self.dispatcher.capability_record(call, outcome)
             )
 
         def commit_call(call: CapabilityCall | AgentCall, outcome: Any) -> str:
@@ -452,7 +470,7 @@ class AgentLoop:
                 return self.dispatcher.commit_capability(
                     context,
                     call,
-                    capability_record(call, outcome),
+                    self.dispatcher.capability_record(call, outcome),
                     summary=summary,
                 )
             child = context.active_children[call.call_id]
@@ -520,27 +538,6 @@ class AgentLoop:
             context.finished = True
             self.dispatcher.emit(context, "cancelled", context.final_message)
         return completed
-
-    @staticmethod
-    def _failed_capability_record(
-        call: CapabilityCall, outcome: Any
-    ) -> Any:
-        from gitagent.harness.context.state import CapabilityCallRecord
-
-        message = str(outcome) if isinstance(outcome, Exception) else "capability failed"
-        error = capability_error(CapabilityErrorType.EXECUTION_FAILED, message)
-        return CapabilityCallRecord(
-            call.call_id,
-            dict(call.arguments),
-            None,
-            CapabilityResult(
-                call.capability_id,
-                "failed",
-                "none",
-                error=error,
-                attempts=0,
-            ),
-        )
 
     def _continue_open_batch(
         self, context: Any, agent: AgentLoopAgent

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from gitagent.agent_loop.models import CapabilityCall, PendingCall
+from gitagent.agent_loop.models import AgentCall, CapabilityCall, PendingCall
 from gitagent.capability import CapabilityResult
 from gitagent.capability.errors import CapabilityErrorType, capability_error
 from gitagent.domain.errors import ValidationError, WorkflowError
@@ -129,6 +129,145 @@ class StructuredCallDispatcher:
                 ),
             )
         return None
+
+    def execute_capability_batch(
+        self,
+        context: Any,
+        calls: list[CapabilityCall],
+        *,
+        summary: str = "",
+    ) -> bool:
+        """Execute one provider-ordered Capability batch through the shared Runtime."""
+
+        prepared: dict[str, Any] = {}
+        preflight_results: dict[str, Any] = {}
+        failure_guard_preflight: dict[str, bool] = {}
+        from gitagent.harness.execution import ExecutionProfile
+
+        profiles = []
+        for call in calls:
+            profile = self.harness.describe_capability_execution(context, call)
+            if self.harness.capability_permission_decision(context, call) in {
+                "ASK",
+                "DENY",
+            }:
+                profile = ExecutionProfile.exclusive(
+                    read=profile.resource_claims.read,
+                    write=profile.resource_claims.write,
+                )
+            profiles.append(profile)
+
+        def prepare_call(call: CapabilityCall | AgentCall) -> None:
+            if not isinstance(call, CapabilityCall):  # pragma: no cover - contract
+                raise ValidationError("Capability batch contains an Agent call")
+            preflight = self.preflight_capability(context, call)
+            if preflight is not None:
+                preflight_results[call.call_id] = preflight
+            else:
+                prepared[call.call_id] = context.prepare_capability_call(
+                    call.call_id,
+                    call.capability_id,
+                    call.arguments,
+                )
+            invocation = prepared.get(call.call_id)
+            guard_arguments = (
+                invocation.execution_arguments
+                if invocation is not None
+                and invocation.execution_arguments is not None
+                else call.arguments
+            )
+            failure_guard_preflight[call.call_id] = not (
+                self.harness.capability_failure_blocked(
+                    context,
+                    call,
+                    arguments=guard_arguments,
+                )
+            )
+
+        def run_call(call: CapabilityCall | AgentCall) -> Any:
+            if not isinstance(call, CapabilityCall):  # pragma: no cover - contract
+                raise ValidationError("Capability batch contains an Agent call")
+            if call.call_id in preflight_results:
+                return preflight_results[call.call_id]
+            return context.execute_capability_call(
+                prepared[call.call_id],
+                preflighted=failure_guard_preflight[call.call_id],
+            )
+
+        def commit_call(call: CapabilityCall | AgentCall, outcome: Any) -> str:
+            if not isinstance(call, CapabilityCall):  # pragma: no cover - contract
+                raise ValidationError("Capability batch contains an Agent call")
+            return self.commit_capability(
+                context,
+                call,
+                self.capability_record(call, outcome),
+                summary=summary,
+            )
+
+        def suspend_call(call: CapabilityCall | AgentCall, outcome: Any) -> None:
+            if not isinstance(call, CapabilityCall):  # pragma: no cover - contract
+                raise ValidationError("Capability batch contains an Agent call")
+            context.uncommitted_capability_results[call.call_id] = (
+                self.capability_record(call, outcome)
+            )
+
+        def cancel_call(call: CapabilityCall | AgentCall, reason: str) -> None:
+            context.uncommitted_capability_results.pop(call.call_id, None)
+            if (
+                context.pending is not None
+                and context.pending.provider_call_id == call.call_id
+            ):
+                context.pending = None
+            if context.unresolved_tool_call(call.call_id) is None:
+                return
+            context.append_tool_result(
+                {"status": "cancelled", "reason": reason},
+                call_id=call.call_id,
+            )
+            self.observe(
+                context,
+                "call_cancelled",
+                {"call_id": call.call_id, "reason": reason},
+            )
+
+        return self.harness.coordinator.execute(
+            calls,
+            profiles,
+            prepare_call=prepare_call,
+            run_call=run_call,
+            commit_call=commit_call,
+            suspend_call=suspend_call,
+            cancel_call=cancel_call,
+            lane_for=lambda call: "capability",
+            provider_for=lambda call: self.harness.provider_id(call.capability_id),
+            owner=context,
+        )
+
+    @staticmethod
+    def capability_record(call: CapabilityCall, outcome: Any) -> Any:
+        """Normalize one Runtime outcome into a Capability call record."""
+
+        if (
+            getattr(outcome, "call_id", None) == call.call_id
+            and hasattr(outcome, "result")
+        ):
+            return outcome
+        from gitagent.harness.context.state import CapabilityCallRecord
+
+        message = str(outcome) if isinstance(outcome, Exception) else "capability failed"
+        error = capability_error(CapabilityErrorType.EXECUTION_FAILED, message)
+        return CapabilityCallRecord(
+            call.call_id,
+            dict(call.arguments),
+            None,
+            CapabilityResult(
+                call.capability_id,
+                "failed",
+                "none",
+                error=error,
+                attempts=0,
+            ),
+        )
 
     def commit_capability(
         self,

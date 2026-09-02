@@ -445,7 +445,7 @@ class ExecutionCoordinator:
                         resolved[index] = True
                 else:
                     raise ValidationError(f"unknown execution lane: {lane}")
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001 - interrupts cancel the batch
                 interruption = exc
                 break
 
@@ -453,7 +453,7 @@ class ExecutionCoordinator:
         if worker_futures and interruption is None:
             try:
                 done, _ = wait(worker_futures, return_when=FIRST_EXCEPTION)
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001 - interrupts cancel the batch
                 interruption = exc
                 done = {future for future in worker_futures if future.done()}
             if interruption is None:
@@ -478,7 +478,7 @@ class ExecutionCoordinator:
         while pending:
             try:
                 wait(pending)
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001 - interrupts cancel the batch
                 if interruption is None:
                     interruption = exc
                 cancellation.cancel()

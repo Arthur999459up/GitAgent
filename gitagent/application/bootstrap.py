@@ -630,6 +630,7 @@ def build_live_application(config: RuntimeConfig) -> LiveApplication:
         reasoner,
         memory,
         context_window_tokens=config.context_window_for("default"),
+        max_structured_retries=config.execution.max_structured_retries,
     )
     extraction_contexts = MemoryExtractionContextBuilder(
         sessions,

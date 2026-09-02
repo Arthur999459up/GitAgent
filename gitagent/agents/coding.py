@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from gitagent.agent_loop import (
+    CapabilityCall,
     ModelResponse,
     WaitForUser,
     explicit_wait,
@@ -14,7 +15,12 @@ from gitagent.agent_loop import (
 )
 from gitagent.capability import AccessLevel
 from gitagent.capability.schema import validate_schema
-from gitagent.domain.errors import LLMProviderError, ValidationError, WorkflowError
+from gitagent.domain.errors import (
+    LLMProviderError,
+    StructuredOutputError,
+    ValidationError,
+    WorkflowError,
+)
 from gitagent.domain.models import (
     AgentGuidance,
     AgentSpec,
@@ -35,6 +41,7 @@ from gitagent.harness.execution import (
     ResourceClaims,
 )
 from gitagent.harness.file_access import safe_repository_path
+from gitagent.harness.structured_call_dispatcher import StructuredCallDispatcher
 from gitagent.model import Reasoner, structured_tools
 from gitagent.prompts import get_prompt_library
 
@@ -198,6 +205,7 @@ class CodingAgent:
         self.harness = harness
         self.reasoner = reasoner
         self.verifier = verifier
+        self.dispatcher = StructuredCallDispatcher(harness)
         harness.register(CODING_SPEC)
 
     def step(self, context: AgentContext) -> ModelResponse | WaitForUser:
@@ -565,7 +573,11 @@ class CodingAgent:
         if self.reasoner is None:
             raise WorkflowError("autonomous Coding task requires a reasoner")
         context.start_message_thread()
-        context.append_message({"role": "user", "content": prompt})
+        if not any(
+            message.get("role") == "user" and message.get("content") == prompt
+            for message in context.messages
+        ):
+            context.append_message({"role": "user", "content": prompt})
         tools = self.harness.llm_tools(context, read_only=True)
         allowed = {
             capability.id
@@ -576,41 +588,89 @@ class CodingAgent:
         final_tools = structured_tools(tool_name, schema, tools)
         for _ in range(context.max_steps):
             response = context.reason(self.reasoner, tools=final_tools)
-            if len(response.calls) != 1:
-                raise WorkflowError(
-                    f"CodingAgent must make exactly one {tool_name} or read-only Capability call"
+            if len(response.calls) > self.harness.max_calls_per_turn:
+                raise StructuredOutputError(
+                    "CodingAgent response exceeds execution.max_calls_per_turn",
+                    max_calls_per_turn=self.harness.max_calls_per_turn,
+                    actual_calls=len(response.calls),
                 )
-            call = response.calls[0]
-            if call.name == tool_name:
-                validate_schema(call.arguments, schema, label=f"{tool_name} result")
+            call_ids = [call.call_id for call in response.calls]
+            if any(not call_id for call_id in call_ids) or len(set(call_ids)) != len(
+                call_ids
+            ):
+                raise StructuredOutputError(
+                    "CodingAgent calls must have unique non-empty call_id values"
+                )
+            historical_ids = [
+                str(call.get("id") or "") for call in context.provider_tool_calls()
+            ]
+            if any(historical_ids.count(call_id) != 1 for call_id in call_ids):
+                raise StructuredOutputError(
+                    "CodingAgent call_id values must be unique in the message thread"
+                )
+
+            final_calls = [call for call in response.calls if call.name == tool_name]
+            if final_calls:
+                if len(response.calls) != 1:
+                    raise StructuredOutputError(
+                        f"{tool_name} must be the only structured call in its response",
+                        expected_tool=tool_name,
+                        actual_tools=[call.name for call in response.calls],
+                    )
+                call = final_calls[0]
+                try:
+                    validate_schema(
+                        call.arguments, schema, label=f"{tool_name} result"
+                    )
+                except ValidationError as exc:
+                    raise StructuredOutputError(str(exc)) from exc
                 context.append_tool_result(
                     {"status": "accepted"}, call_id=call.call_id
                 )
                 return dict(call.arguments)
-            resolved = self.harness.resolve_model_call(call, context)
-            if not hasattr(resolved, "capability_id"):
+
+            if not response.calls:
+                raise StructuredOutputError(
+                    "CodingAgent returned Text where a typed structured result was required",
+                    expected_tool=tool_name,
+                )
+            if any(call.name.startswith("agent__") for call in response.calls):
                 raise WorkflowError("CodingAgent may not delegate another Agent")
-            capability_id = resolved.capability_id
-            if capability_id not in allowed:
-                context.append_tool_result(
-                    {
-                        "status": "failed",
-                        "capability_id": capability_id,
-                        "error": "permission_denied",
-                        "message": "Coding evidence gathering is read-only.",
-                    },
-                    call_id=call.call_id,
-                )
-                continue
+
+            resolved_calls: list[CapabilityCall] = []
+            for call in response.calls:
+                try:
+                    resolved = self.harness.resolve_model_call(call, context)
+                except ValidationError as exc:
+                    raise StructuredOutputError(str(exc)) from exc
+                if not isinstance(resolved, CapabilityCall):
+                    raise WorkflowError("CodingAgent may not delegate another Agent")
+                if resolved.capability_id not in allowed:
+                    raise WorkflowError(
+                        "CodingAgent evidence gathering may use only visible READ capabilities"
+                    )
+                try:
+                    permission = self.harness.capability_permission_decision(
+                        context, resolved
+                    )
+                except ValidationError as exc:
+                    raise StructuredOutputError(str(exc)) from exc
+                if permission != "ALLOW":
+                    raise WorkflowError(
+                        "CodingAgent evidence capability is not directly permitted"
+                    )
+                resolved_calls.append(resolved)
+
             try:
-                self._invoke_capability(
-                    context,
-                    capability_id,
-                    call_id=call.call_id,
-                    **dict(resolved.arguments),
+                completed = self.dispatcher.execute_capability_batch(
+                    context, resolved_calls, summary=response.text
                 )
-            except _CodingCapabilityFailure:
-                continue
+            except ValidationError as exc:
+                raise WorkflowError(
+                    f"CodingAgent capability batch violated the Runtime contract: {exc}"
+                ) from exc
+            if not completed:
+                raise WorkflowError("CodingAgent evidence gathering was cancelled")
         raise WorkflowError(
             f"CodingAgent exceeded the {context.max_steps}-step evidence limit"
         )
