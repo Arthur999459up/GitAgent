@@ -692,6 +692,7 @@ class AgentLoop:
             guidance=context.guidance,
         )
         child.origin_turn_seq = context.origin_turn_seq
+        child.parent_run_id = context.run_id
         child.parent_call_id = call.call_id
         child.parent_call_name = f"agent__{call.agent_id}"
         child.parent_call_arguments = dict(call.arguments)
@@ -777,6 +778,8 @@ class AgentLoop:
         for call_id, child in context.active_children.items():
             if call_id != child.parent_call_id:
                 raise ValidationError("stored active child call_id is invalid")
+            if child.parent_run_id != context.run_id:
+                raise ValidationError("stored active child parent_run_id is invalid")
             self._active_child_call(context, child)
             if not child.waiting and not child.finished and child.error is None:
                 raise ValidationError(

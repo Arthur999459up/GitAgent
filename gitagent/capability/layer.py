@@ -521,6 +521,7 @@ def _trace_content(
             "hits": [
                 {
                     "document_id": hit.get("document_id"),
+                    "document_name": hit.get("document_name"),
                     "section_id": hit.get("section_id"),
                     "chunk_id": hit.get("chunk_id"),
                 }

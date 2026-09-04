@@ -451,6 +451,25 @@ class StructuredCallDispatcher:
             calls,
             provider_call_id,
         )
+        self.harness.trace.emit(
+            session_id=context.session_id,
+            category=TraceCategory.WORKFLOW,
+            name="approval_queued",
+            status=TraceStatus.WAITING,
+            details={
+                "agent": context.agent,
+                "run_id": context.run_id,
+                "approval_id": approval.approval_id,
+                "provider_call_id": provider_call_id or "",
+                "calls": [
+                    {
+                        "capability_id": call.capability_id,
+                        "arguments": dict(call.arguments),
+                    }
+                    for call in calls
+                ],
+            },
+        )
 
     def execute_pending(self, context: Any, pending: PendingCall) -> None:
         for index, call in enumerate(pending.calls):
@@ -705,7 +724,12 @@ class StructuredCallDispatcher:
         *,
         details: dict[str, Any] | None = None,
     ) -> None:
-        event_details = {"steps": context.steps}
+        event_details = {
+            "steps": context.steps,
+            "run_id": context.run_id,
+            "parent_run_id": context.parent_run_id,
+            "parent_call_id": context.parent_call_id,
+        }
         if details:
             event_details.update(details)
         if status == "progress" and "phase" not in event_details:

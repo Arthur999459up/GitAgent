@@ -82,6 +82,7 @@ class AgentContext:
         self.spec = spec
         self.run_id = f"run-{uuid.uuid4().hex}"
         self.origin_turn_seq = 0
+        self.parent_run_id = ""
         self.parent_call_id = ""
         self.parent_call_name = ""
         self.session_id = session_id

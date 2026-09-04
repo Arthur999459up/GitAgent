@@ -803,6 +803,11 @@ class AgentHarness:
             category=TraceCategory.AGENT,
             name=agent_name,
             status=TraceStatus.STARTED,
+            details={
+                "run_id": context.run_id,
+                "parent_run_id": context.parent_run_id,
+                "parent_call_id": context.parent_call_id,
+            },
         )
         try:
             result = operation(context)
@@ -815,7 +820,12 @@ class AgentHarness:
                 name=agent_name,
                 status=TraceStatus.FAILED,
                 message=str(exc),
-                details={"error_type": type(exc).__name__},
+                details={
+                    "run_id": context.run_id,
+                    "parent_run_id": context.parent_run_id,
+                    "parent_call_id": context.parent_call_id,
+                    "error_type": type(exc).__name__,
+                },
                 duration_ms=(perf_counter() - started) * 1000,
             )
             raise
@@ -824,7 +834,12 @@ class AgentHarness:
             category=TraceCategory.AGENT,
             name=agent_name,
             status=TraceStatus.COMPLETED,
-            details={"output_type": type(result).__name__},
+            details={
+                "run_id": context.run_id,
+                "parent_run_id": context.parent_run_id,
+                "parent_call_id": context.parent_call_id,
+                "output_type": type(result).__name__,
+            },
             duration_ms=(perf_counter() - started) * 1000,
         )
         if isinstance(result, VerificationReport):

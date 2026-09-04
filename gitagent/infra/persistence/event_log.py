@@ -397,6 +397,7 @@ class SessionEventRecorder:
                     data={
                         "tool": str(trace_event.name),
                         "call_id": str(details.get("call_id", "")),
+                        "run_id": str(details.get("run_id", "")),
                         "arguments": _json_compatible(details.get("arguments", {})),
                     },
                 )
@@ -409,6 +410,7 @@ class SessionEventRecorder:
                     data={
                         "tool": str(trace_event.name),
                         "call_id": str(details.get("call_id", "")),
+                        "run_id": str(details.get("run_id", "")),
                         "status": str(details.get("status") or status),
                         "content": _json_compatible(details.get("content", "")),
                         "error": details.get("error"),

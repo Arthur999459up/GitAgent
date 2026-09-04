@@ -75,6 +75,7 @@ class LiveApplication:
         default=None,
         repr=False,
     )
+    _closed: bool = field(default=False, init=False, repr=False)
 
     @property
     def session_id(self) -> str | None:
@@ -365,6 +366,25 @@ class LiveApplication:
         self.config.memory_automation = enabled
         self.memory_hooks.enabled = enabled
         return enabled
+
+    def rebuild_memory_index(self) -> None:
+        """Rebuild the active account/repository Memory indexes."""
+
+        current = self._require_scope()
+        self.memory.rebuild_index(current.account_key, current.repository_key)
+
+    def close(self) -> None:
+        """Idempotently release Runtime executors and Memory background hooks."""
+
+        if self._closed:
+            return
+        try:
+            self.service.invalidate()
+        finally:
+            try:
+                self.memory_hooks.close()
+            finally:
+                self._closed = True
 
     def remember(
         self, content: str, *, scope: str = "private"

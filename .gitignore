@@ -8,4 +8,4 @@ dist/
 .venv/
 .gitagent/
 config.json
-config.json
+eval/runs/

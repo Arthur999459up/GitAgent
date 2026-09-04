@@ -510,6 +510,7 @@ class GitAgentService:
             "agent": context.agent,
             "run_id": context.run_id,
             "origin_turn_seq": context.origin_turn_seq,
+            "parent_run_id": context.parent_run_id,
             "parent_call_id": context.parent_call_id,
             "parent_call_name": context.parent_call_name,
             "parent_call_arguments": to_plain(context.parent_call_arguments),
@@ -713,6 +714,7 @@ class GitAgentService:
             raw,
             repository=repository,
             parent_agent=None,
+            parent_run_id="",
             main_messages=main_messages,
         )
         if (
@@ -735,6 +737,7 @@ class GitAgentService:
         *,
         repository: str,
         parent_agent: str | None,
+        parent_run_id: str,
         main_messages: list[dict[str, Any]] | None = None,
     ) -> AgentContext:
         agent = str(raw.get("agent") or "")
@@ -760,6 +763,7 @@ class GitAgentService:
         )
         context.run_id = str(raw.get("run_id") or context.run_id)
         context.origin_turn_seq = int(raw.get("origin_turn_seq") or 0)
+        context.parent_run_id = str(raw.get("parent_run_id") or parent_run_id)
         context.parent_call_id = str(raw.get("parent_call_id") or "")
         context.parent_call_name = str(raw.get("parent_call_name") or "")
         context.parent_call_arguments = dict(raw.get("parent_call_arguments") or {})
@@ -883,9 +887,12 @@ class GitAgentService:
                 child_raw,
                 repository=repository,
                 parent_agent=agent,
+                parent_run_id=context.run_id,
             )
             if child.parent_call_id != call_id:
                 raise RoutingError("stored active child call_id does not match")
+            if child.parent_run_id != context.run_id:
+                raise RoutingError("stored active child parent_run_id does not match")
             context.active_children[call_id] = child
         uncommitted = raw.get("uncommitted_capability_results")
         if not isinstance(uncommitted, dict):

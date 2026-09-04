@@ -91,6 +91,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         application = build_live_application(config)
         application.trace.subscribe(ui.trace)
         if not _select_startup_session(application):
+            application.close()
             return 0
     except (GitAgentError, OSError, TypeError, ValueError) as exc:
         ui.text(str(exc), title="Error · 启动失败", kind="error")
@@ -103,7 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return _repl(application)
     finally:
-        application.memory_hooks.close()
+        application.close()
 
 
 def _run_rag_management(args: argparse.Namespace) -> int:
@@ -885,8 +886,7 @@ def _memory(application: LiveApplication, argument: str) -> None:
             console.print("[yellow]Memory Dream 失败或已有任务正在运行；请查看 /debug。[/yellow]")
         return
     if action == "rebuild":
-        scope = application._require_scope()
-        application.memory.rebuild_index(scope.account_key, scope.repository_key)
+        application.rebuild_memory_index()
         console.print("Memory 索引已重建。")
         return
     if action == "search":
