@@ -449,42 +449,6 @@ class GitAgentService:
             return None
         return None
 
-    def approve(self) -> Any:
-        root, context = self._require_pending_context()
-        output = self._continue_approval(
-            root, context, WorkflowTurnDecision(ApprovalIntent.APPROVE), ""
-        )
-        self._store_resumed_context(root)
-        return output
-
-    def reject(self) -> Any:
-        root, context = self._require_pending_context()
-        output = self._continue_approval(
-            root, context, WorkflowTurnDecision(ApprovalIntent.REJECT), ""
-        )
-        self._store_resumed_context(root)
-        return output
-
-    def revise_proposal(self, instruction: str) -> Any:
-        root, context = self._require_pending_context()
-        output = self._continue_approval(
-            root,
-            context,
-            WorkflowTurnDecision(ApprovalIntent.REVISE, instruction=instruction.strip()),
-            instruction,
-        )
-        self._store_resumed_context(root)
-        return output
-
-    def _store_resumed_context(self, context: AgentContext) -> None:
-        if context.waiting:
-            self._save_context(context)
-        else:
-            self._clear_context()
-
-    def dream_memory(self) -> dict[str, tuple[str, ...]] | None:
-        return self.memory_hooks.dream_now(self._scope()) if self.memory_hooks else None
-
     def invalidate(self) -> None:
         if not self._invalidated:
             self.harness.approvals.invalidate_all()
@@ -1263,16 +1227,6 @@ class GitAgentService:
             context.guidance = inherited
         for child in context.active_children.values():
             self._restore_guidance(child, context.guidance)
-
-    def _require_pending_context(self) -> tuple[AgentContext, AgentContext]:
-        self._require_live()
-        root = self._load_context()
-        if root is None:
-            raise RoutingError("当前 Session 没有待审批提案")
-        context = self.loop.waiting_context(root)
-        if context.pending is None:
-            raise RoutingError("当前 Session 没有待审批提案")
-        return root, context
 
     @staticmethod
     def _observe_service_decision(

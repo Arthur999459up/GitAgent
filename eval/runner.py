@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import time
@@ -77,6 +76,7 @@ except ImportError:  # pragma: no cover - script entry point
 
 
 EXPECTED_SAMPLE_COUNT = 103
+_APPROVE_INPUT = "同意，执行当前待审批提案。"
 _ROOT_FIELDS = {
     "schema_version",
     "dataset_name",
@@ -165,6 +165,7 @@ class EvalRunner:
             for sample in all_samples
             if (not sample_key or sample.sample_key == sample_key)
             and (not group or sample.metric_group == group)
+            and (sample_key is not None or group is not None or sample.metric_group != "E2E")
         ]
         if not self.samples:
             raise ValueError(f"no samples selected for group {group!r}")
@@ -392,7 +393,7 @@ class EvalRunner:
         by_group: dict[str, list[EvalSample]] = defaultdict(list)
         for sample in self.samples:
             by_group[sample.metric_group].append(sample)
-        for group in ("M1", "M2-A", "M2-B", "M3", "M4", "M5", "M6", "M7"):
+        for group in ("E2E", "M2-A", "M2-B", "M3", "M4", "M5", "M6", "M7"):
             samples = by_group.get(group, [])
             if not samples:
                 continue
@@ -461,7 +462,8 @@ class EvalRunner:
             app.resume_session(int(self._account_info["A"]["id"]), session_id)
         else:
             self._create_session(app, "A")
-            app.set_memory_automation(False)
+            app.config.memory_automation = False
+            app.memory_hooks.enabled = False
         for sample in samples:
             if self._has_valid_trials(sample.sample_key, "smallctx", 1):
                 continue
@@ -718,7 +720,7 @@ class EvalRunner:
                 try:
                     action_result = self._dispatch(application, raw, context)
                 except Exception as exc:  # noqa: BLE001 - classify behavior vs infra
-                    expected_error = _expected_command_error(sample, raw)
+                    expected_error = _expected_turn_error(sample, raw)
                     action_error = f"{type(exc).__name__}: {exc}"
                     status = (
                         "invalid"
@@ -1007,16 +1009,49 @@ class EvalRunner:
 
     def _dispatch(self, application: Any, raw: str, context: dict[str, Any]) -> Any:
         text = raw.strip()
+        if text.startswith("<EVAL_MEMORY_WRITE "):
+            header, separator, content = text.partition("\n")
+            scope = header.removeprefix("<EVAL_MEMORY_WRITE ").removesuffix(">")
+            if not separator or scope.casefold() not in {"private", "project"}:
+                raise ValueError("invalid EVAL_MEMORY_WRITE fixture")
+            current = _active_scope(application)
+            return application.memory.manual_write(
+                current.account_key,
+                current.repository_key,
+                content.strip(),
+                scope=scope.casefold(),
+            )
+        if text.startswith("<EVAL_MEMORY_FORGET "):
+            header, separator, identifier = text.partition("\n")
+            scope = header.removeprefix("<EVAL_MEMORY_FORGET ").removesuffix(">")
+            if not separator or scope.casefold() not in {"private", "project"}:
+                raise ValueError("invalid EVAL_MEMORY_FORGET fixture")
+            current = _active_scope(application)
+            return application.memory.forget(
+                current.account_key,
+                current.repository_key,
+                identifier=identifier.strip(),
+                scope=scope.casefold(),
+            )
+        if text.startswith("<EVAL_MEMORY_SEARCH>"):
+            _, separator, query = text.partition("\n")
+            if not separator or not query.strip():
+                raise ValueError("invalid EVAL_MEMORY_SEARCH fixture")
+            current = _active_scope(application)
+            return application.memory_search.search(
+                current.account_key,
+                current.repository_key,
+                query.strip(),
+            )
+        if text == "<EVAL_MEMORY_REBUILD>":
+            current = _active_scope(application)
+            return application.memory.rebuild_index(
+                current.account_key, current.repository_key
+            )
         if not text.startswith("/"):
             return application.handle(text)
         command, _, argument = text.partition(" ")
         normalized = command.casefold()
-        if normalized == "/approve":
-            return application.approve()
-        if normalized == "/reject":
-            return application.reject()
-        if normalized == "/edit":
-            return application.revise(argument.strip())
         if normalized == "/new":
             return application.new_session()
         if normalized == "/reset":
@@ -1034,27 +1069,6 @@ class EvalRunner:
                 index = int(argument.strip()) - 1
                 target = sessions[index].session_id
             return application.switch_session(str(target))
-        if normalized == "/remember":
-            scope = "private"
-            content = argument
-            if argument.startswith("--scope "):
-                _, scope, content = argument.split(maxsplit=2)
-            return application.remember(content.strip(), scope=scope.casefold())
-        if normalized == "/forget":
-            parts = shlex.split(argument)
-            if len(parts) == 2 and parts[0].casefold() in {"private", "project"}:
-                return application.forget(parts[1], scope=parts[0].casefold())
-            return application.forget(argument.strip())
-        if normalized == "/memory":
-            parts = shlex.split(argument)
-            action = parts[0].casefold() if parts else ""
-            if action == "auto" and len(parts) == 2:
-                return application.set_memory_automation(parts[1].casefold() == "on")
-            if action == "rebuild" and len(parts) == 1:
-                return application.rebuild_memory_index()
-            if action == "search" and len(parts) > 1:
-                return application.search_memories(" ".join(parts[1:]))
-            raise ValueError(f"unsupported /memory action: {argument}")
         raise ValueError(f"unsupported eval control action: {command}")
 
     def _finish_trial(
@@ -1483,8 +1497,15 @@ def _is_infrastructure(error: BaseException) -> bool:
     )
 
 
-def _expected_command_error(sample: EvalSample, raw: str) -> bool:
-    return raw.strip().casefold() == "/approve" and sample.id in {
+def _active_scope(application: Any) -> Any:
+    scope = application.scope
+    if scope is None:
+        raise ValueError("eval control action requires an active Session")
+    return scope
+
+
+def _expected_turn_error(sample: EvalSample, raw: str) -> bool:
+    return raw.strip() == _APPROVE_INPUT and sample.id in {
         "SAFE-12",
         "SAFE-14",
         "REC-05",
@@ -1495,16 +1516,19 @@ def _expected_command_error(sample: EvalSample, raw: str) -> bool:
 
 def _action_name(raw: str) -> str:
     text = raw.strip()
+    if text.startswith("<EVAL_MEMORY_"):
+        directive = text.partition(">")[0].removeprefix("<")
+        return directive.split(maxsplit=1)[0].casefold()
     if not text.startswith("/"):
         return "handle"
     return text.split(maxsplit=1)[0].removeprefix("/").casefold()
 
 
 def _action_result_summary(raw: str, result: Any) -> dict[str, Any] | None:
-    """Keep only bounded control-command evidence; never persist Memory bodies."""
+    """Keep only bounded eval-control evidence; never persist Memory bodies."""
 
-    text = raw.strip().casefold()
-    if text.startswith("/memory search "):
+    text = raw.strip()
+    if text.startswith("<EVAL_MEMORY_SEARCH>"):
         hits: list[dict[str, Any]] = []
         if isinstance(result, Sequence) and not isinstance(result, (str, bytes, bytearray)):
             for item in result:

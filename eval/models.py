@@ -8,7 +8,7 @@ from typing import Any
 
 SUPPORTED_DATASET_SCHEMA = "1.0"
 TRIAL_SCHEMA_VERSION = "1.0"
-METRIC_GROUPS = frozenset({"M1", "M2-A", "M2-B", "M3", "M4", "M5", "M6", "M7"})
+METRIC_GROUPS = frozenset({"E2E", "M2-A", "M2-B", "M3", "M4", "M5", "M6", "M7"})
 
 
 @dataclass(frozen=True, slots=True)

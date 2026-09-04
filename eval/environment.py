@@ -144,11 +144,11 @@ def derive_runtime_config(
     elif variant == "smallctx":
         contexts.update(
             {
-                name: 32_768
+                name: 262_144
                 for name in ("main", "repository", "issues", "pull_requests", "coding")
             }
         )
-        contexts["default"] = 32_768
+        contexts["default"] = 262_144
         memory_automation = False
     elif variant not in {"normal", "tool_parallel"}:
         raise ValueError(f"unknown eval variant: {variant}")
@@ -248,18 +248,23 @@ class Observer:
         if local:
             value["local"] = local
         if application is not None and application.scope is not None:
+            scope = application.scope
             value["memory"] = {
                 "pages": [
                     {
-                        "id": indexed.item.id,
-                        "name": indexed.item.name,
-                        "scope": indexed.item.scope,
-                        "relative_path": indexed.item.relative_path,
-                        "disabled": indexed.item.disabled,
-                        "signature": indexed.item.signature,
+                        "id": page.id,
+                        "name": page.name,
+                        "scope": page.scope,
+                        "relative_path": page.relative_path,
+                        "disabled": page.disabled,
+                        "signature": page.signature,
                     }
-                    for indexed in application.indexed_memories(include_inactive=True)
-                    if indexed.item.name.startswith("eval-")
+                    for page in application.memory.list_pages(
+                        scope.account_key,
+                        scope.repository_key,
+                        include_inactive=True,
+                    )
+                    if page.name.startswith("eval-")
                 ]
             }
         return value

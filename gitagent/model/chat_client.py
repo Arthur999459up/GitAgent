@@ -87,7 +87,7 @@ class OpenAIChatClient:
         *,
         temperature: float = 0.0,
         max_output_tokens: int = 16_384,
-        context_window_tokens: int = 32_768,
+        context_window_tokens: int = 262_144,
         timeout: float = 30.0,
         client: Any | None = None,
     ) -> None:

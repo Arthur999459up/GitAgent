@@ -73,7 +73,7 @@ class ContextBuilder:
         self,
         session_manager: SessionManager,
         *,
-        context_window_tokens: int = 32768,
+        context_window_tokens: int = 262144,
     ) -> None:
         self.session_manager = session_manager
         self.context_window_tokens = _integer(

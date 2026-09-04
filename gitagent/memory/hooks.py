@@ -119,16 +119,6 @@ class MemoryStopHooks:
         future.add_done_callback(lambda _: self._finish_dream())
         return True
 
-    def dream_now(self, scope: SessionScope) -> dict[str, tuple[str, ...]] | None:
-        with self._lock:
-            if self._dreaming:
-                return None
-            self._dreaming = True
-        try:
-            return self._run_dream(scope)
-        finally:
-            self._finish_dream()
-
     def wait_for_idle(self, timeout: float | None = None) -> None:
         while True:
             with self._lock:

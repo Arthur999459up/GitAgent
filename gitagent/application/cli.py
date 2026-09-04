@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import shlex
 from collections.abc import Sequence
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -388,28 +386,6 @@ def _run_command(application: LiveApplication, request: str) -> None:
         if cost is not None:
             text += f"（约 ${cost:.4f}）"
         console.print(text)
-    elif command == "/approve":
-        if argument:
-            console.print("[yellow]用法：/approve[/yellow]")
-            return
-        application.approve(
-            renderer=lambda output: _render_application_output(application, output)
-        )
-    elif command == "/reject":
-        if argument:
-            console.print("[yellow]用法：/reject[/yellow]")
-            return
-        application.reject(
-            renderer=lambda output: _render_application_output(application, output)
-        )
-    elif command == "/edit":
-        if not argument:
-            console.print("[yellow]用法：/edit <修改要求>[/yellow]")
-            return
-        application.revise(
-            argument,
-            renderer=lambda output: _render_application_output(application, output),
-        )
     elif command == "/audit":
         events = application.service.harness.audit.events(
             argument or application.session_id
@@ -504,25 +480,6 @@ def _run_command(application: LiveApplication, request: str) -> None:
             )
         except (GitAgentError, ValueError) as exc:
             console.print(f"[red]Context 压缩失败：{exc}[/red]")
-    elif command == "/remember":
-        _remember(application, argument)
-    elif command == "/memory":
-        _memory(application, argument)
-    elif command == "/forget":
-        scope_token, _, identifier = argument.partition(" ")
-        scope = {"private": "private", "project": "project"}.get(
-            scope_token.casefold()
-        )
-        if scope is None or not identifier.strip():
-            console.print("[yellow]用法：/forget <private|project> <id|name>[/yellow]")
-            return
-        try:
-            memory = application.forget(identifier.strip(), scope=scope)
-            console.print(
-                f"已忘记记忆 [cyan]{scope_token}:{memory.name}[/cyan]：{memory.description}"
-            )
-        except (GitAgentError, ValueError) as exc:
-            console.print(f"[red]记忆删除失败：{exc}[/red]")
     else:
         console.print(f"[yellow]未知命令：{command}（使用 /help 查看命令）[/yellow]")
 
@@ -834,149 +791,6 @@ def _show_session_safety_note() -> None:
     )
 
 
-def _remember(application: LiveApplication, argument: str) -> None:
-    scope = "private"
-    content = argument.strip()
-    if content.startswith("--scope "):
-        parts = content.split(maxsplit=2)
-        if len(parts) < 3 or parts[1].casefold() not in {"private", "project"}:
-            console.print(
-                "[yellow]用法：/remember [--scope private|project] <内容>[/yellow]"
-            )
-            return
-        scope = parts[1].casefold()
-        content = parts[2].strip()
-    if not content:
-        console.print(
-            "[yellow]用法：/remember [--scope private|project] <内容>[/yellow]"
-        )
-        return
-    try:
-        memory, created = application.remember(content, scope=scope)
-        if created:
-            console.print(f"已保存固定记忆 [cyan]{memory.item.relative_path}[/cyan]")
-        else:
-            console.print(
-                f"记忆 [cyan]{memory.item.relative_path}[/cyan] 已存在；未重复保存。"
-            )
-    except (GitAgentError, ValueError) as exc:
-        console.print(f"[red]Memory 保存失败：{exc}[/red]")
-
-
-def _memory(application: LiveApplication, argument: str) -> None:
-    try:
-        parts = shlex.split(argument)
-    except ValueError as exc:
-        console.print(f"[red]Memory 命令解析失败：{exc}[/red]")
-        return
-    action = parts[0].casefold() if parts else "list"
-    if action == "auto":
-        state = parts[1].casefold() if len(parts) == 2 else ""
-        if len(parts) > 2 or state not in {"", "on", "off"}:
-            console.print("[yellow]用法：/memory auto [on|off][/yellow]")
-            return
-        if state:
-            application.set_memory_automation(state == "on")
-        label = "已启用" if application.config.memory_automation else "已关闭"
-        console.print(f"Memory 自动提取与整理：[cyan]{label}[/cyan]")
-        return
-    if action == "dream":
-        result = application.dream_memory()
-        if result is None:
-            console.print("[yellow]Memory Dream 失败或已有任务正在运行；请查看 /debug。[/yellow]")
-        return
-    if action == "rebuild":
-        application.rebuild_memory_index()
-        console.print("Memory 索引已重建。")
-        return
-    if action == "search":
-        query = " ".join(parts[1:]).strip()
-        if not query:
-            console.print("[yellow]用法：/memory search <query>[/yellow]")
-            return
-        hits = application.search_memories(query)
-        if not hits:
-            console.print("[dim]没有相关的 Persistent Memory。[/dim]")
-            return
-        table = Table(title="Memory Search", show_lines=True)
-        for heading in ("作用域", "类型", "名称", "描述", "重要性", "状态"):
-            table.add_column(heading)
-        for hit in hits:
-            table.add_row(
-                hit.scope,
-                hit.type,
-                hit.name,
-                hit.description,
-                str(hit.importance),
-                "stale" if hit.stale else "active",
-            )
-        console.print(table)
-        return
-    if action == "show":
-        identifier = " ".join(parts[1:]).strip()
-        if not identifier:
-            console.print("[yellow]用法：/memory show <id|name>[/yellow]")
-            return
-        try:
-            page = application.show_memory(identifier)
-        except (GitAgentError, ValueError) as exc:
-            console.print(f"[red]Memory 读取失败：{exc}[/red]")
-            return
-        console.print(
-            Panel(
-                page.body,
-                title=f"{page.scope} · {page.type} · {page.name}",
-                subtitle=f"{page.id} · importance={page.importance} · {page.updated_at}",
-            )
-        )
-        return
-    if action == "forget":
-        identifier = " ".join(parts[1:]).strip()
-        if not identifier:
-            console.print("[yellow]用法：/memory forget <id|name>[/yellow]")
-            return
-        try:
-            page = application.forget(identifier)
-            console.print(f"已忘记 Memory [cyan]{page.scope}:{page.name}[/cyan]。")
-        except (GitAgentError, ValueError) as exc:
-            console.print(f"[red]Memory 删除失败：{exc}[/red]")
-        return
-    if action not in {"list", "private", "project", "all"} or len(parts) > 1:
-        console.print(
-            "[yellow]用法：/memory [private|project|all|search <query>|show <id|name>|"
-            "forget <id|name>|rebuild|dream|auto [on|off]][/yellow]"
-        )
-        return
-    selected_scope = action if action in {"private", "project"} else None
-    try:
-        memories = application.indexed_memories(
-            scope=selected_scope,
-            include_inactive=action == "all",
-        )
-    except (GitAgentError, ValueError) as exc:
-        console.print(f"[red]Memory 读取失败：{exc}[/red]")
-        return
-    if not memories:
-        console.print("[dim]当前作用域没有长期 Memory。[/dim]")
-        return
-    table = Table(title="Persistent Memory Pages", show_lines=True)
-    for heading in ("作用域", "类型", "名称", "描述", "重要性", "更新时间", "状态"):
-        table.add_column(heading)
-    now = datetime.now().astimezone()
-    for indexed in memories:
-        memory = indexed.item
-        table.add_row(
-            indexed.scope,
-            memory.type,
-            memory.name,
-            memory.description,
-            str(memory.importance),
-            memory.updated_at,
-            memory.status(now),
-        )
-    console.print(table)
-
-
 def _show_debug_history(application: LiveApplication, argument: str) -> None:
     parts = argument.split()
     if len(parts) > 2:
@@ -1016,13 +830,7 @@ def _show_help() -> None:
             "  /reset                保留 Turn 并建立新 Context 边界\n"
             "  /delete <编号>        删除 Session\n"
             "  /compact              压缩旧 Turn 的 Context 投影\n"
-            "  /memory [private|project|all|search|show|forget|rebuild|dream|auto]  管理 Persistent Memory\n"
-            "  /remember [--scope private|project] <内容>  创建人工 Memory Page\n"
-            "  /forget <private|project> <id|name>  删除指定 Memory Page\n"
             "  /tokens               查看模型 token 与估算费用\n"
-            "  /approve              批准当前 Session 的待执行提案\n"
-            "  /reject               拒绝当前 Session 的待执行提案\n"
-            "  /edit <要求>          修改当前待执行方案\n"
             "  /audit [session_id]   查看当前或指定 Session 审计记录\n"
             "  /trace [session_id]   回放当前或指定 Session 实时调用轨迹\n"
             "  /debug [agent]        查看当前 Session 的 Agent Debug History\n"

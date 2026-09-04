@@ -683,7 +683,7 @@ class AgentHarness:
         execution: Mapping[str, Any],
     ) -> None:
         windows = (
-            {"default": 32_768}
+            {"default": 262_144}
             if context_window_tokens is None
             else dict(context_window_tokens)
         )

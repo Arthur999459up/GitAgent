@@ -30,7 +30,6 @@ from gitagent.memory import (
     AutoDream,
     MemoryExtractionContextBuilder,
     MemoryExtractor,
-    MemoryPage,
     MemoryPageStore,
     MemorySearch,
     MemoryStopHooks,
@@ -40,19 +39,10 @@ from gitagent.prompts import get_prompt_library
 
 from .capabilities import build_capability_layer
 from .config import RuntimeConfig
-from .projection import project_output, project_service_result
+from .projection import project_service_result
 from .service import GitAgentService
 
 Renderer = Callable[[Any], None]
-
-
-@dataclass(frozen=True)
-class IndexedMemory:
-    """One CLI-visible memory with a short repository-scope index."""
-
-    index: int
-    scope: str
-    item: MemoryPage
 
 
 @dataclass
@@ -260,19 +250,6 @@ class LiveApplication:
                 ) from exc
             raise
 
-    def approve(self, *, renderer: Renderer | None = None) -> Any:
-        return self._run_context_command(self.service.approve, renderer=renderer)
-
-    def reject(self, *, renderer: Renderer | None = None) -> Any:
-        return self._run_context_command(self.service.reject, renderer=renderer)
-
-    def revise(self, instruction: str, *, renderer: Renderer | None = None) -> Any:
-        if not instruction.strip():
-            raise ValidationError("revision instruction cannot be empty")
-        return self._run_context_command(
-            lambda: self.service.revise_proposal(instruction), renderer=renderer
-        )
-
     def list_sessions(self) -> tuple[SessionRecord, ...]:
         scope = self._require_scope()
         return self.sessions.list_sessions(scope.account_key, scope.repository_key)
@@ -360,19 +337,6 @@ class LiveApplication:
         )
         return self.context_builder.compact(scope, system=system, tools=tools)
 
-    def set_memory_automation(self, enabled: bool) -> bool:
-        if not isinstance(enabled, bool):
-            raise TypeError("Memory automation state must be a boolean")
-        self.config.memory_automation = enabled
-        self.memory_hooks.enabled = enabled
-        return enabled
-
-    def rebuild_memory_index(self) -> None:
-        """Rebuild the active account/repository Memory indexes."""
-
-        current = self._require_scope()
-        self.memory.rebuild_index(current.account_key, current.repository_key)
-
     def close(self) -> None:
         """Idempotently release Runtime executors and Memory background hooks."""
 
@@ -385,100 +349,6 @@ class LiveApplication:
                 self.memory_hooks.close()
             finally:
                 self._closed = True
-
-    def remember(
-        self, content: str, *, scope: str = "private"
-    ) -> tuple[IndexedMemory, bool]:
-        current = self._require_scope()
-        item, created = self.memory.manual_write(
-            current.account_key,
-            current.repository_key,
-            content,
-            scope=scope,
-        )
-        indexed = next(
-            indexed
-            for indexed in self.indexed_memories(scope=item.scope, include_inactive=True)
-            if indexed.item.id == item.id
-        )
-        return indexed, created
-
-    def indexed_memories(
-        self,
-        *,
-        scope: str | None = None,
-        memory_type: str | None = None,
-        include_inactive: bool = False,
-    ) -> tuple[IndexedMemory, ...]:
-        current = self._require_scope()
-        pages = self.memory.list_pages(
-            current.account_key,
-            current.repository_key,
-            scope=scope,
-            memory_type=memory_type,
-            include_inactive=include_inactive,
-        )
-        return tuple(
-            IndexedMemory(index, item.scope, item)
-            for index, item in enumerate(pages, start=1)
-        )
-
-    def search_memories(self, query: str) -> tuple[Any, ...]:
-        current = self._require_scope()
-        return self.memory_search.search(
-            current.account_key, current.repository_key, query
-        )
-
-    def show_memory(self, identifier: str) -> MemoryPage:
-        matches = [
-            indexed.item
-            for indexed in self.indexed_memories(include_inactive=True)
-            if identifier in {
-                indexed.item.id,
-                indexed.item.name,
-                indexed.item.relative_path,
-            }
-        ]
-        if len(matches) > 1:
-            raise ValidationError("Memory identifier is ambiguous; include its scope")
-        if not matches:
-            raise StateError("Memory not found")
-        return matches[0]
-
-    def forget(self, identifier: str, *, scope: str | None = None) -> MemoryPage:
-        current = self._require_scope()
-        forgotten = self.memory.forget(
-            current.account_key,
-            current.repository_key,
-            identifier=identifier,
-            scope=scope,
-        )
-        if forgotten is None:
-            raise StateError("Memory not found")
-        return forgotten
-
-    def dream_memory(self) -> dict[str, tuple[str, ...]] | None:
-        self._require_repository()
-        return self.service.dream_memory()
-
-    def _run_context_command(
-        self, operation: Callable[[], Any], *, renderer: Renderer | None
-    ) -> Any:
-        self._require_scope()
-        try:
-            output = operation()
-            project_output(output, text_sanitizer=self.store.text)
-            if renderer is not None:
-                renderer(output)
-            return output
-        except BaseException as exc:
-            rebuild_error = self._rebuild_current_service()
-            cleanup_note = (
-                "；新的 Service 未能建立" if rebuild_error is not None else ""
-            )
-            raise StateError(
-                f"Session agent 操作失败{cleanup_note}；运行时审批已失效，请核对外部状态后再继续"
-            ) from exc
 
     def _prepare_service(self, scope: SessionScope | None) -> GitAgentService:
         if self._service_factory is not None:
