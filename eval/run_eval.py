@@ -23,14 +23,14 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset",
         default="eval/gitagent-evaluation-dataset.json",
-        help="103-sample dataset (83 benchmark cases + 20 optional E2E smoke cases)",
+        help="103-sample dataset (61 official M3-M7 cases + 22 legacy M2 cases + 20 optional E2E cases)",
     )
     parser.add_argument("--config", default="config.json", help="base GitAgent config")
     parser.add_argument("--output", required=True, help="isolated eval run directory")
     parser.add_argument("--sample", help="run one task_name:id sample")
     parser.add_argument(
         "--group",
-        choices=("E2E", "M2-A", "M2-B", "M3", "M4", "M5", "M6", "M7"),
+        choices=("E2E", "M3", "M4", "M5", "M6", "M7"),
         help="run one metric group",
     )
     parser.add_argument(

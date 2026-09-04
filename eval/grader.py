@@ -304,21 +304,21 @@ def grade_sample(
         {tool for item in per_trial for tool in item.get("capabilities", [])}
     )
     deterministic["approval_summary"] = _approval_aggregate(per_trial)
+    compactions = [entry for item in per_trial for entry in item["compactions"]]
+    ratios = [entry["compression_ratio"] for entry in compactions]
+    deterministic["auto_compact_observed"] = bool(compactions)
+    deterministic["compactions"] = compactions
+    deterministic["compression_ratio_mean"] = _mean(ratios)
+    deterministic["compression_ratio_min"] = min(ratios) if ratios else None
+    deterministic["compression_ratio_max"] = max(ratios) if ratios else None
 
     if sample.metric_group == "M2-A":
-        compactions = [entry for item in per_trial for entry in item["compactions"]]
         context_precondition = any(
             bool(trial.fault and trial.fault.get("auto_compact_observed"))
             for trial in valid_trials
         )
-        deterministic["auto_compact_observed"] = (
-            context_precondition if sample.id == "CTX-11" else bool(compactions)
-        )
-        deterministic["compactions"] = compactions
-        ratios = [entry["compression_ratio"] for entry in compactions]
-        deterministic["compression_ratio_mean"] = _mean(ratios)
-        deterministic["compression_ratio_min"] = min(ratios) if ratios else None
-        deterministic["compression_ratio_max"] = max(ratios) if ratios else None
+        if sample.id == "CTX-11":
+            deterministic["auto_compact_observed"] = context_precondition
         if sample.id == "CTX-11" and not deterministic["auto_compact_observed"]:
             return DeterministicResult(
                 sample.sample_key,
@@ -453,7 +453,6 @@ def aggregate_metrics(
     samples: Sequence[EvalSample],
     results: Sequence[DeterministicResult],
 ) -> dict[str, Any]:
-    by_key = {result.sample_key: result for result in results}
     valid = [result for result in results if result.valid]
     failed = [result for result in valid if result.status == "failed"]
     metrics: dict[str, Any] = {
@@ -476,37 +475,53 @@ def aggregate_metrics(
             "purpose": "optional_smoke_regression",
             "pending_judge": any(item.judge_required for item in e2e),
         }
-    m2a = [item for item in groups["M2-A"] if item.valid]
-    compact_ratios = [
-        item.deterministic.get("compression_ratio_mean")
-        for item in m2a
+    compaction_events = [
+        entry
+        for item in valid
+        for entry in item.deterministic.get("compactions", [])
+        if isinstance(entry, Mapping)
+    ]
+    compaction_results = [
+        item for item in valid if item.deterministic.get("compactions")
+    ]
+    compaction_ratios = [
+        float(entry["compression_ratio"])
+        for entry in compaction_events
+        if entry.get("compression_ratio") is not None
+    ]
+    task_compaction_ratios = [
+        float(item.deterministic["compression_ratio_mean"])
+        for item in compaction_results
         if item.deterministic.get("compression_ratio_mean") is not None
     ]
-    metrics["M2_A"] = {
-        **_counts(groups["M2-A"]),
-        "auto_compact_observed_rate": _rate(m2a, "auto_compact_observed"),
-        "mean_compression_ratio": _mean(compact_ratios),
-        "tool_protocol_valid_rate": _rate(m2a, "tool_protocol_ok"),
-        "ctx_11_fact_retention": None,
-        "pending_judge": any(item.judge_required for item in m2a),
-    }
-    m2b = [item for item in groups["M2-B"] if item.valid]
-    metrics["M2_B"] = {
-        **_counts(groups["M2-B"]),
-        "memory_state_check_rate": _rate(m2b, "memory_state_ok"),
-        "dedup_ok_rate": _sample_rate(
-            by_key, "persistent_memory:MEM-04", "memory_state_ok"
+    before_tokens = [float(entry.get("before_tokens") or 0) for entry in compaction_events]
+    after_tokens = [float(entry.get("after_tokens") or 0) for entry in compaction_events]
+    agents = Counter(
+        str(entry.get("agent") or "unknown") for entry in compaction_events
+    )
+    metrics["M2"] = {
+        "scope": "passive_compaction_instrumentation_across_selected_tasks",
+        "valid_samples_observed": len(valid),
+        "samples_with_compaction": len(compaction_results),
+        "compaction_sample_rate": (
+            len(compaction_results) / len(valid) if valid else None
         ),
-        "forget_ok_rate": _sample_rate(
-            by_key, "persistent_memory:MEM-06", "memory_state_ok"
+        "compaction_event_count": len(compaction_events),
+        "mean_compactions_per_valid_sample": (
+            len(compaction_events) / len(valid) if valid else None
         ),
-        "account_isolation_ok_rate": _sample_rate(
-            by_key, "persistent_memory:MEM-09", "memory_state_ok"
+        "mean_before_tokens": _mean(before_tokens),
+        "mean_after_tokens": _mean(after_tokens),
+        "mean_compression_ratio": _mean(compaction_ratios),
+        "mean_task_compression_ratio": _mean(task_compaction_ratios),
+        "compression_ratio_p50": percentile(compaction_ratios, 0.5),
+        "compression_ratio_p95": percentile(compaction_ratios, 0.95),
+        "post_compaction_tool_protocol_valid_rate": _rate(
+            compaction_results, "tool_protocol_ok"
         ),
-        "index_rebuild_ok_rate": _sample_rate(
-            by_key, "persistent_memory:MEM-10", "memory_state_ok"
-        ),
-        "pending_judge": any(item.judge_required for item in m2b),
+        "post_compaction_case_count": len(compaction_results),
+        "post_compaction_case_pass_rate": None,
+        "events_by_agent": dict(sorted(agents.items())),
     }
     metrics["M3"] = _aggregate_performance(groups["M3"], agent=False)
     metrics["M4"] = _aggregate_performance(groups["M4"], agent=True)
@@ -745,29 +760,38 @@ def finalize_metrics(
     final["judge_pending_samples"] = 0
     final["judge_finalized"] = True
     final["case_pass"] = passes
-    for key in ("E2E", "M2_A", "M2_B", "M5", "M6", "M7"):
+    compacted_keys = [
+        result.sample_key
+        for result in results
+        if result.valid and result.deterministic.get("compactions")
+    ]
+    if "M2" in final:
+        final["M2"]["post_compaction_case_count"] = len(compacted_keys)
+        final["M2"]["post_compaction_case_pass_rate"] = (
+            sum(bool(passes.get(key)) for key in compacted_keys) / len(compacted_keys)
+            if compacted_keys
+            else None
+        )
+    for key in ("E2E", "M3", "M4", "M5", "M6", "M7"):
         if key in final:
             final[key]["pending_judge"] = False
-    m6 = [value for key, value in passes.items() if key.startswith("recovery:")]
-    final["M6"]["official_recovery_success_rate"] = sum(m6) / len(m6) if m6 else None
-    m7_keys = [key for key in passes if key.startswith("rag:")]
-    grounded = [
-        passes[key]
-        and next(
-            result for result in results if result.sample_key == key
-        ).deterministic.get("rag_source_ok")
-        is True
-        for key in m7_keys
-    ]
-    final["M7"]["official_grounded_accuracy"] = (
-        sum(grounded) / len(grounded) if grounded else None
-    )
-    ctx11 = judged.get("context_compaction:CTX-11", {}).get(
-        "answer_reference_item_results"
-    )
-    if isinstance(ctx11, list) and all(isinstance(value, bool) for value in ctx11):
-        final["M2_A"]["ctx_11_fact_retention"] = (
-            sum(ctx11) / len(ctx11) if ctx11 else None
+    if "M6" in final:
+        m6 = [value for key, value in passes.items() if key.startswith("recovery:")]
+        final["M6"]["official_recovery_success_rate"] = (
+            sum(m6) / len(m6) if m6 else None
+        )
+    if "M7" in final:
+        m7_keys = [key for key in passes if key.startswith("rag:")]
+        grounded = [
+            passes[key]
+            and next(
+                result for result in results if result.sample_key == key
+            ).deterministic.get("rag_source_ok")
+            is True
+            for key in m7_keys
+        ]
+        final["M7"]["official_grounded_accuracy"] = (
+            sum(grounded) / len(grounded) if grounded else None
         )
     return final
 
@@ -1845,12 +1869,9 @@ def _judge_fields(sample: EvalSample) -> list[str]:
 
 def _judge_system_prompt() -> str:
     return (
-        "你是 GitAgent benchmark judge。只判断请求中的语义字段，并严格遵守以下规则："
-        "label.trace 是语义 gold，不要求逐 call 完全相同；普通只读的等价 evidence path 可以接受；"
-        "M3/M4 的 timing、overlap、mutation、approval、observer 与其他 deterministic facts 不得被你推翻；"
-        "M3/M4 若提供 performance_variant_candidates，answer_facts_ok 与 semantic_trace_ok 必须同时覆盖 serial 和 parallel 两个代表候选，任一侧语义不正确都判 false；"
-        "Agent 自称已修改或未修改不构成外部状态证据；缺乏语义证据必须判 false，不能猜 true；"
-        "只输出符合 response_schema 的 JSON，不要 Markdown、解释前缀或额外字段。"
+        "你是 GitAgent benchmark judge。label.trace 是语义 gold，普通只读的等价 evidence path 可以接受。"
+        "M3/M4 的串行/并行、timing 和 overlap 由 deterministic grader 判定；semantic_trace_ok 只判断任务、路由、证据和汇总语义是否正确。"
+        "若提供 serial/parallel 两个候选，两侧答案语义都必须正确。只输出符合 response_schema 的 JSON。"
     )
 
 

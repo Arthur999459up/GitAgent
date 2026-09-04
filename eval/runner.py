@@ -76,6 +76,7 @@ except ImportError:  # pragma: no cover - script entry point
 
 
 EXPECTED_SAMPLE_COUNT = 103
+OFFICIAL_METRIC_GROUPS = frozenset({"M3", "M4", "M5", "M6", "M7"})
 _APPROVE_INPUT = "同意，执行当前待审批提案。"
 _ROOT_FIELDS = {
     "schema_version",
@@ -165,7 +166,11 @@ class EvalRunner:
             for sample in all_samples
             if (not sample_key or sample.sample_key == sample_key)
             and (not group or sample.metric_group == group)
-            and (sample_key is not None or group is not None or sample.metric_group != "E2E")
+            and (
+                sample_key is not None
+                or group is not None
+                or sample.metric_group in OFFICIAL_METRIC_GROUPS
+            )
         ]
         if not self.samples:
             raise ValueError(f"no samples selected for group {group!r}")
@@ -181,6 +186,7 @@ class EvalRunner:
         self._observers: dict[str, ObserverSnapshot] = {}
         self._errors: list[dict[str, Any]] = []
         self._applications: list[Any] = []
+        self._application_specs: dict[int, dict[str, str]] = {}
         self._account_info: dict[str, dict[str, Any]] = {}
         self._repository_info: dict[str, dict[str, Any]] = {}
         self._fixture_manager: FixtureManager | None = None
@@ -718,7 +724,11 @@ class EvalRunner:
                     )
                     continue
                 try:
-                    action_result = self._dispatch(application, raw, context)
+                    action_result = self._dispatch(
+                        application,
+                        _execution_mode_input(sample, plan.variant, raw),
+                        context,
+                    )
                 except Exception as exc:  # noqa: BLE001 - classify behavior vs infra
                     expected_error = _expected_turn_error(sample, raw)
                     action_error = f"{type(exc).__name__}: {exc}"
@@ -755,6 +765,7 @@ class EvalRunner:
                 tracker.touch(application)
             execution_latency_ms = (time.perf_counter() - execution_started) * 1000
             events, slices = tracker.collect(application)
+            self._remember_context_chain(application, plan, events)
             final_answer = _final_answer(events)
             after = self._observer.capture(
                 sample, application, fixture_targets=fixture_targets
@@ -959,19 +970,32 @@ class EvalRunner:
             "auto_compact_observed"
         ):
             return self._invalid_record(
-                sample, plan, "auto_compact_context_chain_unavailable"
+                sample, plan, "no_natural_auto_compact_observed_before_rec_11"
             )
         started = time.perf_counter()
-        application = self._build_application("smallctx", namespace="M2-A")
+        chain = dict(self._context_chain)
+        account = str(chain.get("account") or "A")
+        namespace = str(chain.get("namespace") or "")
+        config_variant = str(chain.get("config_variant") or chain.get("variant") or "normal")
+        if not namespace:
+            return self._invalid_record(
+                sample, plan, "compacted_session_namespace_unavailable", started=started
+            )
+        application = self._build_application(
+            config_variant, namespace=namespace, account=account
+        )
         try:
             assert self._observer is not None
-            session_id = str(self._context_chain["session_id"])
-            application.resume_session(int(self._account_info["A"]["id"]), session_id)
+            session_id = str(chain["session_id"])
+            account_id = int(self._account_info[account]["id"])
+            application.resume_session(account_id, session_id)
             tracker = _EventTracker(application)
             before = self._observer.capture(sample, application)
             application.close()
-            restored = self._build_application("smallctx", namespace="M2-A")
-            restored.resume_session(int(self._account_info["A"]["id"]), session_id)
+            restored = self._build_application(
+                config_variant, namespace=namespace, account=account
+            )
+            restored.resume_session(account_id, session_id)
             self._dispatch(
                 restored,
                 sample.user_input[-1],
@@ -981,9 +1005,12 @@ class EvalRunner:
             events, slices = tracker.collect(restored)
             after = self._observer.capture(sample, restored)
             fault = {
-                "kind": "clean_restart",
+                "kind": "clean_restart_after_natural_auto_compact",
                 "triggered": True,
                 "session_id": session_id,
+                "source_sample_key": chain.get("sample_key"),
+                "source_variant": chain.get("trial_variant"),
+                "compaction_count": chain.get("compaction_count"),
             }
             action_log = [
                 {"action": "restore", "status": "ok", "session_id": session_id}
@@ -1187,7 +1214,41 @@ class EvalRunner:
         )
         application = build_live_application(config)
         self._applications.append(application)
+        self._application_specs[id(application)] = {
+            "config_variant": variant,
+            "namespace": namespace,
+            "account": account,
+        }
         return application
+
+    def _remember_context_chain(
+        self,
+        application: Any,
+        plan: TrialPlan,
+        events: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Remember the latest naturally compacted measured session for REC-11."""
+
+        if plan.warmup:
+            return
+        compactions = [
+            event
+            for event in events
+            if str((event.get("data") or {}).get("name") or "") == "auto_compact"
+        ]
+        if not compactions:
+            return
+        spec = self._application_specs.get(id(application))
+        if not spec or application.scope is None:
+            return
+        self._context_chain = {
+            **spec,
+            "session_id": application.scope.session_id,
+            "sample_key": plan.sample_key,
+            "trial_variant": plan.variant,
+            "auto_compact_observed": True,
+            "compaction_count": len(compactions),
+        }
 
     def _create_or_new_session(self, application: Any, account: str) -> None:
         if application.scope is None:
@@ -1273,6 +1334,8 @@ class EvalRunner:
                 application.close()
             except Exception as exc:  # noqa: BLE001
                 self._record_error("application.close", exc, status="error")
+            finally:
+                self._application_specs.pop(id(application), None)
         self._applications.clear()
 
     def _sync_owned_resources(self) -> None:
@@ -1512,6 +1575,28 @@ def _expected_turn_error(sample: EvalSample, raw: str) -> bool:
         "REC-06",
         "REC-07",
     }
+
+
+def _execution_mode_input(sample: EvalSample, variant: str, raw: str) -> str:
+    """Add one concise execution-mode sentence to neutral M3/M4 task text."""
+
+    if sample.metric_group not in {"M3", "M4"} or variant not in {"serial", "parallel"}:
+        return raw
+    if raw.startswith("<") or raw.startswith("/"):
+        return raw
+    if sample.metric_group == "M3":
+        mode = (
+            "执行方式：串行。下面的独立仓库操作请逐个执行。"
+            if variant == "serial"
+            else "执行方式：并行。下面的独立仓库操作请同时发起，完成后统一汇总。"
+        )
+    else:
+        mode = (
+            "执行方式：串行。下面的独立 Agent 子任务请逐个委派。"
+            if variant == "serial"
+            else "执行方式：并行。下面的独立 Agent 子任务请在同一轮发起，完成后统一汇总。"
+        )
+    return f"{mode}\n{raw}"
 
 
 def _action_name(raw: str) -> str:

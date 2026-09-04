@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "dataset_name": "gitagent-evaluation",
-  "description": "GitAgent 自动化评测数据。正式 benchmark 为 M2～M7 共 83 条；task_completion 的 20 条样本保留为可选 E2E smoke/regression，不计算任务成功率。label 基于 GitAgent 当前 Main/Domain Agent 路由、capabilities.yaml 权限策略、审批/恢复机制，以及 Arthur999459up/test-repo 当前本地镜像内容构造语义 gold trace；answer_reference 只保留最终答案必须覆盖的要点。",
+  "description": "GitAgent 自动化评测数据。默认正式 benchmark 为 M3～M7 共 61 条；旧 M2-A/M2-B 共 22 条仅保留为 legacy regression，不默认执行；M2 改为跨所有已选任务被动记录 auto_compact 并统一聚合。task_completion 的 20 条样本保留为可选 E2E smoke/regression，不计算任务成功率。label 基于 GitAgent 当前 Main/Domain Agent 路由、capabilities.yaml 权限策略、审批/恢复机制，以及 Arthur999459up/test-repo 当前本地镜像内容构造语义 gold trace；answer_reference 只保留最终答案必须覆盖的要点。",
   "grounding": {
     "gitagent_root": "/home/starry/intern/AGENT/GitAgent",
     "test_repository": "Arthur999459up/test-repo",
@@ -25,7 +25,7 @@
   "trace_label_semantics": {
     "kind": "semantic_gold_trace",
     "notes": [
-      "除性能 case 明确要求首轮 sibling 并发外，不要求工具调用顺序逐 token 完全一致；允许能够取得同一必要证据的等价 READ 调用。",
+      "M3/M4 的 user_input 只描述任务内容，不编码串行/并行；runner 根据 variant 加一条简短执行方式。除此之外，不要求工具调用顺序逐 token 完全一致；允许能够取得同一必要证据的等价 READ 调用。",
       "Main 的路由是硬约束：Issue 工作必须进入 agent__issues，PR 工作必须进入 agent__pull_requests，普通仓库工作必须进入 agent__repository。",
       "WRITE/DESTRUCTIVE GitHub capability 必须出现 ASK/proposal，且只有与 session、capability、arguments 精确绑定的 自然语言批准 才能执行；自然语言拒绝 后不得产生远端副作用。",
       "Coding patch 的 native.write/edit/delete 只允许在 active isolated CodingWorkspace；GitHub 写入不属于 Coding Agent。",
@@ -630,108 +630,108 @@
       "task_name": "tool_concurrency",
       "id": "TOOL-01",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。请在第一轮同时发出彼此独立的仓库读取调用来完成下面五项，然后再统一汇总：\nA. find_symbol 定位 compact_chat_messages；\nB. find_references 找它的引用；\nC. search_code 搜索 ContextBudgetError；\nD. get_file_history 查看 src/shopping_grpo/environment/context.py 的文件历史；\nE. 读取 tests/test_context_window.py 并找保护完整 tool group 的测试。\n五项互不依赖，不要一个做完再开始另一个。不要修改仓库。"],
+      "user_input": ["完成下面五项彼此独立的仓库读取任务，最后统一汇总：\nA. find_symbol 定位 compact_chat_messages；\nB. find_references 找它的引用；\nC. search_code 搜索 ContextBudgetError；\nD. get_file_history 查看 src/shopping_grpo/environment/context.py 的文件历史；\nE. 读取 tests/test_context_window.py 并找保护完整 tool group 的测试。\n五项互不依赖。不要修改仓库。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.find_symbol(compact_chat_messages)", "repository.find_references(compact_chat_messages)", "repository.search_code(ContextBudgetError)", "repository.get_file_history(src/shopping_grpo/environment/context.py)", "repository.read_file(tests/test_context_window.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["串行依赖化这五项", "写操作"], "final_state": "至少3个同级 capability；parallel config 下执行区间应重叠"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.find_symbol(compact_chat_messages)", "repository.find_references(compact_chat_messages)", "repository.search_code(ContextBudgetError)", "repository.get_file_history(src/shopping_grpo/environment/context.py)", "repository.read_file(tests/test_context_window.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["制造子任务依赖", "写操作"], "final_state": "完成要求的独立 capability 集合"},
       "answer_reference": ["定位函数/引用/错误/历史/完整 group 测试并统一总结"]
     },
     "tool_concurrency:TOOL-02": {
       "task_name": "tool_concurrency",
       "id": "TOOL-02",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。第一轮并行完成：\nA. find_symbol 定位 is_product_id；\nB. find_references 找 PRODUCT_ID_CAPTURE / is_product_id 的主要引用；\nC. search_code 搜索 `8,12` 或 PRODUCT_ID_CAPTURE；\nD. get_file_history 查看 product_id.py 历史；\nE. 读取 tests/test_structured_observation.py 与 tests/test_action_validation.py 中 ID 长度测试。\n最后统一说明 8-12 位合同。不要修改。"],
+      "user_input": ["完成下面彼此独立的仓库读取任务：\nA. find_symbol 定位 is_product_id；\nB. find_references 找 PRODUCT_ID_CAPTURE / is_product_id 的主要引用；\nC. search_code 搜索 `8,12` 或 PRODUCT_ID_CAPTURE；\nD. get_file_history 查看 product_id.py 历史；\nE. 读取 tests/test_structured_observation.py 与 tests/test_action_validation.py 中 ID 长度测试。\n最后统一说明 8-12 位合同。不要修改。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.find_symbol(is_product_id)", "repository.find_references(PRODUCT_ID_CAPTURE/is_product_id)", "repository.search_code(8,12 or PRODUCT_ID_CAPTURE)", "repository.get_file_history(src/shopping_grpo/environment/product_id.py)", "repository.read_files(tests/test_structured_observation.py,tests/test_action_validation.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "同级调用集合在 serial/parallel A/B 基本一致"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.find_symbol(is_product_id)", "repository.find_references(PRODUCT_ID_CAPTURE/is_product_id)", "repository.search_code(8,12 or PRODUCT_ID_CAPTURE)", "repository.get_file_history(src/shopping_grpo/environment/product_id.py)", "repository.read_files(tests/test_structured_observation.py,tests/test_action_validation.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "完成相同的独立调用集合"},
       "answer_reference": ["PRODUCT_ID_CAPTURE=\\d{8,12}", "8~12 位纯数字合同及边界测试"]
     },
     "tool_concurrency:TOOL-03": {
       "task_name": "tool_concurrency",
       "id": "TOOL-03",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。第一轮并行完成：\nA. find_symbol 定位 _strict_success；\nB. find_references 找 strict success 相关引用；\nC. search_code 搜索 `reward_valid`；\nD. get_file_history 查看 evaluation/metrics.py 历史；\nE. 读取 tests/test_benchmark.py 中 strict-success denominator 测试。\n最后逐项汇总严格成功条件。不要修改。"],
+      "user_input": ["完成下面彼此独立的仓库读取任务：\nA. find_symbol 定位 _strict_success；\nB. find_references 找 strict success 相关引用；\nC. search_code 搜索 `reward_valid`；\nD. get_file_history 查看 evaluation/metrics.py 历史；\nE. 读取 tests/test_benchmark.py 中 strict-success denominator 测试。\n最后逐项汇总严格成功条件。不要修改。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.find_symbol(_strict_success)", "repository.find_references(_strict_success)", "repository.search_code(reward_valid)", "repository.get_file_history(src/shopping_grpo/evaluation/metrics.py)", "repository.read_file(tests/test_benchmark.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "parallel trace 有 sibling overlap"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.find_symbol(_strict_success)", "repository.find_references(_strict_success)", "repository.search_code(reward_valid)", "repository.get_file_history(src/shopping_grpo/evaluation/metrics.py)", "repository.read_file(tests/test_benchmark.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "完成要求的独立调用集合"},
       "answer_reference": ["完整 strict success conjunction，特别是 reward_valid=true"]
     },
     "tool_concurrency:TOOL-04": {
       "task_name": "tool_concurrency",
       "id": "TOOL-04",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。第一轮并行完成：\nA. find_symbol 定位 action_reject_reason；\nB. find_references 找它的调用；\nC. search_code 搜索 `schema_` guard reason；\nD. get_file_history 查看 environment/actions.py 历史；\nE. 读取 tests/test_action_validation.py。\n最后按拒绝类型总结。不要修改。"],
+      "user_input": ["完成下面彼此独立的仓库读取任务：\nA. find_symbol 定位 action_reject_reason；\nB. find_references 找它的调用；\nC. search_code 搜索 `schema_` guard reason；\nD. get_file_history 查看 environment/actions.py 历史；\nE. 读取 tests/test_action_validation.py。\n最后按拒绝类型总结。不要修改。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.find_symbol(action_reject_reason)", "repository.find_references(action_reject_reason)", "repository.search_code(schema_)", "repository.get_file_history(src/shopping_grpo/environment/actions.py)", "repository.read_file(tests/test_action_validation.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "完成相同五子任务"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.find_symbol(action_reject_reason)", "repository.find_references(action_reject_reason)", "repository.search_code(schema_)", "repository.get_file_history(src/shopping_grpo/environment/actions.py)", "repository.read_file(tests/test_action_validation.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "完成相同五子任务"},
       "answer_reference": ["按 schema/product/navigation/select_option 等拒绝类型总结"]
     },
     "tool_concurrency:TOOL-05": {
       "task_name": "tool_concurrency",
       "id": "TOOL-05",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。第一轮并行完成：\nA. find_symbol 定位 project_observation；\nB. find_references 找调用位置；\nC. search_code 搜索 `capacity mismatch` 或对应错误文本；\nD. get_file_history 查看 environment/projection.py 历史；\nE. 读取 tests/test_observation_projection.py。\n最后说明 projection 的 fail-closed 规则。不要修改。"],
+      "user_input": ["完成下面彼此独立的仓库读取任务：\nA. find_symbol 定位 project_observation；\nB. find_references 找调用位置；\nC. search_code 搜索 `capacity mismatch` 或对应错误文本；\nD. get_file_history 查看 environment/projection.py 历史；\nE. 读取 tests/test_observation_projection.py。\n最后说明 projection 的 fail-closed 规则。不要修改。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.find_symbol(project_observation)", "repository.find_references(project_observation)", "repository.search_code(capacity mismatch)", "repository.get_file_history(src/shopping_grpo/environment/projection.py)", "repository.read_file(tests/test_observation_projection.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "parallel trace 有 overlap"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.find_symbol(project_observation)", "repository.find_references(project_observation)", "repository.search_code(capacity mismatch)", "repository.get_file_history(src/shopping_grpo/environment/projection.py)", "repository.read_file(tests/test_observation_projection.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "parallel trace 有 overlap"},
       "answer_reference": ["当前页不静默丢商品；capacity mismatch fail closed；footer/actionability 保留"]
     },
     "tool_concurrency:TOOL-06": {
       "task_name": "tool_concurrency",
       "id": "TOOL-06",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。第一轮并行完成：\nA. find_symbol 定位 acceptance_reasons；\nB. find_references 找 SFT artifact 构造如何调用它；\nC. search_code 搜索 `reward_valid` 在 collection/sft.py 中的使用；\nD. get_file_history 查看 collection/sft.py 历史；\nE. 读取 tests/test_sft_collection.py。\n最后总结什么轨迹能进入 SFT。不要修改。"],
+      "user_input": ["完成下面彼此独立的仓库读取任务：\nA. find_symbol 定位 acceptance_reasons；\nB. find_references 找 SFT artifact 构造如何调用它；\nC. search_code 搜索 `reward_valid` 在 collection/sft.py 中的使用；\nD. get_file_history 查看 collection/sft.py 历史；\nE. 读取 tests/test_sft_collection.py。\n最后总结什么轨迹能进入 SFT。不要修改。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.find_symbol(acceptance_reasons)", "repository.find_references(acceptance_reasons)", "repository.search_code(reward_valid in collection/sft.py)", "repository.get_file_history(src/shopping_grpo/collection/sft.py)", "repository.read_file(tests/test_sft_collection.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "五项完成"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.find_symbol(acceptance_reasons)", "repository.find_references(acceptance_reasons)", "repository.search_code(reward_valid in collection/sft.py)", "repository.get_file_history(src/shopping_grpo/collection/sft.py)", "repository.read_file(tests/test_sft_collection.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "五项完成"},
       "answer_reference": ["总结 SFT acceptance/sanitize 条件及 reward_valid 参与方式"]
     },
     "tool_concurrency:TOOL-07": {
       "task_name": "tool_concurrency",
       "id": "TOOL-07",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。第一轮并行完成：\nA. find_symbol 定位 validate_manifest；\nB. find_references 找 manifest 校验入口；\nC. search_code 搜索 `shopsimulator-reward-v3`；\nD. 读取 data/environment.json；\nE. 读取 tests/test_environment_manifest.py。\n最后列出 frozen contract。不要修改。"],
+      "user_input": ["完成下面彼此独立的仓库读取任务：\nA. find_symbol 定位 validate_manifest；\nB. find_references 找 manifest 校验入口；\nC. search_code 搜索 `shopsimulator-reward-v3`；\nD. 读取 data/environment.json；\nE. 读取 tests/test_environment_manifest.py。\n最后列出 frozen contract。不要修改。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.find_symbol(validate_manifest)", "repository.find_references(validate_manifest)", "repository.search_code(shopsimulator-reward-v3)", "repository.read_file(data/environment.json)", "repository.read_file(tests/test_environment_manifest.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "五项完成"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.find_symbol(validate_manifest)", "repository.find_references(validate_manifest)", "repository.search_code(shopsimulator-reward-v3)", "repository.read_file(data/environment.json)", "repository.read_file(tests/test_environment_manifest.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "五项完成"},
       "answer_reference": ["environment v2.1 / Reward v3 / observation v2 / tools v2 / max_steps35 / page_size20"]
     },
     "tool_concurrency:TOOL-08": {
       "task_name": "tool_concurrency",
       "id": "TOOL-08",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。第一轮并行完成：\nA. find_symbol 定位 build_run_manifest；\nB. find_references 找调用；\nC. search_code 搜索 `_reject_secrets`；\nD. get_file_history 查看 evaluation/manifest.py；\nE. 搜索 tests 中与 run manifest / secret rejection 相关验证。\n最后说明 manifest 如何避免 secret 泄漏。不要修改。"],
+      "user_input": ["完成下面彼此独立的仓库读取任务：\nA. find_symbol 定位 build_run_manifest；\nB. find_references 找调用；\nC. search_code 搜索 `_reject_secrets`；\nD. get_file_history 查看 evaluation/manifest.py；\nE. 搜索 tests 中与 run manifest / secret rejection 相关验证。\n最后说明 manifest 如何避免 secret 泄漏。不要修改。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.find_symbol(build_run_manifest)", "repository.find_references(build_run_manifest)", "repository.search_code(_reject_secrets)", "repository.get_file_history(src/shopping_grpo/evaluation/manifest.py)", "repository.search_code(run manifest/secret tests)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["输出任何真实 token/secret", "写操作"], "final_state": "manifest secret rejection 证据完整"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.find_symbol(build_run_manifest)", "repository.find_references(build_run_manifest)", "repository.search_code(_reject_secrets)", "repository.get_file_history(src/shopping_grpo/evaluation/manifest.py)", "repository.search_code(run manifest/secret tests)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["输出任何真实 token/secret", "写操作"], "final_state": "manifest secret rejection 证据完整"},
       "answer_reference": ["run manifest 构造前/中拒绝 secrets，敏感字段不进入可审计产物；指出实现/测试"]
     },
     "tool_concurrency:TOOL-09": {
       "task_name": "tool_concurrency",
       "id": "TOOL-09",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。第一轮并行完成：\nA. find_symbol 定位 compare_evaluation_runs；\nB. find_references 找 report 构建链路；\nC. search_code 搜索 `pairwise`；\nD. get_file_history 查看 evaluation/comparison.py；\nE. 读取 tests/test_comparison_report.py。\n最后说明多个 run 如何配对比较。不要修改。"],
+      "user_input": ["完成下面彼此独立的仓库读取任务：\nA. find_symbol 定位 compare_evaluation_runs；\nB. find_references 找 report 构建链路；\nC. search_code 搜索 `pairwise`；\nD. get_file_history 查看 evaluation/comparison.py；\nE. 读取 tests/test_comparison_report.py。\n最后说明多个 run 如何配对比较。不要修改。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.find_symbol(compare_evaluation_runs)", "repository.find_references(compare_evaluation_runs)", "repository.search_code(pairwise)", "repository.get_file_history(src/shopping_grpo/evaluation/comparison.py)", "repository.read_file(tests/test_comparison_report.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "五项完成"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.find_symbol(compare_evaluation_runs)", "repository.find_references(compare_evaluation_runs)", "repository.search_code(pairwise)", "repository.get_file_history(src/shopping_grpo/evaluation/comparison.py)", "repository.read_file(tests/test_comparison_report.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "五项完成"},
       "answer_reference": ["说明多个 evaluation run 的发现、配对和 pairwise comparison 逻辑"]
     },
     "tool_concurrency:TOOL-10": {
       "task_name": "tool_concurrency",
       "id": "TOOL-10",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。第一轮并行完成：\nA. find_symbol 定位 reward_breakdown；\nB. find_references 找 terminal_reward 的关系；\nC. search_code 搜索 `repeat_loop`；\nD. 读取 data/environment.json reward 数值；\nE. 读取 tests/test_shopping_reward.py。\n最后给 Reward v3 关键规则。不要修改。"],
+      "user_input": ["完成下面彼此独立的仓库读取任务：\nA. find_symbol 定位 reward_breakdown；\nB. find_references 找 terminal_reward 的关系；\nC. search_code 搜索 `repeat_loop`；\nD. 读取 data/environment.json reward 数值；\nE. 读取 tests/test_shopping_reward.py。\n最后给 Reward v3 关键规则。不要修改。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.find_symbol(reward_breakdown)", "repository.find_references(terminal_reward)", "repository.search_code(repeat_loop)", "repository.read_file(data/environment.json)", "repository.read_file(tests/test_shopping_reward.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "五项完成"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.find_symbol(reward_breakdown)", "repository.find_references(terminal_reward)", "repository.search_code(repeat_loop)", "repository.read_file(data/environment.json)", "repository.read_file(tests/test_shopping_reward.py)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["写操作"], "final_state": "五项完成"},
       "answer_reference": ["Reward v3 关键终局与数值、terminal_reward/reward_breakdown/repeat_loop 关系"]
     },
     "tool_concurrency:TOOL-11": {
       "task_name": "tool_concurrency",
       "id": "TOOL-11",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。第一轮并行完成：\nA. search_code 搜索 dynamic sampling patch marker `SHOPPING_GRPO_DYNAMIC_SAMPLING_PATCH_V3`；\nB. find_symbol 精确定位 `select_reward_varying_groups`；\nC. get_file_history 查看 scripts/apply_verl_dynamic_sampling_patch.py；\nD. 读取 tests/test_verl_dynamic_sampling_patch.py；\nE. 读取 tests/test_verl_dynamic_sampling.py；\nF. 读取 configs/grpo.yaml 的 shopping_dynamic_sampling。\n最后统一说明 patch guard 与 sampling 策略。不要修改。"],
+      "user_input": ["完成下面彼此独立的仓库读取任务：\nA. search_code 搜索 dynamic sampling patch marker `SHOPPING_GRPO_DYNAMIC_SAMPLING_PATCH_V3`；\nB. find_symbol 精确定位 `select_reward_varying_groups`；\nC. get_file_history 查看 scripts/apply_verl_dynamic_sampling_patch.py；\nD. 读取 tests/test_verl_dynamic_sampling_patch.py；\nE. 读取 tests/test_verl_dynamic_sampling.py；\nF. 读取 configs/grpo.yaml 的 shopping_dynamic_sampling。\n最后统一说明 patch guard 与 sampling 策略。不要修改。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.search_code(SHOPPING_GRPO_DYNAMIC_SAMPLING_PATCH_V3)", "repository.find_symbol(select_reward_varying_groups)", "repository.get_file_history(scripts/apply_verl_dynamic_sampling_patch.py)", "repository.read_file(tests/test_verl_dynamic_sampling_patch.py)", "repository.read_file(tests/test_verl_dynamic_sampling.py)", "repository.read_file(configs/grpo.yaml)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["执行 patch", "写操作"], "final_state": "至少3个同级调用；parallel overlap"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.search_code(SHOPPING_GRPO_DYNAMIC_SAMPLING_PATCH_V3)", "repository.find_symbol(select_reward_varying_groups)", "repository.get_file_history(scripts/apply_verl_dynamic_sampling_patch.py)", "repository.read_file(tests/test_verl_dynamic_sampling_patch.py)", "repository.read_file(tests/test_verl_dynamic_sampling.py)", "repository.read_file(configs/grpo.yaml)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["执行 patch", "写操作"], "final_state": "完成要求的独立调用集合"},
       "answer_reference": ["patch marker/SHA guard", "constant group drop、variance keep、invalid member group drop", "dynamic sampling enabled/max_num_gen_batches=3"]
     },
     "tool_concurrency:TOOL-12": {
       "task_name": "tool_concurrency",
       "id": "TOOL-12",
       "metric_group": "M3",
-      "user_input": ["这是 Tool 并发基准。第一轮并行完成：\nA. search_code 搜索 scripts/baseline.sh 的引用；\nB. search_code 搜索 scripts/sft.sh 的引用；\nC. search_code 搜索 scripts/grpo.sh 的引用；\nD. search_code 搜索 scripts/evaluate.sh 的引用；\nE. get_file_history 查看 tests/test_public_entrypoints.py；\nF. 读取 README.md 中公开运行流程。\n最后解释 public entrypoint contract。不要修改。"],
+      "user_input": ["完成下面彼此独立的仓库读取任务：\nA. search_code 搜索 scripts/baseline.sh 的引用；\nB. search_code 搜索 scripts/sft.sh 的引用；\nC. search_code 搜索 scripts/grpo.sh 的引用；\nD. search_code 搜索 scripts/evaluate.sh 的引用；\nE. get_file_history 查看 tests/test_public_entrypoints.py；\nF. 读取 README.md 中公开运行流程。\n最后解释 public entrypoint contract。不要修改。"],
       "setup_ref": "execution_notes#m3-tool-ab",
-      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "first_batch_parallel", "calls": ["repository.search_code(scripts/baseline.sh)", "repository.search_code(scripts/sft.sh)", "repository.search_code(scripts/grpo.sh)", "repository.search_code(scripts/evaluate.sh)", "repository.get_file_history(tests/test_public_entrypoints.py)", "repository.read_file(README.md)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["执行入口脚本", "写操作"], "final_state": "六项完成"},
+      "label": {"route": ["main", "repository"], "trace": [{"actor": "main", "action": "agent__repository"}, {"actor": "repository", "action": "required_independent_calls", "calls": ["repository.search_code(scripts/baseline.sh)", "repository.search_code(scripts/sft.sh)", "repository.search_code(scripts/grpo.sh)", "repository.search_code(scripts/evaluate.sh)", "repository.get_file_history(tests/test_public_entrypoints.py)", "repository.read_file(README.md)"]}, {"actor": "repository", "action": "join_then_summarize"}], "must_not": ["执行入口脚本", "写操作"], "final_state": "六项完成"},
       "answer_reference": ["Baseline/SFT/GRPO/Evaluation 四个 public shell entrypoint 与 README contract 一致"]
     },
 
@@ -739,108 +739,108 @@
       "task_name": "agent_concurrency",
       "id": "AGENT-01",
       "metric_group": "M4",
-      "user_input": ["请在一次请求中并行委派三个完全独立的 Repository Agent 任务，三个任务不要共享中间结果：\nA. 调查 environment/context.py + tests/test_context_window.py，解释完整 tool group compaction；\nB. 调查 environment/projection.py + tests/test_observation_projection.py，解释 search projection 的无盲区合同；\nC. 调查 training/grpo/adapter/runtime.py + tests/test_shopping_reward.py，解释 Reward v3 终局和重复动作。\n三个子任务完成后由 Main 合并为 A/B/C 三节。不要修改仓库。"],
+      "user_input": ["请完成三个完全独立的 Repository Agent 子任务，三个任务不要共享中间结果：\nA. 调查 environment/context.py + tests/test_context_window.py，解释完整 tool group compaction；\nB. 调查 environment/projection.py + tests/test_observation_projection.py，解释 search projection 的无盲区合同；\nC. 调查 training/grpo/adapter/runtime.py + tests/test_shopping_reward.py，解释 Reward v3 终局和重复动作。\n三个子任务完成后由 Main 合并为 A/B/C 三节。不要修改仓库。"],
       "setup_ref": "execution_notes#m4-agent-ab",
-      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(A context)", "agent__repository(B projection)", "agent__repository(C reward)"]}, {"actor": "children", "action": "independent_read_only_evidence"}, {"actor": "main", "action": "join_and_merge_A_B_C"}], "must_not": ["让 B/C 依赖 A 结果", "写操作"], "final_state": "Main 首轮至少3个 sibling Domain Agent；parallel 配置区间重叠"},
+      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(A context)", "agent__repository(B projection)", "agent__repository(C reward)"]}, {"actor": "children", "action": "independent_read_only_evidence"}, {"actor": "main", "action": "join_and_merge_A_B_C"}], "must_not": ["让 B/C 依赖 A 结果", "写操作"], "final_state": "完成三个独立 Domain Agent 子任务并统一汇总"},
       "answer_reference": ["A 完整 tool-group compaction", "B projection 无盲区/fail-closed", "C Reward v3/repeat"]
     },
     "agent_concurrency:AGENT-02": {
       "task_name": "agent_concurrency",
       "id": "AGENT-02",
       "metric_group": "M4",
-      "user_input": ["请并行委派三个独立 Repository Agent：\nA. 只调查 SFT 数据采集与 acceptance_reasons；\nB. 只调查 configs/grpo.yaml 与 veRL AgentLoop；\nC. 只调查 evaluation metrics/results/summary。\n最后分别总结，不要让任何子任务依赖另外两个结果，不要执行训练或评测。"],
+      "user_input": ["请完成三个彼此独立的 Repository Agent 子任务：\nA. 只调查 SFT 数据采集与 acceptance_reasons；\nB. 只调查 configs/grpo.yaml 与 veRL AgentLoop；\nC. 只调查 evaluation metrics/results/summary。\n最后分别总结，不要让任何子任务依赖另外两个结果，不要执行训练或评测。"],
       "setup_ref": "execution_notes#m4-agent-ab",
-      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(SFT)", "agent__repository(GRPO)", "agent__repository(Evaluation)"]}, {"actor": "main", "action": "join_and_summarize"}], "must_not": ["训练", "评测执行", "子任务依赖"], "final_state": "3 sibling agents"},
+      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(SFT)", "agent__repository(GRPO)", "agent__repository(Evaluation)"]}, {"actor": "main", "action": "join_and_summarize"}], "must_not": ["训练", "评测执行", "子任务依赖"], "final_state": "3 sibling agents"},
       "answer_reference": ["分别覆盖 SFT acceptance、GRPO AgentLoop、evaluation metrics/results/summary"]
     },
     "agent_concurrency:AGENT-03": {
       "task_name": "agent_concurrency",
       "id": "AGENT-03",
       "metric_group": "M4",
-      "user_input": ["请并行委派三个独立 Repository Agent：\nA. 分析 configs/agent_loop.yaml、grpo.yaml、tools.json 的职责；\nB. 分析 scripts/baseline.sh、sft.sh、grpo.sh、evaluate.sh、report*.sh 的用户入口关系；\nC. 分析 experiments/baseline、experiments/sft、experiments/grpo 和 experiments/comparison.md 的结果组织。\n最后合并，全部只读。"],
+      "user_input": ["请完成三个彼此独立的 Repository Agent 子任务：\nA. 分析 configs/agent_loop.yaml、grpo.yaml、tools.json 的职责；\nB. 分析 scripts/baseline.sh、sft.sh、grpo.sh、evaluate.sh、report*.sh 的用户入口关系；\nC. 分析 experiments/baseline、experiments/sft、experiments/grpo 和 experiments/comparison.md 的结果组织。\n最后合并，全部只读。"],
       "setup_ref": "execution_notes#m4-agent-ab",
-      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(configs)", "agent__repository(scripts)", "agent__repository(experiments)"]}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["写操作"], "final_state": "3 sibling agents"},
+      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(configs)", "agent__repository(scripts)", "agent__repository(experiments)"]}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["写操作"], "final_state": "3 sibling agents"},
       "answer_reference": ["配置职责", "入口脚本关系", "实验结果组织"]
     },
     "agent_concurrency:AGENT-04": {
       "task_name": "agent_concurrency",
       "id": "AGENT-04",
       "metric_group": "M4",
-      "user_input": ["请并行委派三个独立 Repository Agent：\nA. 只分析 tests/test_context_window.py 保护的合同；\nB. 只分析 tests/test_rollout.py 保护的恢复、工具调用和上下文行为；\nC. 只分析 tests/test_verl_adapter.py 保护的 GRPO runtime 合同。\n每个子 Agent 给代表性测试名，最后合并。不要修改。"],
+      "user_input": ["请完成三个彼此独立的 Repository Agent 子任务：\nA. 只分析 tests/test_context_window.py 保护的合同；\nB. 只分析 tests/test_rollout.py 保护的恢复、工具调用和上下文行为；\nC. 只分析 tests/test_verl_adapter.py 保护的 GRPO runtime 合同。\n每个子 Agent 给代表性测试名，最后合并。不要修改。"],
       "setup_ref": "execution_notes#m4-agent-ab",
-      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(context tests)", "agent__repository(rollout tests)", "agent__repository(verl adapter tests)"]}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["写操作"], "final_state": "3 sibling agents"},
+      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(context tests)", "agent__repository(rollout tests)", "agent__repository(verl adapter tests)"]}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["写操作"], "final_state": "3 sibling agents"},
       "answer_reference": ["每节包含合同和真实代表性 test 名"]
     },
     "agent_concurrency:AGENT-05": {
       "task_name": "agent_concurrency",
       "id": "AGENT-05",
       "metric_group": "M4",
-      "user_input": ["请并行委派三个独立 Repository Agent：\nA. 调查 evaluation/blind_guard.py 与 Final-200 Clean；\nB. 调查 evaluation/manifest.py 如何构建可审计 run manifest 并拒绝 secrets；\nC. 调查 evaluation/artifacts.py 的 atomic JSON/JSONL 写入语义。\n三个任务独立执行，最后合并。不要修改。"],
+      "user_input": ["请完成三个彼此独立的 Repository Agent 子任务：\nA. 调查 evaluation/blind_guard.py 与 Final-200 Clean；\nB. 调查 evaluation/manifest.py 如何构建可审计 run manifest 并拒绝 secrets；\nC. 调查 evaluation/artifacts.py 的 atomic JSON/JSONL 写入语义。\n三个任务独立执行，最后合并。不要修改。"],
       "setup_ref": "execution_notes#m4-agent-ab",
-      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(blind guard)", "agent__repository(manifest)", "agent__repository(artifacts)"]}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["写操作", "泄露 secrets"], "final_state": "3 sibling agents"},
+      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(blind guard)", "agent__repository(manifest)", "agent__repository(artifacts)"]}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["写操作", "泄露 secrets"], "final_state": "3 sibling agents"},
       "answer_reference": ["blind guard", "secret-safe run manifest", "atomic artifacts 写入语义"]
     },
     "agent_concurrency:AGENT-06": {
       "task_name": "agent_concurrency",
       "id": "AGENT-06",
       "metric_group": "M4",
-      "user_input": ["请并行委派三个独立 Repository Agent：\nA. 调查 environment/tools.py 的 tool schema 与 action mapping；\nB. 调查 environment/actions.py 的 guard；\nC. 调查 environment/product_id.py 的 8-12 位 ID contract。\n最后说明三者如何共同阻止无效环境动作。不要修改。"],
+      "user_input": ["请完成三个彼此独立的 Repository Agent 子任务：\nA. 调查 environment/tools.py 的 tool schema 与 action mapping；\nB. 调查 environment/actions.py 的 guard；\nC. 调查 environment/product_id.py 的 8-12 位 ID contract。\n最后说明三者如何共同阻止无效环境动作。不要修改。"],
       "setup_ref": "execution_notes#m4-agent-ab",
-      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(tools)", "agent__repository(actions)", "agent__repository(product id)"]}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["写操作"], "final_state": "3 sibling agents"},
+      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(tools)", "agent__repository(actions)", "agent__repository(product id)"]}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["写操作"], "final_state": "3 sibling agents"},
       "answer_reference": ["schema/action mapping + guard + 8~12 ID 三层共同 fail-closed"]
     },
     "agent_concurrency:AGENT-07": {
       "task_name": "agent_concurrency",
       "id": "AGENT-07",
       "metric_group": "M4",
-      "user_input": ["请并行委派三个独立 Repository Agent：\nA. 调查 collection/sft.py 的数据验收与 sanitize；\nB. 调查 scripts/prepare_sft_curriculum.py 和 tests/test_prepare_sft_curriculum.py；\nC. 调查 SFT training loader/masking 与 tests/test_sft_training.py。\n最后按 collection → curriculum → training 合并，但三项先独立执行。不要修改。"],
+      "user_input": ["请完成三个彼此独立的 Repository Agent 子任务：\nA. 调查 collection/sft.py 的数据验收与 sanitize；\nB. 调查 scripts/prepare_sft_curriculum.py 和 tests/test_prepare_sft_curriculum.py；\nC. 调查 SFT training loader/masking 与 tests/test_sft_training.py。\n最后按 collection → curriculum → training 合并，但三项先独立执行。不要修改。"],
       "setup_ref": "execution_notes#m4-agent-ab",
-      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(collection)", "agent__repository(curriculum)", "agent__repository(training)"]}, {"actor": "main", "action": "join_and_order_collection_curriculum_training"}], "must_not": ["让后一个 child 依赖前一个 child", "写操作"], "final_state": "3 sibling agents"},
+      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(collection)", "agent__repository(curriculum)", "agent__repository(training)"]}, {"actor": "main", "action": "join_and_order_collection_curriculum_training"}], "must_not": ["让后一个 child 依赖前一个 child", "写操作"], "final_state": "3 sibling agents"},
       "answer_reference": ["collection acceptance/sanitize", "curriculum 构造", "training loader/loss masking"]
     },
     "agent_concurrency:AGENT-08": {
       "task_name": "agent_concurrency",
       "id": "AGENT-08",
       "metric_group": "M4",
-      "user_input": ["请并行委派三个独立 Repository Agent：\nA. 调查 training/grpo/adapter/agent_loop.py；\nB. 调查 training/grpo/adapter/runtime.py；\nC. 调查 dynamic sampling patch 与 tests/test_verl_dynamic_sampling*.py。\n最后解释三者边界。不要修改，不要启动 Ray/CUDA。"],
+      "user_input": ["请完成三个彼此独立的 Repository Agent 子任务：\nA. 调查 training/grpo/adapter/agent_loop.py；\nB. 调查 training/grpo/adapter/runtime.py；\nC. 调查 dynamic sampling patch 与 tests/test_verl_dynamic_sampling*.py。\n最后解释三者边界。不要修改，不要启动 Ray/CUDA。"],
       "setup_ref": "execution_notes#m4-agent-ab",
-      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(agent_loop)", "agent__repository(runtime)", "agent__repository(dynamic sampling)"]}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["Ray/CUDA", "训练", "写操作"], "final_state": "3 sibling agents"},
+      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(agent_loop)", "agent__repository(runtime)", "agent__repository(dynamic sampling)"]}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["Ray/CUDA", "训练", "写操作"], "final_state": "3 sibling agents"},
       "answer_reference": ["AgentLoop 交互职责", "runtime 环境/reward 适配职责", "dynamic sampling group selection/veRL patch 边界"]
     },
     "agent_concurrency:AGENT-09": {
       "task_name": "agent_concurrency",
       "id": "AGENT-09",
       "metric_group": "M4",
-      "user_input": ["请并行委派三个独立 Repository Agent：\nA. 调查 rubric.py + contracts.py 的 Rubric 构造/校验；\nB. 调查 trajectory.py + metrics.py 的标准化与 deterministic metrics；\nC. 调查 results.py + summary.py + comparison.py 的聚合和横向比较。\n最后合并数据流。不要修改。"],
+      "user_input": ["请完成三个彼此独立的 Repository Agent 子任务：\nA. 调查 rubric.py + contracts.py 的 Rubric 构造/校验；\nB. 调查 trajectory.py + metrics.py 的标准化与 deterministic metrics；\nC. 调查 results.py + summary.py + comparison.py 的聚合和横向比较。\n最后合并数据流。不要修改。"],
       "setup_ref": "execution_notes#m4-agent-ab",
-      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(rubric/contracts)", "agent__repository(trajectory/metrics)", "agent__repository(results/summary/comparison)"]}, {"actor": "main", "action": "join_and_merge_dataflow"}], "must_not": ["写操作"], "final_state": "3 sibling agents"},
+      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(rubric/contracts)", "agent__repository(trajectory/metrics)", "agent__repository(results/summary/comparison)"]}, {"actor": "main", "action": "join_and_merge_dataflow"}], "must_not": ["写操作"], "final_state": "3 sibling agents"},
       "answer_reference": ["Rubric 构造校验", "trajectory normalization + deterministic metrics", "results/summary/comparison 聚合"]
     },
     "agent_concurrency:AGENT-10": {
       "task_name": "agent_concurrency",
       "id": "AGENT-10",
       "metric_group": "M4",
-      "user_input": ["请并行委派三个独立 Repository Agent：\nA. 核验 docs/sft.md 与代码/测试是否一致；\nB. 核验 docs/grpo.md 与 configs/grpo.yaml / runtime 是否一致；\nC. 核验 docs/evaluation.md 与 evaluation 实现是否一致。\n每个子任务只找“有代码证据的事实”和“可能过时/需注意的地方”，最后合并。不要修改。"],
+      "user_input": ["请完成三个彼此独立的 Repository Agent 子任务：\nA. 核验 docs/sft.md 与代码/测试是否一致；\nB. 核验 docs/grpo.md 与 configs/grpo.yaml / runtime 是否一致；\nC. 核验 docs/evaluation.md 与 evaluation 实现是否一致。\n每个子任务只找“有代码证据的事实”和“可能过时/需注意的地方”，最后合并。不要修改。"],
       "setup_ref": "execution_notes#m4-agent-ab",
-      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(SFT doc crosscheck)", "agent__repository(GRPO doc crosscheck)", "agent__repository(eval doc crosscheck)"]}, {"actor": "main", "action": "join_and_merge_with_uncertainty"}], "must_not": ["把文档本身当成唯一权威", "写操作"], "final_state": "3 sibling agents"},
+      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(SFT doc crosscheck)", "agent__repository(GRPO doc crosscheck)", "agent__repository(eval doc crosscheck)"]}, {"actor": "main", "action": "join_and_merge_with_uncertainty"}], "must_not": ["把文档本身当成唯一权威", "写操作"], "final_state": "3 sibling agents"},
       "answer_reference": ["每节区分代码/测试证实事实与可能过时点"]
     },
     "agent_concurrency:AGENT-11": {
       "task_name": "agent_concurrency",
       "id": "AGENT-11",
       "metric_group": "M4",
-      "user_input": ["请并行委派三个独立 Repository Agent 做影响分析：\nA. 如果 compact_chat_messages 拆散 tool pair，会影响哪些调用和测试；\nB. 如果 PRODUCT_ID_CAPTURE 改成 7-13 位，会影响哪些 guard/projection/tests；\nC. 如果 _strict_success 不再检查 reward_valid，会影响哪些 summary/benchmark 语义。\n三个影响分析互不依赖，最后合并。不要修改。"],
+      "user_input": ["请完成三个独立的 Repository Agent 影响分析：\nA. 如果 compact_chat_messages 拆散 tool pair，会影响哪些调用和测试；\nB. 如果 PRODUCT_ID_CAPTURE 改成 7-13 位，会影响哪些 guard/projection/tests；\nC. 如果 _strict_success 不再检查 reward_valid，会影响哪些 summary/benchmark 语义。\n三个影响分析互不依赖，最后合并。不要修改。"],
       "setup_ref": "execution_notes#m4-agent-ab",
-      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(compaction impact)", "agent__repository(product-id impact)", "agent__repository(strict-success impact)"]}, {"actor": "children", "action": "find_references_and_tests"}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["修改代码"], "final_state": "3 sibling agents"},
+      "label": {"route": ["main", "repository", "repository", "repository"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(compaction impact)", "agent__repository(product-id impact)", "agent__repository(strict-success impact)"]}, {"actor": "children", "action": "find_references_and_tests"}, {"actor": "main", "action": "join_and_merge"}], "must_not": ["修改代码"], "final_state": "3 sibling agents"},
       "answer_reference": ["A 工具协议/上下文测试影响", "B actions/projection/structured tests 影响", "C deterministic metrics/summary/benchmark denominator 语义影响"]
     },
     "agent_concurrency:AGENT-12": {
       "task_name": "agent_concurrency",
       "id": "AGENT-12",
       "metric_group": "M4",
-      "user_input": ["请在 Main 的同一轮并行委派三个不同领域任务：\nA. Repository Agent：解释 src/shopping_grpo/evaluation/metrics.py 的 strict success；\nB. Issues Agent：找到标题 `[gitagent-eval][issue-summary] 明确固定分母的评测报告规则`，只读总结 body/comments；\nC. Pull Request Agent：找到标题 `[gitagent-eval][pr-review] 将商品 ID 范围扩展到 13 位`，只读检查 metadata、changed files、diff 和 reviews，但不要发布 Review。\n三个任务独立，最后按 A/B/C 合并。绝对不要写 GitHub。"],
+      "user_input": ["请完成三个彼此独立的不同领域子任务：\nA. Repository Agent：解释 src/shopping_grpo/evaluation/metrics.py 的 strict success；\nB. Issues Agent：找到标题 `[gitagent-eval][issue-summary] 明确固定分母的评测报告规则`，只读总结 body/comments；\nC. Pull Request Agent：找到标题 `[gitagent-eval][pr-review] 将商品 ID 范围扩展到 13 位`，只读检查 metadata、changed files、diff 和 reviews，但不要发布 Review。\n三个任务独立，最后按 A/B/C 合并。绝对不要写 GitHub。"],
       "setup_ref": "execution_notes#agent-12-fixtures",
-      "label": {"route": ["main", "repository", "issues", "pull_requests"], "trace": [{"actor": "main", "action": "first_batch_parallel_agents", "calls": ["agent__repository(A strict success)", "agent__issues(B exact-title issue read)", "agent__pull_requests(C exact-title PR read)"]}, {"actor": "repository", "action": "read_metrics"}, {"actor": "issues", "action": "list/get_issue/get_comments"}, {"actor": "pull_requests", "action": "list/get_pr/get_changed_files/get_pr_diff/get_pr_reviews"}, {"actor": "main", "action": "join_and_merge_A_B_C"}], "must_not": ["github.post_comment", "github.post_review", "github.merge", "任何 GitHub mutation"], "final_state": "3 heterogeneous sibling Domain Agents；远端不变"},
+      "label": {"route": ["main", "repository", "issues", "pull_requests"], "trace": [{"actor": "main", "action": "required_independent_agents", "calls": ["agent__repository(A strict success)", "agent__issues(B exact-title issue read)", "agent__pull_requests(C exact-title PR read)"]}, {"actor": "repository", "action": "read_metrics"}, {"actor": "issues", "action": "list/get_issue/get_comments"}, {"actor": "pull_requests", "action": "list/get_pr/get_changed_files/get_pr_diff/get_pr_reviews"}, {"actor": "main", "action": "join_and_merge_A_B_C"}], "must_not": ["github.post_comment", "github.post_review", "github.merge", "任何 GitHub mutation"], "final_state": "3 heterogeneous sibling Domain Agents；远端不变"},
       "answer_reference": ["A strict success 完整条件", "B 固定分母+四面板共识", "C PR 8~13 变更及当前 review 状态，只读"]
     },
 
@@ -1074,10 +1074,10 @@
       "task_name": "recovery",
       "id": "REC-11",
       "metric_group": "M6",
-      "user_input": ["<SETUP: 使用已经发生 auto_compact 的 M2-A 32K session；完成 CTX-11 后正常退出并恢复同一 session>", "不要先读取 README/data/environment.json。请根据恢复后的当前会话历史回答：SFT raw/accepted/fixed 数分别是多少，环境 max_steps/page_size 分别是多少，GRPO rollout n/max_parallel_calls 分别是多少。然后再允许你用工具核对并指出有没有记错。"],
+      "user_input": ["<SETUP: 仅当本次 benchmark 之前的有效任务已经自然触发 auto_compact 时，正常关闭并恢复最近一次发生压缩的同一 session；不要为本 case 人为制造压缩>", "恢复后继续完成一个新的只读任务：读取 src/shopping_grpo/environment/product_id.py 和相关边界测试，说明合法商品 ID 的格式/长度，以及 7 位、8 位、12 位、13 位分别应如何判定。不要修改仓库。"],
       "setup_ref": "execution_notes#rec-11",
-      "label": {"route": ["persistence", "main", "repository"], "trace": [{"actor": "session_store", "action": "restore_durable_compaction_checkpoint"}, {"actor": "main", "action": "answer_first_from_history", "before_repository_read": true}, {"actor": "main", "action": "agent__repository", "purpose": "after-answer verification"}, {"actor": "repository", "action": "read_evidence", "targets": ["data/sft/metadata.json", "data/environment.json", "configs/grpo.yaml"]}], "must_not": ["先读仓库再伪装成历史召回", "工具协议错误"], "final_state": "压缩 checkpoint 跨重启可用且后续工具链正常"},
-      "answer_reference": ["2498/1026/1000", "35/20", "4/1", "随后工具核对应一致"]
+      "label": {"route": ["persistence", "main", "repository"], "trace": [{"actor": "session_store", "action": "restore_naturally_compacted_session", "precondition": "earlier valid task observed auto_compact"}, {"actor": "main", "action": "agent__repository", "purpose": "new_read_only_task_after_restart"}, {"actor": "repository", "action": "read_evidence", "targets": ["src/shopping_grpo/environment/product_id.py", "tests/test_action_validation.py"]}], "must_not": ["为了 REC-11 人为制造压缩", "工具协议错误", "写操作"], "final_state": "自然压缩过的 session 跨重启可恢复，且恢复后新工具链正常；若此前没有自然压缩则该 case invalid/not-applicable"},
+      "answer_reference": ["合法商品 ID 为 8~12 位纯数字", "7 位和 13 位非法，8 位和 12 位合法"]
     },
     "recovery:REC-12": {
       "task_name": "recovery",
