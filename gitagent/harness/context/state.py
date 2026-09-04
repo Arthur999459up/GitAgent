@@ -32,6 +32,7 @@ from gitagent.harness.file_reads import (
     PreparedFileRead,
 )
 from gitagent.prompts import get_prompt_library
+from gitagent.token_accounting import request_tokens
 
 if TYPE_CHECKING:
     from gitagent.harness.coding_workspace import CodingWorkspace
@@ -557,7 +558,7 @@ class AgentContext:
     ) -> Any:
         """Run one native Text/structured-call model step and persist it verbatim."""
 
-        request = self.model_messages(tools)
+        request = self._model_request(tools)
         response = reasoner.complete_messages(
             messages=request,
             tools=tools,
@@ -646,11 +647,22 @@ class AgentContext:
         self.start_message_thread()
         self.append_message({"role": "user", "content": prompt})
         content = reasoner.complete_text_messages(
-            messages=self.model_messages(),
+            messages=self._model_request(),
             context_window_tokens=self.context_window_tokens,
         ).strip()
         self.append_message({"role": "assistant", "content": content})
         return content
+
+    def _model_request(
+        self, tools: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        """Build one model-visible payload and record its exact context usage."""
+
+        messages = self.model_messages(tools)
+        self._harness.record_context_usage(
+            self, input_tokens=request_tokens(messages, tools)
+        )
+        return messages
 
     def _ephemeral_messages(self) -> list[dict[str, Any]]:
         messages = [dict(message) for message in self.messages]

@@ -738,6 +738,22 @@ class AgentHarness:
             agent_name, self.context_window_tokens["default"]
         )
 
+    def record_context_usage(self, context: AgentContext, *, input_tokens: int) -> None:
+        """Persist one model-visible context snapshot through the existing trace path."""
+
+        self.trace.emit(
+            session_id=context.session_id,
+            category=TraceCategory.AGENT,
+            name=context.agent,
+            status=TraceStatus.PROGRESS,
+            details={
+                "debug_event": "context_usage",
+                "run_id": context.run_id,
+                "input_tokens": input_tokens,
+                "context_window_tokens": context.context_window_tokens,
+            },
+        )
+
     def register(self, spec: AgentSpec) -> None:
         if spec.name in self._specs:
             raise ValidationError(f"duplicate agent spec: {spec.name}")

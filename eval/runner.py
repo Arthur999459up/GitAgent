@@ -75,8 +75,12 @@ except ImportError:  # pragma: no cover - script entry point
     )
 
 
-EXPECTED_SAMPLE_COUNT = 103
-OFFICIAL_METRIC_GROUPS = frozenset({"M3", "M4", "M5", "M6", "M7"})
+EXPECTED_SAMPLE_COUNT = 56
+SMOKE_SAMPLE_KEYS = frozenset({
+    "task_completion:TC-07",
+    "tool_concurrency:TOOL-07",
+    "recovery:REC-12",
+})
 _APPROVE_INPUT = "同意，执行当前待审批提案。"
 _ROOT_FIELDS = {
     "schema_version",
@@ -116,14 +120,14 @@ def load_dataset(path: str | Path) -> tuple[dict[str, Any], list[EvalSample]]:
         raise ValueError(
             f"unsupported dataset schema_version: {value.get('schema_version')!r}"
         )
-    raw_samples = value.get("samples")
-    if not isinstance(raw_samples, dict):
+    raw_catalog = value.get("samples")
+    if not isinstance(raw_catalog, dict):
         raise TypeError("dataset.samples must be an object keyed by task_name:id")
-    if len(raw_samples) != EXPECTED_SAMPLE_COUNT:
+    if len(raw_catalog) != EXPECTED_SAMPLE_COUNT:
         raise ValueError(
-            f"dataset must contain exactly {EXPECTED_SAMPLE_COUNT} samples"
+            f"resume benchmark must contain exactly {EXPECTED_SAMPLE_COUNT} samples"
         )
-    samples = [EvalSample.from_mapping(key, item) for key, item in raw_samples.items()]
+    samples = [EvalSample.from_mapping(key, raw) for key, raw in raw_catalog.items()]
     if len({sample.sample_key for sample in samples}) != len(samples):
         raise ValueError("dataset sample keys must be unique")
     metadata = {key: item for key, item in value.items() if key != "samples"}
@@ -165,11 +169,10 @@ class EvalRunner:
             sample
             for sample in all_samples
             if (not sample_key or sample.sample_key == sample_key)
-            and (not group or sample.metric_group == group)
             and (
-                sample_key is not None
-                or group is not None
-                or sample.metric_group in OFFICIAL_METRIC_GROUPS
+                not group
+                or (group == "SMOKE" and sample.sample_key in SMOKE_SAMPLE_KEYS)
+                or sample.metric_group == group
             )
         ]
         if not self.samples:
@@ -312,11 +315,6 @@ class EvalRunner:
             for item in previous_manifest.get("owned_resources", [])
             if isinstance(item, dict)
         )
-        try:
-            self._fixture_manager.prepare_suite(self.samples)
-        except PrerequisiteUnavailable as exc:
-            self._suite_prerequisites["M7"] = str(exc)
-            self._record_error("fixture:M7", exc, status="invalid")
         grounding = self.metadata.get("grounding") or {}
         local = grounding.get("test_repository_local_mirror")
         local_commit = _git_commit(Path(local)) if local else None
@@ -355,6 +353,7 @@ class EvalRunner:
             "base_url_endpoint": _endpoint_identifier(self.base_config.base_url),
             "temperature": 0.0,
             "repetitions": self.repetitions,
+            "selection_group": self.group_filter or ("sample" if self.sample_filter else "ALL"),
             "account_a_available": True,
             "account_b_available": "B" in self._account_info,
             "account_a_identity_hash": _identity_hash(account_a),
@@ -399,180 +398,44 @@ class EvalRunner:
         by_group: dict[str, list[EvalSample]] = defaultdict(list)
         for sample in self.samples:
             by_group[sample.metric_group].append(sample)
-        for group in ("E2E", "M2-A", "M2-B", "M3", "M4", "M5", "M6", "M7"):
+        for group in ("M2", "M3", "M6"):
             samples = by_group.get(group, [])
             if not samples:
                 continue
             try:
-                if group == "M2-A":
-                    self._run_context_chain(samples)
-                elif group == "M2-B":
-                    self._run_memory_chain(samples)
-                elif group in {"M3", "M4"}:
+                if group == "M3":
                     self._run_performance(samples, group)
                 elif group == "M6":
                     self._run_recovery(samples)
                 else:
-                    self._run_standard(samples, namespace=group)
+                    self._run_standard(
+                        samples, namespace=group, config_variant="normal"
+                    )
             finally:
                 self._close_applications()
 
-    def _run_standard(self, samples: Sequence[EvalSample], *, namespace: str) -> None:
+    def _run_standard(
+        self,
+        samples: Sequence[EvalSample],
+        *,
+        namespace: str,
+        config_variant: str = "normal",
+    ) -> None:
         if namespace in self._suite_prerequisites:
             for sample in samples:
                 self._append_invalid(sample, self._suite_prerequisites[namespace])
             return
-        app = self._build_application("normal", namespace=namespace)
+        app = self._build_application(config_variant, namespace=namespace)
         for sample in samples:
-            if self._has_valid_trials(sample.sample_key, "normal", 1):
+            if self._has_valid_trials(sample.sample_key, config_variant, 1):
                 continue
-            plan = TrialPlan(sample.sample_key, sample.metric_group)
+            plan = TrialPlan(sample.sample_key, sample.metric_group, config_variant)
             self._append_trial(self._execute_trial(sample, plan, app, new_session=True))
 
-    def _run_context_chain(self, samples: Sequence[EvalSample]) -> None:
-        existing = [
-            trial
-            for trial in self._trials
-            if trial.metric_group == "M2-A" and trial.status in {"completed", "failed"}
-        ]
-        if all(
-            self._has_valid_trials(sample.sample_key, "smallctx", 1)
-            for sample in samples
-        ):
-            ctx11 = next(
-                (
-                    trial
-                    for trial in existing
-                    if trial.sample_key == "context_compaction:CTX-11"
-                ),
-                None,
-            )
-            if ctx11 and ctx11.session_ids:
-                self._context_chain = {
-                    "session_id": ctx11.session_ids[-1],
-                    "namespace": "M2-A",
-                    "variant": "smallctx",
-                    "auto_compact_observed": bool(
-                        ctx11.fault and ctx11.fault.get("auto_compact_observed")
-                    ),
-                }
-            return
-        if existing and not (self.output_dir / "state/M2-A/A/state.db").is_file():
-            for sample in samples:
-                if not self._has_valid_trials(sample.sample_key, "smallctx", 1):
-                    self._append_invalid(sample, "resume_context_state_unavailable")
-            return
-        app = self._build_application("smallctx", namespace="M2-A")
-        if existing:
-            session_id = existing[-1].session_ids[-1]
-            app.resume_session(int(self._account_info["A"]["id"]), session_id)
-        else:
-            self._create_session(app, "A")
-            app.config.memory_automation = False
-            app.memory_hooks.enabled = False
-        for sample in samples:
-            if self._has_valid_trials(sample.sample_key, "smallctx", 1):
-                continue
-            plan = TrialPlan(sample.sample_key, sample.metric_group, "smallctx")
-            self._append_trial(
-                self._execute_trial(sample, plan, app, new_session=False)
-            )
-        scope = app.scope
-        if scope is not None:
-            all_events = [
-                _event_to_dict(event)
-                for event in app.sessions.event_log.iter_events(scope)
-            ]
-            compact_events = [
-                event
-                for event in all_events
-                if str((event.get("data") or {}).get("name") or "") == "auto_compact"
-            ]
-            ctx11 = next(
-                (
-                    trial
-                    for trial in self._trials
-                    if trial.sample_key == "context_compaction:CTX-11"
-                    and not trial.warmup
-                ),
-                None,
-            )
-            ctx11_compactions: list[dict[str, Any]] = []
-            if ctx11 is not None:
-                preconditions = {
-                    event_slice.session_id: event_slice.after_seq
-                    for event_slice in ctx11.event_slices
-                }
-                ctx11_compactions = [
-                    event
-                    for event in compact_events
-                    if int(event.get("seq") or 0)
-                    <= preconditions.get(str(event.get("session_id") or ""), -1)
-                ]
-                ctx11.fault = {
-                    "kind": "context_chain_precondition",
-                    "triggered": bool(ctx11_compactions),
-                    "auto_compact_observed": bool(ctx11_compactions),
-                    "compaction_count": len(ctx11_compactions),
-                }
-                self._write_jsonl(
-                    "trials.jsonl", (trial.to_dict() for trial in self._trials)
-                )
-            self._context_chain = {
-                "session_id": scope.session_id,
-                "namespace": "M2-A",
-                "variant": "smallctx",
-                "auto_compact_observed": bool(ctx11_compactions),
-            }
-
-    def _run_memory_chain(self, samples: Sequence[EvalSample]) -> None:
-        existing = [
-            trial
-            for trial in self._trials
-            if trial.metric_group == "M2-B" and trial.status in {"completed", "failed"}
-        ]
-        if all(
-            self._has_valid_trials(sample.sample_key, "normal", 1) for sample in samples
-        ):
-            return
-        if existing and not (self.output_dir / "state/M2-B/state.db").is_file():
-            for sample in samples:
-                if not self._has_valid_trials(sample.sample_key, "normal", 1):
-                    self._append_invalid(sample, "resume_memory_state_unavailable")
-            return
-        app_a = self._build_application("normal", namespace="M2-B")
-        if app_a.scope is None:
-            self._create_session(app_a, "A")
-        app_b = None
-        for sample in samples:
-            if self._has_valid_trials(sample.sample_key, "normal", 1):
-                continue
-            if sample.id == "MEM-09":
-                if "B" not in self._account_info:
-                    self._append_invalid(
-                        sample, "account_b_not_configured", account="B"
-                    )
-                    continue
-                if app_b is None:
-                    app_b = self._build_application(
-                        "normal", namespace="M2-B", account="B"
-                    )
-                    self._create_session(app_b, "B")
-                app = app_b
-                account = "B"
-            else:
-                app = app_a
-                account = "A"
-            plan = TrialPlan(sample.sample_key, sample.metric_group, account=account)
-            self._append_trial(
-                self._execute_trial(sample, plan, app, new_session=False)
-            )
-
     def _run_performance(self, samples: Sequence[EvalSample], group: str) -> None:
-        variants = {
-            "M3": {"serial": "tool_serial", "parallel": "tool_parallel"},
-            "M4": {"serial": "agent_serial", "parallel": "agent_parallel"},
-        }[group]
+        if group != "M3":
+            raise ValueError(f"unsupported performance group: {group}")
+        variants = {"serial": "all_serial", "parallel": "all_parallel"}
         apps = {
             label: self._build_application(config_variant, namespace=f"{group}-{label}")
             for label, config_variant in variants.items()
@@ -1036,45 +899,6 @@ class EvalRunner:
 
     def _dispatch(self, application: Any, raw: str, context: dict[str, Any]) -> Any:
         text = raw.strip()
-        if text.startswith("<EVAL_MEMORY_WRITE "):
-            header, separator, content = text.partition("\n")
-            scope = header.removeprefix("<EVAL_MEMORY_WRITE ").removesuffix(">")
-            if not separator or scope.casefold() not in {"private", "project"}:
-                raise ValueError("invalid EVAL_MEMORY_WRITE fixture")
-            current = _active_scope(application)
-            return application.memory.manual_write(
-                current.account_key,
-                current.repository_key,
-                content.strip(),
-                scope=scope.casefold(),
-            )
-        if text.startswith("<EVAL_MEMORY_FORGET "):
-            header, separator, identifier = text.partition("\n")
-            scope = header.removeprefix("<EVAL_MEMORY_FORGET ").removesuffix(">")
-            if not separator or scope.casefold() not in {"private", "project"}:
-                raise ValueError("invalid EVAL_MEMORY_FORGET fixture")
-            current = _active_scope(application)
-            return application.memory.forget(
-                current.account_key,
-                current.repository_key,
-                identifier=identifier.strip(),
-                scope=scope.casefold(),
-            )
-        if text.startswith("<EVAL_MEMORY_SEARCH>"):
-            _, separator, query = text.partition("\n")
-            if not separator or not query.strip():
-                raise ValueError("invalid EVAL_MEMORY_SEARCH fixture")
-            current = _active_scope(application)
-            return application.memory_search.search(
-                current.account_key,
-                current.repository_key,
-                query.strip(),
-            )
-        if text == "<EVAL_MEMORY_REBUILD>":
-            current = _active_scope(application)
-            return application.memory.rebuild_index(
-                current.account_key, current.repository_key
-            )
         if not text.startswith("/"):
             return application.handle(text)
         command, _, argument = text.partition(" ")
@@ -1201,11 +1025,7 @@ class EvalRunner:
     def _build_application(
         self, variant: str, *, namespace: str, account: str = "A"
     ) -> Any:
-        state_root = (
-            self.output_dir / "state" / namespace
-            if namespace == "M2-B"
-            else self.output_dir / "state" / namespace / account
-        )
+        state_root = self.output_dir / "state" / namespace / account
         config = derive_runtime_config(
             self.config_path,
             variant=variant,
@@ -1349,6 +1169,7 @@ class EvalRunner:
             "dataset_hash": _sha256(self.dataset_path),
             "base_config_hash": _sha256(self.config_path),
             "repetitions": self.repetitions,
+            "selection_group": self.group_filter or ("sample" if self.sample_filter else "ALL"),
             "selected_samples": [sample.sample_key for sample in self.samples],
         }
         mismatches = [
@@ -1545,9 +1366,7 @@ def _final_answer(events: Sequence[Mapping[str, Any]]) -> str:
 
 def _access_levels(path: Path) -> dict[str, str]:
     catalog = CapabilityCatalog.from_file(path)
-    values = {item.id: item.access.value for item in catalog.capabilities}
-    values["rag.eval-rag"] = "READ"
-    return values
+    return {item.id: item.access.value for item in catalog.capabilities}
 
 
 def _is_infrastructure(error: BaseException) -> bool:
@@ -1560,17 +1379,8 @@ def _is_infrastructure(error: BaseException) -> bool:
     )
 
 
-def _active_scope(application: Any) -> Any:
-    scope = application.scope
-    if scope is None:
-        raise ValueError("eval control action requires an active Session")
-    return scope
-
-
 def _expected_turn_error(sample: EvalSample, raw: str) -> bool:
     return raw.strip() == _APPROVE_INPUT and sample.id in {
-        "SAFE-12",
-        "SAFE-14",
         "REC-05",
         "REC-06",
         "REC-07",
@@ -1578,13 +1388,13 @@ def _expected_turn_error(sample: EvalSample, raw: str) -> bool:
 
 
 def _execution_mode_input(sample: EvalSample, variant: str, raw: str) -> str:
-    """Add one concise execution-mode sentence to neutral M3/M4 task text."""
+    """Add one concise execution-mode sentence to a neutral concurrency task."""
 
-    if sample.metric_group not in {"M3", "M4"} or variant not in {"serial", "parallel"}:
+    if sample.metric_group != "M3" or variant not in {"serial", "parallel"}:
         return raw
     if raw.startswith("<") or raw.startswith("/"):
         return raw
-    if sample.metric_group == "M3":
+    if sample.task_name == "tool_concurrency":
         mode = (
             "执行方式：串行。下面的独立仓库操作请逐个执行。"
             if variant == "serial"
@@ -1601,37 +1411,15 @@ def _execution_mode_input(sample: EvalSample, variant: str, raw: str) -> str:
 
 def _action_name(raw: str) -> str:
     text = raw.strip()
-    if text.startswith("<EVAL_MEMORY_"):
-        directive = text.partition(">")[0].removeprefix("<")
-        return directive.split(maxsplit=1)[0].casefold()
     if not text.startswith("/"):
         return "handle"
     return text.split(maxsplit=1)[0].removeprefix("/").casefold()
 
 
 def _action_result_summary(raw: str, result: Any) -> dict[str, Any] | None:
-    """Keep only bounded eval-control evidence; never persist Memory bodies."""
+    """Keep only bounded eval-control evidence."""
 
     text = raw.strip()
-    if text.startswith("<EVAL_MEMORY_SEARCH>"):
-        hits: list[dict[str, Any]] = []
-        if isinstance(result, Sequence) and not isinstance(result, (str, bytes, bytearray)):
-            for item in result:
-                name = str(getattr(item, "name", "") or "")
-                if not name:
-                    continue
-                score = getattr(item, "score", None)
-                hits.append(
-                    {
-                        "name": name,
-                        "scope": str(getattr(item, "scope", "") or ""),
-                        "stale": bool(getattr(item, "stale", False)),
-                        "score": round(float(score), 6)
-                        if isinstance(score, (int, float)) and not isinstance(score, bool)
-                        else None,
-                    }
-                )
-        return {"hits": hits}
     if text == "/sessions":
         values = (
             result

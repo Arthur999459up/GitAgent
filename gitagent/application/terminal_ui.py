@@ -10,9 +10,12 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 
 from gitagent.infra.observability import TraceCategory, TraceEvent, TraceStatus
+
+from .metrics import ContextUsage, TurnLatency
 
 _PANEL_STYLES = {
     "user": "blue",
@@ -131,6 +134,53 @@ class TerminalUI:
                 box=box.ROUNDED,
             )
         )
+
+    def context_usage(
+        self, rows: tuple[ContextUsage, ...], *, session_id: str
+    ) -> None:
+        """Render latest per-Agent model-visible context usage."""
+
+        table = Table(title=f"Context Usage · {session_id}", box=box.ROUNDED)
+        table.add_column("Agent", style="cyan")
+        table.add_column("Context")
+        table.add_column("Tokens", justify="right")
+        table.add_column("Usage", justify="right")
+        table.add_column("Turn", justify="right", style="dim")
+        for row in rows:
+            agent_name = _AGENT_NAMES.get(row.agent, row.agent)
+            if row.input_tokens is None:
+                meter = _usage_meter(0, row.context_window_tokens)
+                tokens = f"— / {row.context_window_tokens:,}"
+                usage = "—"
+                turn = "—"
+            else:
+                meter = _usage_meter(row.input_tokens, row.context_window_tokens)
+                tokens = f"{row.input_tokens:,} / {row.context_window_tokens:,}"
+                usage = f"{(row.ratio or 0.0) * 100:.1f}%"
+                turn = f"#{row.turn_seq}" if row.turn_seq else "—"
+            table.add_row(agent_name, meter, tokens, usage, turn)
+        self.console.print(table)
+
+    def turn_latencies(
+        self, rows: tuple[TurnLatency, ...], *, session_id: str
+    ) -> None:
+        """Render end-to-end latency for every Turn in the active Session."""
+
+        if not rows:
+            self.text("当前 Session 还没有 Turn。", title="Latency", kind="info")
+            return
+        table = Table(title=f"Latency · {session_id}", box=box.ROUNDED)
+        table.add_column("Turn", justify="right", style="cyan")
+        table.add_column("E2E", justify="right")
+        table.add_column("Status")
+        for row in rows:
+            duration = (
+                _duration(row.duration_ms, milliseconds=True)
+                if row.duration_ms is not None
+                else "—"
+            )
+            table.add_row(f"#{row.seq}", duration, row.status)
+        self.console.print(table)
 
     def trace(self, event: TraceEvent) -> None:
         """Render a low-noise live trace.
@@ -479,7 +529,9 @@ def _usage_meter(tokens: int, capacity: int, width: int = 18) -> str:
     return "━" * filled + "─" * (width - filled)
 
 
-def _duration(duration_ms: float) -> str:
+def _duration(duration_ms: float, *, milliseconds: bool = False) -> str:
+    if milliseconds:
+        return f"{duration_ms:,.0f}ms"
     if duration_ms < 1:
         return "<1ms"
     if duration_ms < 1000:

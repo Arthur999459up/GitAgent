@@ -306,7 +306,7 @@ def _repl(application: LiveApplication) -> int:
         Panel.fit(
             f"[bold]{application.repository}[/bold]  ·  {application.config.model}\n"
             f"[dim]session {application.session_id}[/dim]\n"
-            "[dim]自然语言提问 · /help 命令 · /trace 轨迹 · /debug Agent History · quit 退出[/dim]",
+            "[dim]自然语言提问 · /help 命令 · /context 上下文 · /latency 延迟 · /trace 轨迹 · quit 退出[/dim]",
             title="[bold cyan]GitAgent[/bold cyan] [dim]v0.1.0[/dim]",
             title_align="left",
             border_style="cyan",
@@ -386,6 +386,20 @@ def _run_command(application: LiveApplication, request: str) -> None:
         if cost is not None:
             text += f"（约 ${cost:.4f}）"
         console.print(text)
+    elif command == "/context":
+        if argument:
+            console.print("[yellow]用法：/context[/yellow]")
+            return
+        ui.context_usage(
+            application.context_usage(), session_id=application.session_id or ""
+        )
+    elif command == "/latency":
+        if argument:
+            console.print("[yellow]用法：/latency[/yellow]")
+            return
+        ui.turn_latencies(
+            application.turn_latencies(), session_id=application.session_id or ""
+        )
     elif command == "/audit":
         events = application.service.harness.audit.events(
             argument or application.session_id
@@ -831,6 +845,8 @@ def _show_help() -> None:
             "  /delete <编号>        删除 Session\n"
             "  /compact              压缩旧 Turn 的 Context 投影\n"
             "  /tokens               查看模型 token 与估算费用\n"
+            "  /context              查看各 Agent 上下文占用\n"
+            "  /latency              查看当前 Session 每轮端到端耗时\n"
             "  /audit [session_id]   查看当前或指定 Session 审计记录\n"
             "  /trace [session_id]   回放当前或指定 Session 实时调用轨迹\n"
             "  /debug [agent]        查看当前 Session 的 Agent Debug History\n"

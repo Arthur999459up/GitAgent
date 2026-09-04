@@ -39,6 +39,13 @@ from gitagent.prompts import get_prompt_library
 
 from .capabilities import build_capability_layer
 from .config import RuntimeConfig
+from .metrics import (
+    AGENT_NAMES,
+    ContextUsage,
+    TurnLatency,
+    project_context_usage,
+    project_turn_latencies,
+)
 from .projection import project_service_result
 from .service import GitAgentService
 
@@ -253,6 +260,25 @@ class LiveApplication:
     def list_sessions(self) -> tuple[SessionRecord, ...]:
         scope = self._require_scope()
         return self.sessions.list_sessions(scope.account_key, scope.repository_key)
+
+    def context_usage(self) -> tuple[ContextUsage, ...]:
+        """Return the latest persisted model-visible context usage for every Agent."""
+
+        scope = self._require_scope()
+        return project_context_usage(
+            self.sessions.event_log.iter_events(scope),
+            agents=AGENT_NAMES,
+            context_windows=self.config.context_window_tokens,
+        )
+
+    def turn_latencies(self) -> tuple[TurnLatency, ...]:
+        """Return persisted end-to-end durations for the active Session."""
+
+        scope = self._require_scope()
+        turns = self.sessions.list_turns(
+            scope.account_key, scope.repository_key, scope.session_id
+        )
+        return project_turn_latencies(turns)
 
     def new_session(self) -> SessionRecord:
         scope = self._require_scope()

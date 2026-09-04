@@ -8,15 +8,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-_CONFIGURABLE_AGENTS = frozenset(
-    {
-        "main",
-        "repository",
-        "coding",
-        "issues",
-        "pull_requests",
-    }
-)
+AGENT_NAMES = ("main", "repository", "issues", "pull_requests", "coding")
+_CONFIGURABLE_AGENTS = frozenset(AGENT_NAMES)
 
 
 @dataclass(frozen=True, slots=True)

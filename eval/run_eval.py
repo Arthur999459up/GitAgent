@@ -13,9 +13,6 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from runner import EvalRunner, finalize_run
-
-
 def build_run_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the GitAgent automatic evaluation suite"
@@ -23,18 +20,18 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset",
         default="eval/gitagent-evaluation-dataset.json",
-        help="103-sample dataset (61 official M3-M7 cases + 22 legacy M2 cases + 20 optional E2E cases)",
+        help="resume-focused dataset: 20 context + 24 concurrency + 12 recovery cases",
     )
     parser.add_argument("--config", default="config.json", help="base GitAgent config")
     parser.add_argument("--output", required=True, help="isolated eval run directory")
     parser.add_argument("--sample", help="run one task_name:id sample")
     parser.add_argument(
         "--group",
-        choices=("E2E", "M3", "M4", "M5", "M6", "M7"),
+        choices=("M2", "M3", "M6", "SMOKE"),
         help="run one metric group",
     )
     parser.add_argument(
-        "--repetitions", type=int, default=5, help="valid M3/M4 repetitions per variant"
+        "--repetitions", type=int, default=5, help="valid M3 serial/parallel repetitions per variant"
     )
     parser.add_argument(
         "--resume", action="store_true", help="continue an existing run directory"
@@ -60,14 +57,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments[:1] == ["finalize"]:
         args = build_finalize_parser().parse_args(arguments[1:])
+        from runner import finalize_run
+
         metrics = finalize_run(args.run_dir, args.judge_results)
     else:
         args = build_run_parser().parse_args(arguments)
+        from runner import EvalRunner
+
         metrics = EvalRunner(
             dataset_path=args.dataset,
             config_path=args.config,
             output_dir=args.output,
-            repetitions=args.repetitions,
+            repetitions=1 if args.group == "SMOKE" else args.repetitions,
             sample_key=args.sample,
             group=args.group,
             resume=args.resume,
