@@ -6,11 +6,11 @@
 
 ## Gathered evidence
 
-The JSON log contains Issue, comment, and repository observations ordered oldest to newest.
+The evidence payload contains the bounded Issue and comment observations available for this draft.
 
 <evidence>
 {{evidence}}
-</evidence>{{guidance}}
+</evidence>
 
 ## Drafting rules
 

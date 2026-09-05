@@ -21,7 +21,6 @@ from gitagent.domain.errors import (
     WorkflowError,
 )
 from gitagent.domain.models import (
-    AgentGuidance,
     AgentSpec,
     CandidatePatch,
     ChangeRequest,
@@ -46,7 +45,6 @@ from gitagent.harness.validation.code import deterministic_code_checks
 from gitagent.model import Reasoner, structured_tools
 from gitagent.prompts import get_prompt_library
 
-from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
 
@@ -224,19 +222,15 @@ class CodingAgent:
     def _run_task(self, context: AgentContext, task: CodingTask) -> Any:
         mode = task.mode
         if mode == "explain":
-            return self._explain(context, task.task, task.evidence, context.guidance)
+            return self._explain(context, task.task, task.evidence)
         if mode == "review":
-            return self._review(context, task.task, task.evidence, context.guidance)
+            return self._review(context, task.task, task.evidence)
         if mode == "plan":
-            return self._plan(context, task.task, task.evidence, context.guidance)
+            return self._plan(context, task.task, task.evidence)
         if mode == "review_dialogue":
-            return self._summarize_review_dialogue(
-                context, task.task, task.evidence, context.guidance
-            )
+            return self._summarize_review_dialogue(context, task.task, task.evidence)
         if mode == "ci":
-            return self._analyze_ci(
-                context, task.task, task.evidence, context.guidance
-            )
+            return self._analyze_ci(context, task.task, task.evidence)
         raise ValidationError(f"unknown Coding Agent mode: {mode}")
 
     @staticmethod
@@ -467,7 +461,6 @@ class CodingAgent:
         context: AgentContext,
         request: str,
         evidence: dict[str, Any],
-        guidance: AgentGuidance | None,
     ) -> CodeExplanationResult:
         if self.reasoner is None:
             changed = [str(path) for path in evidence.get("changed_files", [])]
@@ -483,7 +476,6 @@ class CodingAgent:
                 "agents.coding_explain",
                 request=request,
                 evidence=json.dumps(evidence, ensure_ascii=False),
-                guidance=guidance_section(guidance),
             ),
             schema=_EXPLANATION_SCHEMA,
             tool_name="explain_code_change",
@@ -502,7 +494,6 @@ class CodingAgent:
         context: AgentContext,
         request: str,
         evidence: dict[str, Any],
-        guidance: AgentGuidance | None,
     ) -> CodeReviewResult:
         changed = [str(path) for path in evidence.get("changed_files", [])]
         if self.reasoner is None:
@@ -527,7 +518,6 @@ class CodingAgent:
                 "agents.pr_review",
                 request=request,
                 evidence=json.dumps(evidence, ensure_ascii=False),
-                guidance=guidance_section(guidance),
             ),
             schema=_REVIEW_SCHEMA,
             tool_name="review_code_change",
@@ -556,7 +546,6 @@ class CodingAgent:
         context: AgentContext,
         request: str,
         evidence: dict[str, Any],
-        guidance: AgentGuidance | None,
     ) -> CodePlanResult:
         changed = [str(path) for path in evidence.get("changed_files", [])]
         if self.reasoner is None:
@@ -572,7 +561,6 @@ class CodingAgent:
                 "agents.coding_plan",
                 request=request,
                 evidence=json.dumps(evidence, ensure_ascii=False),
-                guidance=guidance_section(guidance),
             ),
             schema=_PLAN_SCHEMA,
             tool_name="plan_code_change",
@@ -589,7 +577,6 @@ class CodingAgent:
         context: AgentContext,
         request: str,
         evidence: dict[str, Any],
-        guidance: AgentGuidance | None,
     ) -> dict[str, Any]:
         reviews = [
             item for item in evidence.get("reviews", []) if isinstance(item, dict)
@@ -624,7 +611,6 @@ class CodingAgent:
                 "agents.pull_request_dialogue",
                 request=request,
                 evidence=json.dumps(evidence, ensure_ascii=False),
-                guidance=guidance_section(guidance),
             ),
             schema=_DIALOGUE_SCHEMA,
             tool_name="summarize_review_dialogue",
@@ -643,7 +629,6 @@ class CodingAgent:
         context: AgentContext,
         request: str,
         evidence: dict[str, Any],
-        guidance: AgentGuidance | None,
     ) -> dict[str, Any]:
         runs = [
             item for item in evidence.get("workflow_runs", []) if isinstance(item, dict)
@@ -674,7 +659,6 @@ class CodingAgent:
                     "agents.pull_request_ci",
                     request=request,
                     evidence=json.dumps(evidence, ensure_ascii=False),
-                    guidance=guidance_section(guidance),
                 ),
                 schema=_CI_SCHEMA,
                 tool_name="analyze_pull_request_ci",

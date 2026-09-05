@@ -32,7 +32,6 @@ from gitagent.harness.execution import AgentHarness, ExecutionProfile
 from gitagent.model import Reasoner
 from gitagent.prompts import get_prompt_library
 
-from .guidance import guidance_section
 
 _PROMPTS = get_prompt_library()
 _CODING_SCHEMA = {
@@ -319,7 +318,6 @@ class IssueAgent:
                     },
                     ensure_ascii=False,
                 ),
-                guidance=guidance_section(context.guidance),
             ),
         )
 
