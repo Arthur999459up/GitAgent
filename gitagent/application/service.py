@@ -1176,6 +1176,7 @@ class GitAgentService:
         self.harness.trace.emit_auto_compaction(
             session_id=context.session_id,
             agent=context.agent,
+            run_id=context.run_id,
             level=level,
             before_tokens=before_tokens,
             after_tokens=after_tokens,

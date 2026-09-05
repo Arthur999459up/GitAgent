@@ -40,7 +40,6 @@ from gitagent.prompts import get_prompt_library
 from .capabilities import build_capability_layer
 from .config import RuntimeConfig
 from .metrics import (
-    AGENT_NAMES,
     ContextUsage,
     TurnLatency,
     project_context_usage,
@@ -262,13 +261,14 @@ class LiveApplication:
         return self.sessions.list_sessions(scope.account_key, scope.repository_key)
 
     def context_usage(self) -> tuple[ContextUsage, ...]:
-        """Return the latest persisted model-visible context usage for every Agent."""
+        """Return model-visible context usage for each concrete Agent run."""
 
         scope = self._require_scope()
+        session = self._session()
         return project_context_usage(
             self.sessions.event_log.iter_events(scope),
-            agents=AGENT_NAMES,
             context_windows=self.config.context_window_tokens,
+            current_context=session.agent_context,
         )
 
     def turn_latencies(self) -> tuple[TurnLatency, ...]:

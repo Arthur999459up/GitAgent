@@ -138,16 +138,23 @@ class TerminalUI:
     def context_usage(
         self, rows: tuple[ContextUsage, ...], *, session_id: str
     ) -> None:
-        """Render latest per-Agent model-visible context usage."""
+        """Render model-visible context usage for each concrete Agent run."""
 
         table = Table(title=f"Context Usage · {session_id}", box=box.ROUNDED)
         table.add_column("Agent", style="cyan")
+        table.add_column("Run", style="dim")
+        table.add_column("State")
         table.add_column("Context")
         table.add_column("Tokens", justify="right")
         table.add_column("Usage", justify="right")
         table.add_column("Turn", justify="right", style="dim")
         for row in rows:
             agent_name = _AGENT_NAMES.get(row.agent, row.agent)
+            display_run = (
+                "main"
+                if row.agent == "main"
+                else row.run_id.removeprefix("run-")[:8]
+            )
             if row.input_tokens is None:
                 meter = _usage_meter(0, row.context_window_tokens)
                 tokens = f"— / {row.context_window_tokens:,}"
@@ -158,7 +165,15 @@ class TerminalUI:
                 tokens = f"{row.input_tokens:,} / {row.context_window_tokens:,}"
                 usage = f"{(row.ratio or 0.0) * 100:.1f}%"
                 turn = f"#{row.turn_seq}" if row.turn_seq else "—"
-            table.add_row(agent_name, meter, tokens, usage, turn)
+            table.add_row(
+                agent_name,
+                display_run,
+                row.state,
+                meter,
+                tokens,
+                usage,
+                turn,
+            )
         self.console.print(table)
 
     def turn_latencies(
@@ -275,6 +290,7 @@ class TerminalUI:
             automatic=True,
             agent=str(details.get("agent") or ""),
             level=str(details.get("level") or "none"),
+            run_id=str(details.get("run_id") or ""),
             before_tokens=int(details.get("before_tokens") or 0),
             after_tokens=int(details.get("after_tokens") or 0),
             context_window_tokens=int(details.get("context_window_tokens") or 0),
@@ -289,12 +305,16 @@ class TerminalUI:
         before_tokens: int,
         after_tokens: int,
         context_window_tokens: int,
+        run_id: str = "",
     ) -> None:
         """Render manual and automatic compaction with one canonical layout."""
 
         agent_name = _AGENT_NAMES.get(
             agent,
             (agent or "Agent").replace("_", " ").title(),
+        )
+        display_run = (
+            "main" if agent == "main" else run_id.removeprefix("run-")[:8]
         )
         reduced = before_tokens - after_tokens
         before_percent = (
@@ -321,7 +341,10 @@ class TerminalUI:
                 ),
                 title=Text(f"Context compact  {trigger}", style="bold cyan"),
                 title_align="left",
-                subtitle=Text(f"{agent_name} · {level} · window {window:,}", style="dim"),
+                subtitle=Text(
+                    f"{agent_name} · {display_run} · {level} · window {window:,}",
+                    style="dim",
+                ),
                 subtitle_align="right",
                 border_style="bright_black",
                 box=box.ROUNDED,

@@ -47,7 +47,6 @@ class CompactionResult:
     """Canonical context-pressure result shared by every compaction caller."""
 
     messages: list[dict[str, Any]]
-    level: str
     stages: tuple[dict[str, Any], ...]
     plan: MessageCompactionPlan
     before_tokens: int
@@ -57,6 +56,10 @@ class CompactionResult:
     @property
     def changed(self) -> bool:
         return self.plan.changed
+
+    @property
+    def level(self) -> str:
+        return " -> ".join(str(stage["level"]) for stage in self.stages) or "none"
 
 
 @dataclass(frozen=True)
@@ -230,13 +233,11 @@ def compact_messages(
     initial = request_tokens(canonical, tools)
     current = canonical
     light_replacements: tuple[tuple[str, str], ...] = ()
-    level = "none"
 
     context_window_tokens = _integer(
         context_window_tokens, "context_window_tokens", positive=True
     )
     if context_pressure(initial, context_window_tokens) >= LIGHT_THRESHOLD:
-        level = "light"
         current, light_replacements = _light_compact(
             current, tools, context_window_tokens
         )
@@ -252,7 +253,6 @@ def compact_messages(
     projected = _ProjectedCompaction(current)
     current_tokens = request_tokens(current, tools)
     if context_pressure(current_tokens, context_window_tokens) >= SUMMARY_THRESHOLD:
-        level = "summary"
         before = current_tokens
         projected = _summary_compact(current, tools, context_window_tokens)
         current = projected.messages
@@ -266,7 +266,6 @@ def compact_messages(
 
     current_tokens = request_tokens(current, tools)
     if context_pressure(current_tokens, context_window_tokens) >= EMERGENCY_THRESHOLD:
-        level = "emergency"
         before = current_tokens
         projected = _emergency_compact(
             durable_base, tools, context_window_tokens
@@ -295,7 +294,6 @@ def compact_messages(
     )
     return CompactionResult(
         messages=current,
-        level=level,
         stages=tuple(stages),
         plan=plan,
         before_tokens=initial,

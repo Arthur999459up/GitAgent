@@ -114,6 +114,7 @@ class TraceBus:
         before_tokens: int,
         after_tokens: int,
         context_window_tokens: int,
+        run_id: str = "",
         turn_seq: int | None = None,
     ) -> TraceEvent:
         """Emit the one normalized event used for automatic compact visibility."""
@@ -125,6 +126,7 @@ class TraceBus:
             status=TraceStatus.COMPLETED,
             details={
                 "agent": agent,
+                "run_id": "main" if agent == "main" else run_id,
                 "level": level,
                 "before_tokens": before_tokens,
                 "after_tokens": after_tokens,
