@@ -6,7 +6,11 @@ from dataclasses import replace
 from time import perf_counter
 from typing import Any
 
-from .ingestion import LocalEmbeddingModel, model_directory_error
+from .ingestion import (
+    LocalEmbeddingModel,
+    model_directory_error,
+    quiet_transformers_model_loading,
+)
 from .models import (
     KnowledgeBase,
     RAGSettings,
@@ -54,11 +58,12 @@ class LocalReranker:
         try:
             from sentence_transformers import CrossEncoder
 
-            model = CrossEncoder(
-                str(path),
-                local_files_only=True,
-                trust_remote_code=True,
-            )
+            with quiet_transformers_model_loading():
+                model = CrossEncoder(
+                    str(path),
+                    local_files_only=True,
+                    trust_remote_code=True,
+                )
         except Exception as exc:
             raise RAGUnavailableError(
                 f"cannot load local reranker model at {path}: {exc}"

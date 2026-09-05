@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from gitagent.domain.errors import PermissionDenied, ValidationError
@@ -20,6 +23,36 @@ from .models import (
 )
 
 _HEADERS = [("#" * level, f"h{level}") for level in range(1, 7)]
+_MODEL_LOAD_LOCK = RLock()
+
+
+@contextmanager
+def quiet_transformers_model_loading():
+    """Temporarily suppress third-party model-load progress and advisory logs."""
+
+    try:
+        from transformers.utils import logging as transformers_logging
+    except ImportError:
+        yield
+        return
+
+    with _MODEL_LOAD_LOCK:
+        previous_verbosity = transformers_logging.get_verbosity()
+        progress_enabled = transformers_logging.is_progress_bar_enabled()
+        sentence_transformers_logger = logging.getLogger("sentence_transformers")
+        previous_sentence_transformers_level = sentence_transformers_logger.level
+        try:
+            transformers_logging.disable_progress_bar()
+            transformers_logging.set_verbosity_error()
+            sentence_transformers_logger.setLevel(logging.ERROR)
+            yield
+        finally:
+            sentence_transformers_logger.setLevel(previous_sentence_transformers_level)
+            transformers_logging.set_verbosity(previous_verbosity)
+            if progress_enabled:
+                transformers_logging.enable_progress_bar()
+            else:
+                transformers_logging.disable_progress_bar()
 
 
 class LocalEmbeddingModel:
@@ -90,12 +123,13 @@ class LocalEmbeddingModel:
         try:
             from sentence_transformers import SentenceTransformer
 
-            model = SentenceTransformer(
-                str(path),
-                local_files_only=True,
-                trust_remote_code=True,
-            )
-            dimension = model.get_sentence_embedding_dimension()
+            with quiet_transformers_model_loading():
+                model = SentenceTransformer(
+                    str(path),
+                    local_files_only=True,
+                    trust_remote_code=True,
+                )
+            dimension = model.get_embedding_dimension()
         except Exception as exc:
             raise RAGUnavailableError(
                 f"cannot load local embedding model at {path}: {exc}"

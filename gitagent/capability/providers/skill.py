@@ -20,6 +20,13 @@ from ..models import (
 )
 
 
+_EMPTY_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
+
 class SkillProvider:
     id = "skill"
 
@@ -54,6 +61,7 @@ class SkillProvider:
                         definition.source_id,
                         status,
                         definition.access,
+                        input_schema=_EMPTY_INPUT_SCHEMA,
                     ),
                     CapabilityBinding(definition.id, self.id, definition),
                 )
