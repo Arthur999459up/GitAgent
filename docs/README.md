@@ -1,107 +1,134 @@
-# GitAgent 学习文档
+# GitAgent 复习与教学文档
 
-这组文档不按源码文件顺序讲 GitAgent，也不把类名和函数名当成知识点。阅读目标是建立一套能够复述、推导和回到代码验证的工程心智模型。
+这套文档不是源码索引，也不是把类名和函数名换成中文后的“注释集合”。它的目标是帮助你从零建立一张完整的 GitAgent 运行图：**一个用户请求从进入应用开始，怎样被路由给合适的 Agent，怎样让模型提出调用，怎样执行工具，怎样形成代码候选，怎样经过验证和审批产生远端副作用，又怎样在进程中断、上下文变长和跨会话时保持可恢复。**
 
-每章都遵循同一条 STAR 叙事线：
+## 这套文档采用什么讲法
 
-| 阶段 | 文档里对应的问题 |
-|---|---|
-| 情境 S | 为什么 GitAgent 会遇到这个工程问题；如果不解决，会出现什么 |
-| 任务 T | 这个模块必须建立哪些不变量，和相邻模块怎样分工 |
-| 行动 A | 对象从创建、交接、使用、更新到失效的完整生命周期；正常流程和异常流程怎样推进 |
-| 结果 R | 这种设计最终保证了什么，付出了什么复杂度，为什么没有选择更简单的方案 |
+每一章都遵循同一套教学顺序。
 
-STAR 不是每章四个孤立标题。正文会沿着一条真实运行路径展开：先看到问题，再理解目标，再跟着状态一步步流动，最后回头看设计结果和取舍。
+1. **先看设计**：先告诉你这一部分在 GitAgent 里有哪些对象、数据怎样流动、前后环节怎样衔接。读者先建立“它实际上是怎么工作的”的心智模型。
+2. **再走流程**：沿一个具体任务一步一步走过这部分 pipeline，而不是直接列规则。
+3. **最后用 STAR 复盘设计取舍**：在已经知道“怎么做”的前提下，再解释 Situation、Task、Action、Result，也就是为什么需要这个模块、它要完成什么、采取了什么设计、最后换来了什么以及付出了什么代价。
+4. **收尾只保留必要的源码定位**：代码路径用于复习后核对实现，不在正文里大段罗列代码。
 
-这里的“结果”首先指代码中可以核对的行为和边界，不代表已经测得的效果提升。本组文档不包含实验成绩、失败案例复盘或优化路线；评测章只解释如何设计观察、判分和指标口径。
+也就是说，这里的 STAR 不是机械地让每章一上来先讲一堆“为什么”。**教学顺序是先 How，再 Why；STAR 用来复盘设计逻辑，而不是阻挡读者进入系统。**
 
-## 一条贯穿全部章节的故事线
+---
 
-用户说一句话之后，GitAgent 并不是“让模型自己想办法操作 GitHub”。它把任务逐层收敛。
+## 先用一张图认识 GitAgent
 
 ```mermaid
 flowchart LR
-    U[用户输入] --> S[会话与轮次]
-    S --> M[主代理]
-    M --> D[领域代理]
-    D --> L[代理循环]
-    L --> H[执行框架]
-    H --> C[能力层]
-    C --> P[能力提供方]
-    D --> K[代码代理]
-    K --> W[隔离工作树]
-    H --> A[审批与安全检查]
-    S --> E[持久化与事件历史]
-    S --> MEM[长期记忆]
+    U[用户输入] --> APP[应用层 / Session]
+    APP --> MAIN[Main Agent]
+    MAIN --> DOMAIN[Repository / Issue / PR Agent]
+    DOMAIN --> CODE[需要时委派 Coding Agent]
+    MAIN --> LOOP[Agent Loop]
+    DOMAIN --> LOOP
+    CODE --> LOOP
+    LOOP --> MODEL[模型请求]
+    MODEL --> LOOP
+    LOOP --> CAP[Capability 层]
+    CAP --> EXEC[执行与并发调度]
+    EXEC --> TOOL[Native / GitHub / MCP / RAG / Skill]
+    TOOL --> EXEC
+    EXEC --> LOOP
+    CODE --> WS[隔离 Coding Workspace]
+    WS --> VERIFY[真实验证]
+    VERIFY --> CAND[CandidatePatch]
+    CAND --> PLAN[Mutation Plan]
+    PLAN --> APPROVAL[用户审批]
+    APPROVAL --> REMOTE[受保护远端写入]
+    LOOP --> STATE[事件历史 / 暂停状态 / Trace]
+    STATE --> APP
 ```
 
-可以把整套系统压缩成三个问题：
+这张图可以先记成五层：
 
-| 主线 | 始终要问的问题 |
-|---|---|
-| 控制权 | 谁只是提出动作，谁有权让动作真正进入系统 |
-| 状态 | 当前事实保存在哪里，暂停后靠什么恢复，不同状态谁是权威 |
-| 副作用 | 哪些动作可重复，哪些动作必须审批，网络失败后怎样避免重复写入 |
+| 层 | 负责什么 | 不负责什么 |
+|---|---|---|
+| 应用与会话 | 确定用户、仓库、Session、启动/恢复/切换 | 不自己决定代码怎么改 |
+| Agent 与 Agent Loop | 理解任务、选择下一步、维护调用协议 | 不直接相信模型就执行副作用 |
+| Capability 与执行层 | 发现能力、校验输入、权限、调度、提交结果 | 不替业务 Agent 判断任务目标 |
+| Coding / Approval 工作流 | 把“想改代码”变成验证过且经授权的远端动作 | 不允许模型把自然语言当授权 |
+| 状态与知识系统 | 重放历史、恢复等待、管理上下文、记忆和 RAG | 不取代当前仓库或 GitHub 的事实来源 |
 
-GitAgent 的核心设计可以概括为一句话：**模型提出动作，执行框架把动作变成受状态、权限和副作用约束的运行过程。**
+---
 
 ## 推荐阅读顺序
 
-| 顺序 | 章节 | 先带着什么问题去读 |
-|---:|---|---|
-| 1 | [代理循环与整体架构](01-agent-loop-and-architecture.md) | 一次模型输出怎样变成可暂停、可恢复的代理运行 |
-| 2 | [能力层](02-capability-layer.md) | 各种底层工具怎样被统一注册、发现、调用、刷新和删除 |
-| 3 | [异常、失败隔离与恢复](03-errors-recovery-and-resume.md) | 为什么不同失败不能使用同一套重试逻辑 |
-| 4 | [并发调度](04-execution-and-concurrency.md) | 怎样并行执行，又不改变模型调用顺序和副作用语义 |
-| 5 | [上下文系统](05-context-system.md) | 消息、运行时状态和临时知识为什么必须分层 |
-| 6 | [长期记忆](06-memory-system.md) | 会话中的信息怎样变成长久知识，又怎样过期和被替代 |
-| 7 | [持久化、可观测与追踪](07-persistence-observability.md) | 进程退出后怎样恢复，运行中怎样解释系统正在做什么 |
-| 8 | [执行安全、审批与隔离工作区](08-safety-approval-workspace.md) | 从本地候选代码到远端写入之间有哪些硬边界 |
-| 9 | [领域代理与业务工作流](09-domain-agents-and-workflows.md) | 为什么要拆主代理、领域代理和代码代理，它们怎样交接证据与产物 |
-| 10 | [模型协议与适配](10-model-protocol-and-adaptation.md) | 模型输出怎样成为可验证的调用，协议、预算和重试分别由谁负责 |
-| 11 | [原生工具、MCP 与 Skills](11-tools-mcp-and-skills.md) | 能力契约怎样落到代码读取、编辑、命令执行和外部服务连接 |
-| 12 | [RAG 知识系统](12-rag-knowledge-system.md) | 文档怎样入库、检索和切换版本，检索证据为什么不等于记忆 |
-| 13 | [应用装配与 Prompt](13-application-and-prompts.md) | 配置和共享依赖怎样进入会话，用户回复怎样回到原来的任务 |
-| 14 | [Harness 评测设计](14-evaluation-design.md) | 怎样同时判断任务答案、执行过程和副作用，避免指标口径混淆 |
-| 15 | [亮点设计与其他 Harness 的异同](15-design-highlights-and-harness-comparison.md) | 面对同一修复任务，GitAgent、Claude Code、Codex、pi 怎样划分核心职责 |
+新的章节顺序尽量沿着一次真实请求向下走，横切机制放在主流程建立以后再展开。
 
-第一次阅读可以按章节顺序建立完整心智模型。面试前复习则可以从第 9 章的一次修复任务进入：先用第 1、4、8 章解释控制流和授权，再用第 5、10、11、12 章解释模型实际获得的上下文与能力，最后用第 14、15 章说明如何验证设计、如何与其他 Harness 比较。
+| 章节 | 先回答的问题 | 主要边界 |
+|---|---|---|
+| [01 总览：一个请求怎样走完整条 GitAgent Pipeline](01-overview-and-pipeline.md) | 整个系统到底怎么串起来 | 只建立全局地图，不深挖局部算法 |
+| [02 Agent 拓扑与领域工作流](02-agent-topology-and-workflows.md) | Main、Domain、Coding Agent 怎样分工和交接 | 讲职责与产物，不重复执行器细节 |
+| [03 Agent Loop 与调用协议](03-agent-loop-and-call-protocol.md) | 单个 Agent 怎样一轮轮地思考、调用、等待和结束 | 讲控制循环，不展开具体工具实现 |
+| [04 模型与上下文协议](04-model-and-context-protocol.md) | 模型真正看到什么，返回什么才能被运行时接住 | 讲消息/结构化响应，不展开压缩算法 |
+| [05 Capability 与工具系统](05-capability-and-tool-system.md) | 不同来源的工具怎样成为统一且可控的能力 | 讲能力契约，不展开线程调度 |
+| [06 执行与并发](06-execution-and-concurrency.md) | 一批调用怎样安全并行，又保持逻辑顺序 | 讲 prepare/run/commit 与资源冲突 |
+| [07 Coding Workspace 与验证](07-coding-workspace-and-verification.md) | 模型怎样在本地形成一份可信候选补丁 | 只到 CandidatePatch，不做远端发布 |
+| [08 Approval 与远端 Mutation](08-approval-and-remote-mutations.md) | 候选怎样获得远端写入资格 | 讲精确授权和业务前置条件 |
+| [09 持久化、恢复与可观测性](09-persistence-recovery-observability.md) | 进程退出后，系统凭什么知道之前发生了什么 | 讲状态权威、错误恢复、Trace/Audit |
+| [10 上下文治理与读取状态](10-context-governance-and-read-state.md) | 长会话怎样控制 token，同时不破坏工具协议 | 讲压缩、读取缓存和文件覆盖 |
+| [11 长期记忆](11-long-term-memory.md) | 哪些交互信息值得跨会话保留 | 讲记忆生命周期，不和 RAG 混在一起 |
+| [12 RAG 知识系统](12-rag-knowledge-system.md) | 已有文档怎样变成带来源、可更新的参考证据 | 讲文档索引与检索，不取代当前事实 |
+| [13 应用装配、配置与 Prompt](13-application-config-and-prompts.md) | 各模块怎样在真实 CLI / Session 中被组装起来 | 讲生命周期与行为指导，不把 Prompt 当安全边界 |
+| [14 Harness 评测设计](14-evaluation-design.md) | 怎样证明“任务完成了，而且约束没有被绕过” | 讲判分证据与指标口径 |
 
-如果面试官追问“程序从哪里启动、用户插话以后怎么办”，再沿第 13 章回到第 3、7 章；如果追问跨会话知识，结合第 6、12 章区分长期记忆与文档检索。这样复习时仍然是在讲一条运行链，而不是背十五份模块摘要。
+### 面试速查附录
 
-## 阅读方法
+14 章正文讲的是 **GitAgent 自己**。如果已经完整复习过主线，再看下面这篇横向对比，用来回答“为什么你的 Harness 这么设计，其他 Coding Agent/Harness 又怎么做”：
 
-一章读完后，不要先背类名。先试着回答一条完整链路。
+- [GitAgent、Claude Code、Codex、Pi、DeepSeek Harness 设计思路快速对比](appendix-harness-design-comparison.md)
 
-例如能力层，不是回答“有 `CapabilityRegistry` 和 `PermissionPolicy`”，而是回答：
+这篇附录不是第 15 个技术模块，也不要求背功能列表。重点是用 **Agent Loop、Tools、Context、Multi-Agent、Execution/Sandbox、Approval、Recovery** 这些 GitAgent 已经熟悉的维度理解不同 Harness 的设计取舍。
 
-> 一个 MCP 工具怎样在服务启动时变成能力注册项，怎样进入目录，为什么某个代理能看见它，模型调用后经过哪些检查，远端服务重连后这个工具如果消失怎样从目录移除，失败和重试又由谁统一处理。
+---
 
-能够这样从头讲到尾，代码中的类和函数才有位置。
+## 贯穿全书的几个核心对象
 
-## 代码地图
+不要先背所有类名，只要先认清下面这些对象在 pipeline 里的作用。
 
-| 主题 | 主要代码位置 |
-|---|---|
-| 代理循环 | `gitagent/agent_loop/` |
-| 执行框架与并发 | `gitagent/harness/execution.py` |
-| 结构化调用与审批 | `gitagent/harness/structured_call_dispatcher.py` |
-| 上下文构建与压缩 | `gitagent/harness/context/` |
-| 文件阅读状态 | `gitagent/harness/file_reads.py` |
-| 能力层 | `gitagent/capability/` |
-| 领域代理 | `gitagent/agents/` |
-| 隔离工作树 | `gitagent/harness/coding_workspace.py` |
-| 变更计划 | `gitagent/harness/mutation_plans.py` |
-| 持久化 | `gitagent/infra/persistence/` |
-| 追踪与审计 | `gitagent/infra/observability/` |
-| 长期记忆 | `gitagent/memory/` |
-| 应用服务与恢复 | `gitagent/application/service.py` |
-| 模型调用与结构化结果 | `gitagent/model/` |
-| 原生能力提供方 | `gitagent/capability/providers/` |
-| MCP 传输与 GitHub 适配 | `gitagent/infra/mcp/`、`gitagent/infra/github/` |
-| RAG 入库、检索与版本管理 | `gitagent/capability/rag/` |
-| 配置与应用装配 | `gitagent/application/config.py`、`gitagent/application/bootstrap.py` |
-| Prompt 模板与加载 | `gitagent/prompts/` |
-| 评测运行、环境观察与判分 | `eval/runner.py`、`eval/environment.py`、`eval/grader.py` |
+| 对象 | 可以把它理解成 | 主要出现位置 |
+|---|---|---|
+| `Session` / `Turn` | 一段持续会话 / 一次用户输入的业务单元 | 应用与持久化 |
+| `AgentContext` | 某个 Agent 当前运行所需要的控制状态和消息视图 | Agent Loop / Context |
+| `StructuredCall` | 模型提出的“下一步动作” | Model → Agent Loop |
+| `Capability` | 运行时认可、带 schema 和权限的稳定动作 | Capability 层 |
+| `ExecutionProfile` | 一项动作能否并行、会占什么资源、失败影响多大 | 执行层 |
+| `ChangeRequest` | 要改什么，以及候选基于哪个代码版本 | Domain → Coding |
+| `CandidatePatch` | 实际工作树最终改成了什么 | Coding Workspace |
+| `VerificationReport` | 哪些真实检查覆盖了哪一版工作树 | Coding Workspace |
+| `Mutation Plan` | 真正准备对远端执行的精确动作列表 | Domain / Approval |
+| `ApprovalRequest` | 用户批准的精确调用与顺序 | Approval |
+| 事件历史 | 按顺序发生过什么、模型消息是什么 | Persistence |
+| 暂停快照 | 当前等待中的控制树停在哪里 | Recovery |
 
-外部项目的比较集中在第 15 章，并附官方资料链接与核对日期。要区分“公开文档确认的能力”“本项目代码实现的机制”和“据此作出的设计分析”，不要把三者混成产品优劣结论。
+---
+
+## 复习时最重要的主线
+
+如果时间不够，只要能完整讲清下面这条链，就已经抓住 GitAgent 的骨架：
+
+**用户输入 → 建立 Turn → Main Agent 路由 → Domain Agent 收集业务证据 → 必要时委派 Coding Agent → Agent Loop 让模型提出结构化调用 → Capability 层校验和授权 → Execution 层执行并按逻辑顺序提交结果 → Coding Workspace 形成并验证 CandidatePatch → Domain Agent 生成 Mutation Plan → 用户对精确计划审批 → 受保护能力再次检查当前状态后执行 → 结果、消息与必要控制状态持久化 → 后续 Session 可以恢复或继续。**
+
+后面的上下文压缩、长期记忆、RAG、Tracing 和评测，都围绕这条主线提供“长时间运行、知识复用、可解释和可验证”的能力，而不是另一套独立 Agent 系统。
+
+---
+
+## 阅读约定
+
+- 正文优先讲机制和数据流，不要求你一边读一边跳源码。
+- Mermaid 图用于建立流程关系，不表示真实线程或网络拓扑一定与图一一对应。
+- 表格中的“为什么”只在相应设计已经解释清楚以后出现。
+- 文档会明确区分“当前实现已经保证什么”和“不能从当前实现推导出什么”，避免把 worktree 说成 OS sandbox、把工具缓存说成 KV Cache、把结构校验说成事实正确性。
+- 每章最后的“代码定位”适合复习后回到源码核对，不建议第一次阅读时按文件顺序学习。
+
+## 旧章节文件说明
+
+当前正式维护的 GitAgent 教学正文仍然只有上面的 **01—14 共十四章**。面试速查附录属于横向复习材料，不计入 GitAgent 技术主线。
+
+目录中仍保留少量旧文件名，例如 `01-agent-loop-and-architecture.md`、`08-safety-approval-workspace.md`，它们只是一页很短的迁移入口，用来避免仓库里已有链接突然失效。
+
+旧文件不再承载重复正文。阅读、复习和后续维护都应以本 README 列出的十四个新章节为准；完成主线以后，再按需阅读面试速查附录。
