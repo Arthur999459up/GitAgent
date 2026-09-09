@@ -1,4 +1,4 @@
-# 07 持久化、事件历史与可观测：既要知道“现在是什么”，也要知道“发生过什么”
+# 07 持久化、事件历史与 Observability：既要知道“现在是什么”，也要知道“发生过什么”
 
 ## 本章先回答什么
 
@@ -479,7 +479,7 @@ flowchart TD
 
 ---
 
-## 23. 实时追踪为什么单独存在
+## 23. Tracing 为什么单独存在
 
 事件历史适合重放，不适合直接驱动终端界面的细粒度进度。
 
@@ -665,3 +665,5 @@ GitAgent 接受这部分复杂度，因为它换来的是：**进程可以退出
 | 实时追踪事件和监听器 | `gitagent/infra/observability/trace.py` |
 | 能力审计 | `gitagent/infra/observability/audit.py` |
 | 应用服务怎样组合消息和暂停状态 | `gitagent/application/service.py` |
+
+实时追踪监听器的失败隔离，不代表最终回复渲染也一定处于业务调用链之外。界面、轮次完成与会话切换的实际顺序见[应用装配与 Prompt](13-application-and-prompts.md)；这些记录怎样进一步成为可判分的执行证据，见[Harness 评测设计](14-evaluation-design.md)。

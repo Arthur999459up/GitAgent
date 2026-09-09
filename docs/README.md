@@ -13,6 +13,8 @@
 
 STAR 不是每章四个孤立标题。正文会沿着一条真实运行路径展开：先看到问题，再理解目标，再跟着状态一步步流动，最后回头看设计结果和取舍。
 
+这里的“结果”首先指代码中可以核对的行为和边界，不代表已经测得的效果提升。本组文档不包含实验成绩、失败案例复盘或优化路线；评测章只解释如何设计观察、判分和指标口径。
+
 ## 一条贯穿全部章节的故事线
 
 用户说一句话之后，GitAgent 并不是“让模型自己想办法操作 GitHub”。它把任务逐层收敛。
@@ -56,6 +58,16 @@ GitAgent 的核心设计可以概括为一句话：**模型提出动作，执行
 | 7 | [持久化、可观测与追踪](07-persistence-observability.md) | 进程退出后怎样恢复，运行中怎样解释系统正在做什么 |
 | 8 | [执行安全、审批与隔离工作区](08-safety-approval-workspace.md) | 从本地候选代码到远端写入之间有哪些硬边界 |
 | 9 | [领域代理与业务工作流](09-domain-agents-and-workflows.md) | 为什么要拆主代理、领域代理和代码代理，它们怎样交接证据与产物 |
+| 10 | [模型协议与适配](10-model-protocol-and-adaptation.md) | 模型输出怎样成为可验证的调用，协议、预算和重试分别由谁负责 |
+| 11 | [原生工具、MCP 与 Skills](11-tools-mcp-and-skills.md) | 能力契约怎样落到代码读取、编辑、命令执行和外部服务连接 |
+| 12 | [RAG 知识系统](12-rag-knowledge-system.md) | 文档怎样入库、检索和切换版本，检索证据为什么不等于记忆 |
+| 13 | [应用装配与 Prompt](13-application-and-prompts.md) | 配置和共享依赖怎样进入会话，用户回复怎样回到原来的任务 |
+| 14 | [Harness 评测设计](14-evaluation-design.md) | 怎样同时判断任务答案、执行过程和副作用，避免指标口径混淆 |
+| 15 | [亮点设计与其他 Harness 的异同](15-design-highlights-and-harness-comparison.md) | 面对同一修复任务，GitAgent、Claude Code、Codex、pi 怎样划分核心职责 |
+
+第一次阅读可以按章节顺序建立完整心智模型。面试前复习则可以从第 9 章的一次修复任务进入：先用第 1、4、8 章解释控制流和授权，再用第 5、10、11、12 章解释模型实际获得的上下文与能力，最后用第 14、15 章说明如何验证设计、如何与其他 Harness 比较。
+
+如果面试官追问“程序从哪里启动、用户插话以后怎么办”，再沿第 13 章回到第 3、7 章；如果追问跨会话知识，结合第 6、12 章区分长期记忆与文档检索。这样复习时仍然是在讲一条运行链，而不是背十五份模块摘要。
 
 ## 阅读方法
 
@@ -84,5 +96,12 @@ GitAgent 的核心设计可以概括为一句话：**模型提出动作，执行
 | 追踪与审计 | `gitagent/infra/observability/` |
 | 长期记忆 | `gitagent/memory/` |
 | 应用服务与恢复 | `gitagent/application/service.py` |
+| 模型调用与结构化结果 | `gitagent/model/` |
+| 原生能力提供方 | `gitagent/capability/providers/` |
+| MCP 传输与 GitHub 适配 | `gitagent/infra/mcp/`、`gitagent/infra/github/` |
+| RAG 入库、检索与版本管理 | `gitagent/capability/rag/` |
+| 配置与应用装配 | `gitagent/application/config.py`、`gitagent/application/bootstrap.py` |
+| Prompt 模板与加载 | `gitagent/prompts/` |
+| 评测运行、环境观察与判分 | `eval/runner.py`、`eval/environment.py`、`eval/grader.py` |
 
-原有评测执行记录位于 [gitagent-evaluation-execution-notes.md](gitagent-evaluation-execution-notes.md)。建议在九章读完后再看，用评测行为反向检查自己的架构理解。
+外部项目的比较集中在第 15 章，并附官方资料链接与核对日期。要区分“公开文档确认的能力”“本项目代码实现的机制”和“据此作出的设计分析”，不要把三者混成产品优劣结论。

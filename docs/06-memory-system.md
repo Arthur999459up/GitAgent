@@ -674,3 +674,5 @@ GitAgent 接受这部分复杂度，因为长期知识真正困难的不是“�
 | 双游标、同会话合并和失败补做 | `gitagent/memory/hooks.py` |
 | 自动整理门槛和维护状态 | `gitagent/memory/dream.py` |
 | 记忆游标怎样持久化 | `gitagent/infra/persistence/sessions.py` |
+
+长期记忆从会话中提取需要保留的知识，RAG 则管理已有文档的检索证据。两者虽然都能补充模型上下文，但权威来源、更新方式和失效条件不同；可以结合[RAG 知识系统](12-rag-knowledge-system.md)理解这条边界。

@@ -190,6 +190,8 @@ flowchart LR
 
 GitAgent 在调用模型前估算消息和工具定义的总占用，再根据窗口大小得到压力比例。
 
+这里使用本地估算，不是模型服务实际返回的 usage。输出空间还要在请求层单独预留；估算、实际计量以及工具缓存与 KV Cache 的区别，见[模型协议与适配](10-model-protocol-and-adaptation.md)。
+
 当前使用三档压力：
 
 | 阶段 | 大致窗口占用 | 处理重点 |
@@ -225,7 +227,9 @@ flowchart LR
 | 用户目标 | 高，不应轻易丢失 | 否 |
 | 代理关键结论 | 较高 | 否 |
 
-这是一种按“信息可恢复性”排序的压缩策略。
+这张表表达的是设计动机，不是当前实现中的语义分类器。当前轻量压缩主要按工具消息角色和正文长度识别候选，并不会逐条证明信息确实能够重新获取，也不会按重获成本排序。对于会变化的日志、远端搜索或临时结果，重新调用未必得到原来的证据。
+
+因此，准确的说法是优先缩减大型工具正文、暂时保留用户和助手文本，而不是已经实现了通用的信息价值评估。
 
 ---
 
@@ -242,11 +246,11 @@ GitAgent 没有再调用一个模型自由总结旧对话，而是用固定规�
 - 工具结果的有界内容；
 - 旧检查点中的已有摘要。
 
-这样做的原因是可重放。
+这样做可以避免额外的摘要模型调用，让相同输入下的检查点生成规则容易核对。
 
-如果摘要由另一个模型自由生成，同一份历史在两次恢复时可能产生不同摘要，还可能引入原历史不存在的新事实。
+如果每次恢复都重新调用模型生成摘要，确实可能出现结果变化；但把已经生成的模型摘要持久化并在恢复时复用，同样可以稳定重建上下文。因此，生成规则的确定性与恢复的一致性不是同一件事。
 
-确定性检查点牺牲一些语言自然度，换来恢复一致性。
+确定性检查点不主动生成新的语义解释，但截取内容仍然可能丢失重要信息。它换来的是生成过程可检查、无需额外模型调用，而不是无损摘要。与 pi 模型摘要机制的比较见[亮点设计与其他 Harness 的异同](15-design-highlights-and-harness-comparison.md)。
 
 ---
 
@@ -572,6 +576,8 @@ GitAgent 接受这部分复杂度，因为它换来的是：**模型看到的内
 | 主代理上下文怎样从事件历史构建 | `gitagent/harness/context/builder.py` |
 | 消息和压缩事件怎样投影 | `gitagent/harness/context/projector.py` |
 | 领域代理怎样构造模型请求和临时注入 | `gitagent/harness/context/state.py` |
-| 上下文预算和分级压缩 | `gitagent/harness/context/budget.py` |
+| 上下文压力阈值 | `gitagent/harness/context/budget.py` |
+| 分级压缩、原子跨度与检查点构造 | `gitagent/harness/context/builder.py` |
+| 模型请求的 token 估算与输出余量 | `gitagent/token_accounting.py`、[第 10 章](10-model-protocol-and-adaptation.md) |
 | 文件阅读覆盖、缺口和 EOF | `gitagent/harness/file_reads.py` |
 | 压缩变化怎样持久化 | `gitagent/infra/persistence/sessions.py`、`event_log.py` |

@@ -1,4 +1,4 @@
-# 09 领域代理与业务工作流：一个用户任务怎样在代理之间交接
+# 09 Domain Agents 与 Workflows：一个用户任务怎样在 agent 之间交接
 
 ## 本章先回答什么
 
@@ -658,3 +658,5 @@ GitAgent 接受这部分复杂度，因为代理拆分真正带来的价值不�
 | 代理循环怎样创建和收束 child context | `gitagent/agent_loop/loop.py` |
 | 不同领域的远端写计划 | `gitagent/harness/mutation_plans.py` |
 | 应用服务怎样处理领域结果和等待恢复 | `gitagent/application/service.py` |
+
+如果继续追问“模型怎样保证返回的就是这些产物”，可以转到[模型协议与适配](10-model-protocol-and-adaptation.md)，区分 Prompt 引导、结构校验和业务状态校验。若要解释这种固定分工与通用编码代理的差别，则沿[亮点设计与其他 Harness 的异同](15-design-highlights-and-harness-comparison.md)继续复述同一修复任务。

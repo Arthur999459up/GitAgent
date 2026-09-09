@@ -547,3 +547,5 @@ GitAgent 只修复能够从已有完整前缀证明的中断痕迹。
 | 业务轮次中断怎样修复 | `gitagent/infra/persistence/sessions.py` |
 | 事件坏尾部怎样处理 | `gitagent/infra/persistence/event_log.py` |
 | 长期记忆失败怎样保留游标 | `gitagent/memory/hooks.py` |
+
+本章的运行时重试还需要与模型客户端的传输重试区分，具体见[模型协议与适配](10-model-protocol-and-adaptation.md)。如果要说明怎样验证这些边界，而不只复述处理逻辑，可以继续阅读[Harness 评测设计](14-evaluation-design.md)中的故障注入、观察范围和判分过程。
