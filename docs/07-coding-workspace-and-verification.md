@@ -1,331 +1,510 @@
-# 07 Coding Workspace 与验证：怎样把模型的修改意图变成可信 CandidatePatch
+# 07 Coding Workspace 与验证：代码候选是怎样一步步构造出来的
 
-前一章已经知道 Execution 怎样安全运行本地工具。本章专门看 GitAgent 的代码修改路径：**Coding Agent 在哪里改文件，候选基于哪个版本，怎样记录“工作树已经变了”，验证怎样和某一版代码绑定，最终 CandidatePatch 又怎样从真实文件状态产生。**
+前一章讲的是 Execution 层怎样安排调用、控制并发并按逻辑顺序提交结果。本章继续往下看 Coding Agent 的 patch 模式，重点回答一件事：**当模型决定修改代码以后，GitAgent 怎样把“我要改代码”逐步变成一份可以检查、可以验证、可以交给上层继续处理的本地候选。**
 
-本章只负责“本地候选是否可信”。候选怎样获得远端发布资格放到第 08 章。
+这一章先讲实现过程，再讨论设计原因。每个关键环节都会先说明“系统具体怎么做”，随后用 STAR 做一次复盘：Situation 说明当时面对的问题，Task 说明这一环节要解决什么，Action 回扣已经介绍过的实现动作，Result 说明最终得到什么效果以及还留下哪些边界。
+
+本章只覆盖本地候选构造和验证。候选怎样进入远端 Mutation Plan、怎样经过审批并最终影响 GitHub，放在第 08 章讨论。
 
 ---
 
-## 1. 先看代码候选的完整生命周期
+## 1. 先建立整体认识：这个模块到底由哪些部分组成
+
+进入细节前，先把整条 patch 链路看完整。Coding Agent 在 patch 模式下会维护一块临时 Git 工作区，并围绕这块工作区不断执行“读取 → 修改 → 验证 → 再修改”的循环。等当前状态可以收束时，Harness 再从真实 Git 工作树中生成 `CandidatePatch` 和 `VerificationReport`。
 
 ```mermaid
 flowchart LR
-    CR[ChangeRequest] --> SHA[确定 source SHA]
-    SHA --> WS[创建 detached worktree]
-    WS --> READ[读取代码]
-    READ --> EDIT[编辑真实文件]
-    EDIT --> REV[workspace revision +1]
-    REV --> CHECK[测试 / lint / build]
-    CHECK --> VR[VerificationReport 绑定 revision]
-    VR --> GATE{当前 revision 已真实验证?}
-    GATE -->|否| READ
-    GATE -->|是| SNAP[从工作树快照 CandidatePatch]
-    SNAP --> OUT[候选 + 验证返回 Domain Agent]
-    OUT --> CLEAN[清理临时 worktree]
+    A[ChangeRequest] --> B[确定 source_ref]
+    B --> C[创建 CodingWorkspace]
+    C --> D[读取与定位代码]
+    D --> E[修改真实文件]
+    E --> F[workspace revision 推进]
+    F --> G[运行真实验证]
+    G --> H{还需要继续修改?}
+    H -->|需要| D
+    H -->|可以收束| I[读取最终 worktree snapshot]
+    I --> J[确定性检查]
+    J --> K[VerificationReport]
+    I --> L[CandidatePatch]
+    K --> N[清理临时 worktree]
+    L --> N
+    N --> M[返回 Domain Agent]
 ```
 
-这条链最重要的是两个绑定：
+这条链路里有三个状态最值得先记住。
 
-1. **候选绑定 source SHA**：说明模型是在什么代码版本上工作的；
-2. **验证绑定 workspace revision**：说明哪一版修改真正跑过检查。
+| 状态 | 放在哪里 | 它回答的问题 |
+|---|---|---|
+| `source_ref` | `ChangeRequest` 与 `CodingWorkspace` | 这次修改从哪个精确 Git commit 开始 |
+| `revision` | `CodingWorkspace` | 当前工作树在本次任务里经历了第几轮真实变化 |
+| 验证事件 | `AgentContext.observations` | 哪条真实验证命令针对哪个 revision 执行，结果怎样 |
 
----
-
-## 2. ChangeRequest 先固定“改什么”和“基于什么”
-
-领域 Agent 在让 Coding Agent 进入 patch 模式前，会形成结构化 `ChangeRequest`。
-
-它不是一段随意 Prompt，而是给修改建立最基本的业务边界：
-
-- 用户目标是什么；
-- 目标仓库是什么；
-- 当前任务来自 Repository、Issue 还是 PR；
-- 候选应该基于哪个精确 source SHA；
-- 必要时还携带实体编号、分支等上下文。
-
-如果只有 branch 名而没有精确 SHA，同一个“main”在任务执行期间可能已经指向另一份代码。绑定 SHA 后，后面可以明确说“这份 CandidatePatch 是基于哪一个不可变版本产生的”。
+还要先澄清一个容易混淆的数据边界：`CandidatePatch` 当前包含新增、修改、删除文件，patch 文本和最终文件内容等候选事实；`source_ref` 留在 `ChangeRequest/CodingWorkspace` 这条任务链里，`CandidatePatch` 数据结构本身没有单独的 SHA 字段。理解这一点以后，后面就不会把“候选内容”和“候选来源版本”混成一个对象。
 
 ---
 
-## 3. Coding Workspace 怎样创建
+## 2. 第一步：先把修改的起点固定下来
 
-进入 patch 模式后，Coding Workspace 会在受管理目录中为当前任务准备一个临时 Git worktree。
+### 2.1 系统具体怎么做
 
-实现上会先准备本地仓库缓存/镜像，再基于目标 source SHA 创建 detached worktree。不同任务可以共享只读缓存基础，但每次修改使用自己的工作树目录。
+Domain Agent 要调用 Coding Agent 进行 patch 时，会准备一个结构化 `ChangeRequest`。这个对象至少描述目标仓库和修改目标，还可以携带目标分支、Issue 编号、建议标题、已知目标文件等信息。
+
+真正影响 Coding Workspace 基线的是 `source_ref`。
+
+如果上层已经知道精确 commit SHA，就直接把它放进 `ChangeRequest.source_ref`。如果上层没有提供，Coding Agent 初始化 patch workspace 时会读取仓库默认分支，并把当时解析到的默认分支 commit SHA 写回 `ChangeRequest`。从这一刻开始，本次任务使用这个 SHA 作为固定基线。
+
+随后 `CodingWorkspace` 会再次检查 `source_ref` 的格式，只接受精确 commit SHA。工作区创建完成以后，还会执行一次 HEAD 解析，确认临时 worktree 的 HEAD 与预期 SHA 完全一致。
 
 ```mermaid
 flowchart TD
-    R[目标仓库 + source SHA] --> C[受管理 repository cache]
-    C --> L[获取相应资源 claim]
-    L --> W[git worktree add --detach]
-    W --> S[确认 HEAD == source SHA]
-    S --> READY[Workspace ready]
+    A[Domain Agent 准备 ChangeRequest] --> B{已有精确 source_ref?}
+    B -->|有| C[直接使用 commit SHA]
+    B -->|没有| D[读取默认分支当前 commit SHA]
+    D --> C
+    C --> E[CodingWorkspace 校验 SHA]
+    E --> F[创建 worktree]
+    F --> G[再次确认 HEAD == source_ref]
 ```
 
-“detached”意味着候选不直接依赖某个本地可移动分支名。创建完成后还会核对工作树 HEAD 是否正是预期 source SHA。
+因此，这一阶段完成以后，系统已经得到一个明确答案：**本次代码修改从哪个不可变 Git commit 开始。**
+
+### 2.2 STAR 复盘
+
+**S — Situation**：分支名会移动。任务开始时的 `main` 和几分钟后的 `main` 可能已经指向不同 commit，如果整个流程只记分支名，后面很难判断模型究竟基于哪份代码完成修改。
+
+**T — Task**：给一次 patch 任务确定稳定、可核对的代码起点，让后续工作树创建、差异计算和远端发布准备都能围绕同一个版本展开。
+
+**A — Action**：`ChangeRequest` 保存精确 `source_ref`；缺失时先解析默认分支当前 SHA；`CodingWorkspace` 只接收精确 SHA；worktree 建好后再核对实际 HEAD。
+
+**R — Result**：任务的基线从“一个会移动的名字”变成“一个固定 commit”。后面即使远端分支继续前进，本地候选仍然知道自己从哪份代码出发。
 
 ---
 
-## 4. 为什么共享 cache 还需要资源协调
+## 3. 第二步：基于这个 commit 创建独立 Coding Workspace
 
-多个并行任务可能针对同一个远端仓库。每个任务拥有独立 worktree，但它们可能共同依赖同一个本地缓存仓库。
+### 3.1 系统具体怎么做
 
-缓存准备、fetch 或 worktree 管理并不是完全无冲突的。所以 Workspace 会向 Execution 层声明相应资源，避免两个任务在不安全的位置同时改共享 Git 元数据。
+`CodingWorkspace` 没有直接在 GitAgent 项目目录里修改目标仓库。它使用两个受管理区域：一个区域保存目标仓库的本地 repository cache，另一个区域保存每次 patch 任务自己的临时 worktree。
 
-这说明“有独立目录”不等于“所有 Git 操作天然并发安全”。目录隔离和资源协调解决的是两层问题。
+创建流程可以分成四步。
+
+第一步，检查目标仓库的本地 cache 是否存在。没有 cache 时，系统会先 clone 一份不 checkout 工作树的本地仓库副本。
+
+第二步，检查 `source_ref` 对应 commit 是否已经存在于 cache。缺少时先 fetch 远端引用，再尝试针对这个精确 SHA 获取对象。如果最终仍然找不到该 commit，workspace 创建直接失败，系统不会偷偷换用另一个 commit 继续。
+
+第三步，为当前任务创建独立 worktree。创建时使用 detached HEAD，并明确指定 `source_ref`。
+
+第四步，在新 worktree 中读取 HEAD，确认它与 `source_ref` 完全一致。只有这一步通过，workspace 才进入 prepared 状态。
+
+```mermaid
+flowchart TD
+    A[repository + source_ref] --> B[取得 repository cache 资源]
+    B --> C{本地 cache 已存在?}
+    C -->|否| D[clone --no-checkout]
+    C -->|是| E[检查 source_ref commit]
+    D --> E
+    E -->|缺少 commit| F[fetch 远端对象]
+    F --> G{现在能找到 source_ref?}
+    E -->|已有 commit| H[创建 detached worktree]
+    G -->|否| X[创建失败]
+    G -->|是| H
+    H --> I[核对 worktree HEAD]
+    I --> J[Workspace ready]
+```
+
+这里的 repository cache 可以被针对同一仓库的多个任务复用，但具体编辑目录属于当前任务。于是“共享 Git 对象”和“独立修改现场”被拆成两层。
+
+### 3.2 repository cache 为什么还要加资源协调
+
+cache 中不仅有 Git 对象，还包含 worktree 管理相关的 Git 元数据。创建、fetch、remove、prune 等操作可能同时触碰这些共享状态。
+
+所以 `CodingWorkspace` 在准备和清理期间，会向 Execution Coordinator 申请一个仓库级写资源，资源键形如 `repository-cache:<repo>`。同一仓库上会改动 cache 元数据的操作需要依次进入，等前一个释放以后后一个再继续。
+
+每个任务拥有独立目录，可以隔离文件内容；资源 claim 进一步保护共享 Git 元数据。两个机制负责不同层次的问题。
+
+### 3.3 STAR 复盘
+
+**S — Situation**：Coding Agent 可能同时处理多个仓库任务。同一仓库如果每次都完整 clone，会重复下载大量 Git 对象；多个任务直接共用同一个可写工作目录，又容易互相污染。
+
+**T — Task**：既复用昂贵的仓库数据，又给每次 patch 提供独立修改现场，同时控制共享 Git 元数据上的并发冲突。
+
+**A — Action**：系统复用 repository cache，为每个任务创建 detached worktree，并在 cache 准备和清理时使用仓库级 `ResourceClaims` 做协调。
+
+**R — Result**：大部分 Git 对象可以复用，每个 patch 仍然有自己的文件工作区；同仓库的关键 Git 管理动作会被串行保护。代价是 Harness 需要维护 cache、worktree 和资源生命周期。
 
 ---
 
-## 5. 模型看到的是逻辑 workspace，不是任意路径参数
+## 4. 第三步：把 Coding Agent 的工具绑定到当前 workspace
 
-Coding Agent 不应该通过工具参数自行声明“这次去另一个目录执行”。当前 invocation context 已经绑定本次 Coding Workspace。
+### 4.1 系统具体怎么做
 
-Native Provider 在处理文件写、edit 和 bash 时，会从当前 invocation context 取得工作区根目录。路径还要经过规范化和边界检查，防止通过 `..`、绝对路径或符号链接把目标跳到受管理根之外。
+worktree 创建好以后，Harness 在构造 `InvocationContext` 时，会把当前 `CodingWorkspace.root` 放进 `workspace_root`。Native Provider 后续执行 read、glob、grep、write、edit、delete、bash 等能力时，都能从 invocation context 取得当前任务的工作区根目录。
+
+模型调用文件工具时只提供工作区内的相对路径。Provider 会检查路径是否为绝对路径、是否包含 `..`，随后进行路径解析，再确认解析结果仍然位于当前 workspace 内。这样即使路径中涉及符号链接，最终真实位置仍要经过根目录边界检查。
 
 ```mermaid
 flowchart LR
-    C[InvocationContext] --> W[当前 workspace root]
-    A[模型给相对路径] --> N[规范化]
-    N --> B{仍在 workspace 内?}
-    B -->|否| R[拒绝]
-    B -->|是| F[真实文件操作]
-    W --> B
+    A[CodingWorkspace.root] --> B[InvocationContext.workspace_root]
+    C[模型给出相对路径] --> D[Provider 规范化与解析]
+    B --> E{解析后仍位于 workspace 内?}
+    D --> E
+    E -->|否| F[拒绝访问]
+    E -->|是| G[读取或修改真实文件]
 ```
 
-这让“工作区是谁的”由 Harness 决定，而不是由模型每次调用时重申。
+这使 workspace 的归属由 Harness 决定。模型只负责表达“我要操作这个工作区里的哪个相对路径”，不需要在每次工具调用里重新声明任意工作目录。
+
+### 4.2 Bash 的工作目录怎样确定
+
+`native.bash` 同样从 `InvocationContext.workspace_root` 取得 cwd。验证命令因此会在当前 Coding Workspace 中启动，并且只保留一组受限环境变量。
+
+Bash 还有单独的命令策略。Coding profile 会放行经过识别的观察命令和真实验证命令，对 shell chaining、重定向、pipe、subshell 等语法采用更严格的处理。Coding patch 场景里，如果 Bash policy 给出需要额外批准的结果，当前实现会直接拒绝这类命令，避免 patch 阶段绕过既定执行边界。
+
+### 4.3 这套路径边界能保证到什么程度
+
+文件能力可以严格检查最终路径是否仍落在 workspace 根目录下。Bash 的保证范围更窄：Harness 能控制命令分类、启动 cwd 和传入环境，但当前实现没有提供容器、namespace、seccomp 一类操作系统级隔离。
+
+因此，Coding Workspace 适合称为**受管理的 Git 候选工作区**。它能够约束 GitAgent 自己的文件工具并管理工作目录，仍需把 Bash 子进程看作本机进程来理解其安全边界。
+
+### 4.4 STAR 复盘
+
+**S — Situation**：如果模型可以自由指定任意绝对路径或任意 cwd，一次 patch 很容易写到任务目录之外；符号链接还可能让看起来正常的相对路径最终跳出目标仓库。
+
+**T — Task**：让每次文件操作都自动落在当前 patch 的逻辑工作区里，并在 Provider 层统一执行路径边界检查。
+
+**A — Action**：Harness 把 workspace root 注入 `InvocationContext`；Provider 只接受受约束的相对路径并检查解析后的真实位置；Bash 固定从当前 workspace 启动，并经过 coding Bash policy 分类。
+
+**R — Result**：模型调用更简单，工作区边界也由运行时集中管理。文件工具拥有明确的目录约束；Bash 仍保留操作系统进程层面的能力边界，这一点需要单独记住。
 
 ---
 
-## 6. 路径检查解决什么，不能解决什么
+## 5. 第四步：每次真实变化怎样推进 workspace revision
 
-路径边界可以阻止文件工具直接访问工作区外的路径，也会检查符号链接解析后的真实位置仍然落在允许根目录。
+### 5.1 revision 表示什么
 
-但它不能提供操作系统级安全隔离。
+`CodingWorkspace` 创建时 `revision = 0`。它不表示 Git commit 数量，也不要求每次修改都生成新的 commit。它表示**本次临时工作区在运行时记录中经历了多少轮真实内容变化**。
 
-尤其是 Bash：一个被允许执行的测试进程从受管理工作目录启动，不代表这个子进程在内核层被禁止访问其他路径或网络。当前实现没有因为使用 worktree 和路径校验就自动获得容器、namespace、seccomp 一类 sandbox 保证。
+只要当前候选内容真的发生变化，revision 就会向前推进。这样 Harness 可以区分“验证的是刚才那一版”还是“验证以后代码又变了”。
 
-因此文档只把它称为**受管理的候选工作区**，不会把它夸大成完整安全沙箱。
+### 5.2 write、edit、delete 怎样判断有没有真实变化
 
----
+Native Provider 在执行文件修改后会返回 `changed` 信息。
 
-## 7. 文件修改怎样推进 workspace revision
+`write` 会比较写入前后的文本；内容相同则 `changed=false`。`edit` 会比较替换前后的完整文本；新旧内容相同也不会产生真实变化。`delete` 成功删除普通文件后会报告变化。
 
-Coding Workspace 维护一个 revision 计数。它表示“当前候选内容经历过多少次已经提交到逻辑状态的真实变更”。
-
-关键点是：并不是模型调用了 write/edit 就一定推进 revision。
-
-Provider 会报告这次操作是否实际改变文件；Execution Commit 阶段根据真实结果决定是否记录 mutation。
-
-例如把一个文件替换成和原内容完全相同的内容，`changed = false`，不应该让系统误以为出现了新代码版本。
+Execution 把能力结果 Commit 到 `AgentContext` 时，会先处理读取状态：成功的 WRITE/DESTRUCTIVE 能力会清空旧 `read_cache` 和文件读取记录，避免后续继续复用修改前的读取结果。随后，如果这次调用属于当前 Coding Workspace 的文件写入/破坏能力，并且结果里的 `changed` 为真，才调用 `workspace.record_mutation()` 让 revision 加一。
 
 ```mermaid
 flowchart TD
-    E[edit/write/delete 物理结果] --> C{changed?}
-    C -->|否| K[revision 保持不变]
-    C -->|是| R[commit 时 revision +1]
+    A[文件修改工具执行成功] --> B[清空旧 read cache / file read 状态]
+    A --> C[Provider 返回 changed]
+    C --> D{changed == true?}
+    D -->|否| E[revision 保持]
+    D -->|是| F[Commit 阶段 record_mutation]
+    F --> G[revision + 1]
 ```
 
-revision 在 Commit 阶段推进，也保证了并发物理完成顺序不会破坏逻辑修改顺序。
+这里把“工具调用成功”“读取缓存需要失效”“候选真的变了”分成三个概念。一次无效果写入会让旧读取缓存失效，但不会制造新的 workspace revision。
+
+### 5.3 Bash 如果改了文件怎么办
+
+真实项目命令也可能产生文件变化。例如某些测试会更新快照，某些格式化或构建命令会生成 Git 可见文件。
+
+为覆盖这种情况，执行 `native.bash` 前，`AgentContext` 会先让 workspace 捕获一份 Git 可见状态；命令结束后再次捕获。如果两份状态不同，Harness 会把它当成一次真实 mutation，revision 同样加一，并清理旧读取缓存。
+
+```mermaid
+flowchart LR
+    A[Bash 前 worktree_state] --> B[运行命令]
+    B --> C[Bash 后 worktree_state]
+    A --> D{前后状态一致?}
+    C --> D
+    D -->|一致| E[revision 不变]
+    D -->|不同| F[revision + 1]
+```
+
+这个细节很重要，因为“代码变化”并不只来自 write/edit/delete 三个文件工具。Harness 关心的是最终 Git 工作树是否发生真实变化。
+
+### 5.4 STAR 复盘
+
+**S — Situation**：验证结果只有和某一版候选绑定才有意义。仅仅记录“模型执行过三次 edit”无法判断文件是否真的发生变化；Bash 还可能在模型没有显式调用文件工具时改变工作树。
+
+**T — Task**：建立一个简单的候选版本标记，让每轮真实变化都能使后续验证证据失效或重新建立。
+
+**A — Action**：文件工具通过 `changed` 报告真实变化；Commit 阶段推进 revision；Bash 通过执行前后 `worktree_state` 对比检测额外副作用；发生变化时同步清理旧读取状态。
+
+**R — Result**：revision 与工作树真实变化保持联系。系统可以用一个轻量整数追踪“当前候选已经走到哪一版”，无需为每轮编辑都创建 Git commit。
 
 ---
 
-## 8. 为什么验证也要绑定 revision
+## 6. 第五步：验证怎样和当前 revision 建立联系
 
-假设模型：
+### 6.1 先判断一条 Bash 命令算不算真实验证
 
-1. 修改代码；
-2. 跑测试，测试通过；
-3. 又修改代码；
-4. 直接说“完成”。
+Coding Agent 可以运行 Bash，但并非所有成功退出的命令都具有验证价值。Harness 会通过 `BashCommandPolicy.is_real_verification()` 对命令进行分类。
 
-如果系统只保存一个 `tests_passed = true`，第三步之后仍然会保留旧绿色标志，看起来新代码也通过了测试。
+当前 coding profile 能识别的典型验证包括 Python 测试、类型检查、Ruff check、Python 编译检查，Node 包管理器中的 test/lint/typecheck/check/build 脚本，以及 Cargo、Go 中常见的 test/check/build/vet/clippy 等命令。版本查询、帮助信息和普通观察命令不会被当成真实验证。
 
-GitAgent 的 VerificationReport 会绑定运行验证时的 workspace revision。
+所以 `echo ok` 即使 exit code 为 0，也不能给候选增加“已经验证”的证据。
+
+### 6.2 一次真实验证执行后记录什么
+
+当命令被识别为真实验证时，Commit 阶段会把结果写入 `AgentContext.observations`，事件类型为 `coding_verification`。
+
+对于正常启动并执行完的验证命令，事件会记录当前 `revision`、命令文本、exit code、stdout 尾部和 stderr 尾部。同时 workspace 会把 `last_validated_revision` 更新为当前 revision。
+
+如果验证命令本身没有成功执行，例如运行环境缺少工具，系统仍然会记录当前 revision 和 `unavailable_reason`，让“验证无法执行”成为显式事实。
+
+```mermaid
+flowchart TD
+    A[Bash command] --> B{属于 real verification?}
+    B -->|否| C[普通 Bash 结果]
+    B -->|是| D[执行命令]
+    D --> E{命令工具能正常执行?}
+    E -->|能| F[记录 revision + exit_code + 输出摘要]
+    F --> G[last_validated_revision = current revision]
+    E -->|不能| H[记录 revision + unavailable_reason]
+```
+
+### 6.3 “有验证覆盖”和“验证通过”要分开理解
+
+这是整个模块最关键的概念之一。
+
+| 概念 | 判断依据 | 含义 |
+|---|---|---|
+| 当前 revision 有验证事件 | observations 中存在相同 revision 的 `coding_verification` | 系统知道针对当前候选尝试过哪项真实验证 |
+| 当前 revision 被正常验证命令覆盖 | `last_validated_revision == revision` | 至少有一条真实验证命令完成了执行过程 |
+| 某项检查 PASS | 对应验证 exit code 为 0，或确定性检查成功 | 这项具体检查通过 |
+| `VerificationReport.passed` | 最终 checks 中没有 FAIL | 这份候选的汇总验证结论通过 |
+
+例如测试命令正常运行后返回 exit code 1，系统仍然知道“revision=3 跑过这条真实测试”；随后生成的 `VerificationCheck` 会标记为 FAIL，`VerificationReport.passed` 也会变成 false。
+
+如果验证工具根本无法启动，事件里会保存 unavailable reason。这样上层看到的是明确失败原因，不会把“缺少验证环境”误解成“测试通过”。
+
+### 6.4 后续修改会怎样影响旧验证
+
+假设 revision=2 时测试通过，然后模型又修改了文件，revision 变为 3。旧事件仍然保留，因为它有审计价值；finalization 在判断当前候选时只把 revision=3 的事件当成当前证据。
 
 ```mermaid
 stateDiagram-v2
-    [*] --> R1: 第一次修改
-    R1 --> V1: 测试通过并记录 revision=1
-    V1 --> R2: 第二次修改，revision=2
-    R2 --> R2: V1 不再覆盖当前代码
-    R2 --> V2: 重新真实验证 revision=2
+    [*] --> R0: workspace 创建
+    R0 --> R1: 第一次真实修改
+    R1 --> V1: revision=1 运行测试
+    V1 --> R2: 再次真实修改
+    R2 --> V2: revision=2 重新验证
+    V2 --> Final: 收束当前候选
 ```
 
-因此“通过过测试”和“当前候选通过测试”是两个不同结论。
+因此，旧验证不会随着后续编辑自动“迁移”到新候选上。
+
+### 6.5 STAR 复盘
+
+**S — Situation**：模型很可能在“测试通过”以后继续修改代码。如果系统只保存一个全局 `tests_passed=true`，后续修改会继续继承旧绿灯，验证证据就会失真。
+
+**T — Task**：让每一条真实验证都能回答“它验证的是哪一版工作树”，同时保留失败和验证不可用的信息。
+
+**A — Action**：Harness 先分类真实验证命令，再把验证事件与当前 revision 一起记录；正常执行时更新 `last_validated_revision`；后续 mutation 推进 revision；finalization 只接受当前 revision 的验证事件作为当前证据。
+
+**R — Result**：验证从一个模糊的任务级布尔值变成带版本语义的运行证据。测试失败仍然可以被完整记录，上层可以据此阻止后续发布。
 
 ---
 
-## 9. 什么才算真实验证
+## 7. 第六步：什么时候可以把工作树收束成 CandidatePatch
 
-Coding patch 需要的不是任意 shell 成功，而是能反映项目行为的验证。
+### 7.1 finish 调用先经过哪些检查
 
-常见真实检查包括：
+模型认为 patch 已经处理完时，需要单独调用运行时 finish 工具。这个 finish 调用不能和其他结构化调用混在同一条响应里。
 
-- 项目测试；
-- lint；
-- type check；
-- build；
-- 项目定义的验证脚本。
+Runtime 收到 finish 后，会先读取当前 workspace snapshot。没有任何真实 changed files 时直接拒绝收束。
 
-Bash command policy 会判断命令是否属于允许的验证形式。单纯 `echo ok`、查看版本号或纯只读命令不能冒充代码验证。
+接着 Runtime 查找当前 revision 的 `coding_verification` 事件。当前 revision 连一条验证事件都没有时，同样拒绝收束。对于已经正常执行的验证命令，还会检查 `last_validated_revision` 是否等于当前 revision。
 
-此外 Harness 会记录每项 VerificationCheck 的命令、结果和必要摘要，让上层知道候选经过了什么，而不是只收到一个模糊的“已验证”。
-
----
-
-## 10. Deterministic Code Checks 在哪里发挥作用
-
-真实项目命令由模型选择并执行，但 Harness 还可以执行确定性的代码检查，对候选是否满足基本结构要求做补充判断。
-
-模型判断和确定性检查的角色不同：
-
-- 模型适合选择与当前改动相关的测试，并理解输出；
-- 确定性检查适合验证明确机器规则。
-
-最终 VerificationReport 可以汇总这些证据，但不会因为模型说“应该没问题”就生成成功检查。
-
----
-
-## 11. CandidatePatch 为什么从真实工作树生成
-
-Coding Agent 最终不能自己填写一份“我改了 A 和 B”的 CandidatePatch 作为权威。
-
-Workspace 会读取 Git 工作树当前状态，比较 source SHA，计算真正的 changed files、文件内容和相关差异，再形成 CandidatePatch。
-
-```mermaid
-flowchart LR
-    W[真实 worktree] --> S[git status / diff / 文件快照]
-    S --> P[CandidatePatch]
-    P --> F[changed_files]
-    P --> B[source SHA / before-after 事实]
-```
-
-这样候选对象描述的是文件系统事实，而不是模型自述。
-
-如果模型声称改了三个文件，但实际只变了两个，CandidatePatch 以真实工作树为准。
-
----
-
-## 12. patch 最终提交前有哪些门槛
-
-Coding Agent 想结束 patch 任务时，会检查当前状态是否满足候选要求。核心逻辑可以理解为：
-
-1. Workspace 已准备，且基于正确 source SHA；
-2. 实际存在用户要求的有效修改；
-3. CandidatePatch 能从真实工作树构造；
-4. 当前 workspace revision 有真实 VerificationReport 覆盖；
-5. 必要结构化结果完整。
-
-如果当前 revision 未验证，Agent 不能靠一段自然语言直接跳过。它需要继续执行验证，或明确返回不能完成的状态。
-
----
-
-## 13. 候选形成后为什么可以清理 worktree
-
-上层 Domain Agent 后续真正需要的是稳定 CandidatePatch、VerificationReport、source SHA 和业务上下文，而不是一直保留某个临时目录。
-
-因此 patch 完成后，Coding Workspace 可以清理 worktree。远端发布阶段使用候选对象中的确定内容重新执行对应能力。
-
-这降低了长 Session 累积临时目录和本地分支状态的风险。
-
-当然，如果任务中途失败，清理逻辑也要尽量收束未完成 workspace。持久恢复并不是试图让一个临时 worktree 永久存在；第 09 章会说明受支持的恢复边界。
-
----
-
-## 14. Repository、Issue、PR 为什么共享同一候选构造方式
-
-三个领域的发布语义不同，但“如何证明这份代码候选是基于某个版本真实产生、且当前 revision 被验证”是同一个技术问题。
-
-所以它们都把 patch 交给 Coding Agent / Coding Workspace，拿回相同类型的 CandidatePatch 和 VerificationReport。
+如果当前 revision 记录的是验证工具不可用，Runtime 会保留这项失败事实，并允许继续生成验证报告。这样候选可以带着明确的失败状态返回上层，由上层决定后续流程。
 
 ```mermaid
 flowchart TD
-    R[Repository Change] --> C[Coding Workspace]
-    I[Issue Fix] --> C
-    P[PR Fix] --> C
-    C --> V[CandidatePatch + VerificationReport]
-    V --> RP[Repository 发布语义]
-    V --> IP[Issue 发布语义]
-    V --> PP[PR 发布语义]
+    A[runtime finish] --> B[读取 workspace snapshot]
+    B --> C{存在真实 changed files?}
+    C -->|否| X[拒绝 finish]
+    C -->|是| D{当前 revision 有验证事件?}
+    D -->|否| X
+    D -->|是| E{验证命令正常执行过或已记录 unavailable?}
+    E -->|否| X
+    E -->|是| F[构造 checks 与候选]
 ```
 
-这让“候选正确性”和“发布业务规则”解耦：本章只处理前者，第 08 章处理后者。
+这里的 finish 门槛负责确认“当前候选有真实变化，并且当前 revision 的验证状态已经被记录”。所有检查是否 PASS 会在 `VerificationReport` 中继续表达。
+
+### 7.2 CandidatePatch 怎样从真实 worktree 生成
+
+Workspace 的 `snapshot()` 直接读取 Git 工作树状态。它会分别找出 tracked changes 和 untracked files，再整理出新增、修改、删除文件集合。
+
+对于新增和修改文件，snapshot 还会读取最终文本内容；对于 tracked change，会生成相对 HEAD 的 Git diff；对于 untracked 新文件，会补充对应的新增文件 diff。最后形成完整的 changed files 和 patch 文本。
+
+```mermaid
+flowchart LR
+    A[最终 worktree] --> B[tracked name-status]
+    A --> C[untracked files]
+    A --> D[git diff HEAD]
+    B --> E[added / modified / deleted]
+    C --> E
+    E --> F[changed_files]
+    D --> G[patch]
+    E --> H[读取新增/修改文件最终内容]
+    F --> I[CandidatePatch]
+    G --> I
+    H --> I
+```
+
+`CandidatePatch` 因此描述的是当前文件系统和 Git diff 的事实。模型之前说自己改了哪些文件，只能作为意图；最终 changed files 由 snapshot 重新计算。
+
+### 7.3 确定性检查在这个时候加入
+
+finalization 还会对 snapshot 中新增和修改后的文件内容执行 `deterministic_code_checks()`。
+
+当前检查覆盖 Python 语法、JSON/TOML/YAML 解析、未解决的 Git 冲突标记，以及尾随空格、Python tab 缩进、超长行等文本卫生问题。
+
+这些检查不会替代项目测试。它们提供一组机器可以稳定判断的基础规则：语法或配置解析错误会形成 FAIL，文本卫生问题通常形成 WARN。
+
+### 7.4 VerificationReport 怎样汇总
+
+Runtime 会把所有记录过的真实验证事件转换成 `VerificationCheck`。当前 revision 的非零 exit code 会成为 FAIL；旧 revision 上已经被后续修改淘汰的失败会降为 WARN，并在 details 中说明已经被后续编辑覆盖。随后再追加确定性检查结果。
+
+`VerificationReport.passed` 的规则很直接：最终 checks 中只要还有 FAIL，passed 就是 false。
+
+这意味着 Coding Workspace 可以整理出一份带失败验证的 CandidatePatch 和 VerificationReport；Domain Agent 收到后会继续执行更高层门槛。例如 Repository、Issue、PR 的 patch 流程都要求 `verification.passed` 为 true 才继续排队远端变更。
+
+这一层分工很重要：Coding Workspace 负责**如实形成候选和验证报告**，Domain Agent 负责**判断这份报告是否足够进入具体业务发布流程**。
+
+### 7.5 finalization 结束时还会做什么
+
+候选和报告构造完成以后，Runtime 会把 snapshot 计算出的 changed files 写回 `ChangeRequest.target_files`，让上层看到最终实际影响范围。
+
+随后临时 worktree 会被 cleanup；`context.coding_workspace` 被清空，`context.code_candidate` 保存 `CandidatePatch`，`context.verification` 保存 `VerificationReport`，并把 coding task 标记为完成。
+
+因此，Coding Agent 完成 patch 后，上层继续依赖的是稳定的领域对象和验证结果，不需要长期持有那块临时目录。
+
+### 7.6 STAR 复盘
+
+**S — Situation**：模型的自然语言总结可能漏文件，也可能把已经失败的测试说成成功。如果最终候选继续依赖模型自述，上层难以得到可靠输入。
+
+**T — Task**：在 patch 收束时，从机器可观察事实重新构造候选，并把真实验证、失败原因和确定性检查统一整理成结构化报告。
+
+**A — Action**：finish 先检查 changed files 和当前 revision 验证事件；snapshot 从 Git 工作树计算文件变化和 patch；确定性检查补充语法与配置证据；Runtime 生成 `CandidatePatch`、`VerificationReport`，写回实际 target files，然后清理 worktree。
+
+**R — Result**：Domain Agent 接收到的是一份由真实文件状态生成的候选，以及一份明确表达 PASS、FAIL、WARN、skipped/不可用信息的验证报告。后续业务层可以基于结构化事实决定是否进入远端变更阶段。
 
 ---
 
-## 15. 一次实际 patch 的状态变化
+## 8. 把 revision 和验证放在一起看：真正的状态机是什么样
 
-假设用户要求把缓存过期判断修正并补测试。
+理解这个模块时，可以把 `source_ref` 当成横向不变的起点，把 `revision` 当成任务内部不断向前走的版本号。
 
-**准备阶段**：Repository Agent 形成 ChangeRequest，固定 source SHA。Coding Workspace 基于该 SHA 创建 detached worktree。
+```mermaid
+flowchart TD
+    S[source_ref 固定基线] --> R0[revision 0]
+    R0 -->|真实修改| R1[revision 1]
+    R1 -->|测试通过| V1[验证事件 revision 1 / PASS]
+    V1 -->|再次修改| R2[revision 2]
+    R2 -->|测试失败| F2[验证事件 revision 2 / FAIL]
+    F2 -->|继续修复| R3[revision 3]
+    R3 -->|测试通过| V3[验证事件 revision 3 / PASS]
+    V3 --> Z[final snapshot + deterministic checks]
+    Z --> P[CandidatePatch + VerificationReport]
+```
 
-**读取阶段**：Coding Agent 定位实现和测试，读取必要范围。此时 revision 仍为 0。
+这里有一条很实用的判断方法：
 
-**第一次修改**：edit 改实现，物理结果 `changed=true`；Commit 后 revision 变为 1。
+> `source_ref` 回答“从哪一版仓库开始”，`revision` 回答“这次临时工作区现在走到哪一版”，验证事件回答“哪一版执行了什么检查、结果怎样”。
 
-**第二次修改**：write/edit 补测试；Commit 后 revision 变为 2。
-
-**第一次验证**：运行目标测试，失败。VerificationReport 记录 revision=2 的失败检查。Agent 继续。
-
-**第三次修改**：修正实现，revision 变为 3。之前 revision=2 的任何验证都不能覆盖新候选。
-
-**第二次验证**：测试和 lint 在 revision=3 通过。
-
-**候选收束**：Workspace 从真实文件系统构造 CandidatePatch，确认 changed files 与 source SHA；VerificationReport 覆盖 revision=3。Coding Agent 可以完成。
-
-这个例子最值得记住的是：**测试不是“任务属性”，而是某一版工作树的证据。**
+只要把这三个问题分开，Coding Workspace 的设计就会清晰很多。
 
 ---
 
-## 16. STAR 复盘：为什么先构造本地候选，再考虑远端写入
+## 9. 用一次完整 patch 串起所有步骤
+
+假设用户要求修复缓存过期判断，并补上对应测试。
+
+| 阶段 | Workspace 状态 | Harness 做的事情 | 此时能得出的结论 |
+|---|---|---|---|
+| 1. 准备请求 | 尚未创建 | `ChangeRequest` 确定仓库、描述、source_ref | 修改起点已经固定 |
+| 2. 创建 workspace | revision=0 | 准备 cache，创建 detached worktree，核对 HEAD | 有一块基于精确 commit 的临时工作区 |
+| 3. 读取代码 | revision=0 | read/grep/glob 都绑定当前 workspace | 已找到需要修改的位置 |
+| 4. 修改实现 | revision=1 | edit 真实改变文件，Commit 推进 revision | 候选出现第一轮变化 |
+| 5. 补测试 | revision=2 | 再次真实修改 | 当前候选已经走到 revision 2 |
+| 6. 跑目标测试 | revision=2 | 记录真实验证事件，exit code 非零 | revision 2 的验证失败 |
+| 7. 修复实现 | revision=3 | 新 mutation 使旧验证退出当前证据范围 | 需要针对 revision 3 重新验证 |
+| 8. 再跑测试和 lint | revision=3 | 记录新的验证事件 | 如果检查全通过，report 可以得到 passed=true |
+| 9. finish | revision=3 | snapshot、确定性检查、生成候选与报告 | 得到真实 CandidatePatch 和 VerificationReport |
+| 10. 返回上层 | workspace 已清理 | Domain Agent 接收结构化结果 | 可以继续判断是否进入远端变更流程 |
+
+这个例子中最值得记住的地方是：**验证描述的是某个候选版本的证据，它会随着真实修改的出现而需要重新建立。**
+
+---
+
+## 10. 这个模块实际提供了哪些保证
+
+前面已经把实现走完，现在可以把设计能力边界集中整理一下。
+
+| 能力 | 当前实现怎样保证 | 边界 |
+|---|---|---|
+| 固定修改基线 | `ChangeRequest.source_ref` + worktree HEAD 校验 | SHA 保存在任务上下文链路中，CandidatePatch 本体没有 SHA 字段 |
+| 隔离每次修改现场 | 每个任务独立 detached worktree | repository cache 仍属于共享 Git 状态，需要资源 claim |
+| 限制文件工具路径 | InvocationContext 绑定 root，Provider 做相对路径与 resolve 检查 | Bash 子进程没有 OS 级 sandbox |
+| 识别真实候选变化 | 文件工具 `changed` + Bash 前后 worktree_state 对比 | revision 是运行时计数，并非 Git commit |
+| 保持验证新鲜度 | 验证事件记录 revision，后续 mutation 推进 revision | 旧事件保留用于审计，但不能覆盖当前候选 |
+| 区分验证尝试与验证通过 | event 记录执行结果，report 根据 FAIL 汇总 passed | 当前 revision 有验证记录仍可能得到 passed=false |
+| 生成候选事实 | final snapshot 读取 Git 状态、diff 和最终文件内容 | 上层仍需结合业务语义、人审与远端计划继续处理 |
+
+这张表也解释了为什么本章只叫“Coding Workspace 与验证”。它负责把本地候选做成可检查的结构化事实，远端写入权限和业务审批由下一层继续负责。
+
+---
+
+## 11. 整个模块的 STAR 总结
 
 ### S — Situation
 
-模型修改代码时容易出现版本漂移、路径误写、声称修改但文件没变、测试通过后又继续修改等问题。如果直接把模型生成的 patch 文本或文件内容推到远端，系统很难证明发布的究竟是哪一版代码。
+LLM 可以很快提出代码修改，但工程系统需要面对几个现实问题：远端分支会移动，多个任务可能并行，模型可能写错路径，工具调用可能没有产生真实变化，测试以后还可能继续修改，Bash 也可能暗中改变工作树，模型对 changed files 和验证结果的自然语言总结也可能不完整。
 
 ### T — Task
 
-需要建立一条从精确来源版本到真实工作树、真实修改、真实验证再到稳定候选的证据链，同时把代码构造和 GitHub 发布分开。
+GitAgent 需要建立一条可以核对的本地候选链路：固定修改基线，创建独立工作区，限制工具访问范围，记录真实候选变化，把验证证据绑定到候选版本，最后从 Git 工作树事实生成候选，并把验证结果结构化交给上层。
 
 ### A — Action
 
-GitAgent 用 ChangeRequest 固定 source SHA，用 detached worktree 隔离候选；文件能力绑定当前 workspace 并做路径校验；真实 mutation 在 Commit 时推进 revision；VerificationReport 绑定 revision；最终 CandidatePatch 从实际 Git 工作树生成，而不是由模型自报；满足门槛后清理临时 workspace。
+系统用 `ChangeRequest.source_ref` 固定 commit 基线；用 repository cache 加 detached worktree 准备 Coding Workspace；通过 `InvocationContext.workspace_root` 把 Native 工具绑定到当前任务；通过 `changed` 和 Bash worktree state 对比推进 revision；通过 Bash policy 识别真实验证命令并把验证事件记录到对应 revision；finalization 从 snapshot 生成 `CandidatePatch`，追加确定性检查形成 `VerificationReport`，再清理临时 worktree。
 
 ### R — Result
 
-Domain Agent 拿到的是一个有明确来源和验证依据的候选对象，可以在不同业务场景下安全地继续生成发布计划。代价是需要维护 Git cache、worktree、revision 和验证状态，并增加本地磁盘与 Git 操作。
+最终得到两类稳定输出：一类是描述“代码实际变成什么样”的 `CandidatePatch`，另一类是描述“这些变化经历了哪些验证、结果怎样”的 `VerificationReport`。Domain Agent 可以继续根据 `verification.passed` 和具体业务规则判断候选能否进入远端变更阶段。
 
-核心结果是：**模型负责提出和实施修改，但“最终到底改成什么、哪一版验证过”由真实工作树和 Harness 决定。**
+这套设计的核心价值可以压缩成一句话：
 
----
-
-## 17. 这一章最容易混淆的地方
-
-| 误解 | 正确理解 |
-|---|---|
-| worktree 是完整安全沙箱 | 不是，只是受管理的 Git 候选工作区 |
-| 跑过一次测试就可以一直沿用 | 不是，验证绑定具体 workspace revision |
-| 模型说 changed files 是 A/B/C 就以它为准 | 不是，CandidatePatch 来自真实 worktree |
-| 调用 edit 就一定增加 revision | 不是，只有实际 changed=true 的 mutation 在 Commit 时推进 |
-| Coding Agent 完成 patch 就已经写入 GitHub | 不是，此时只形成本地候选 |
+> **模型负责探索和修改，Harness 负责把修改落到受管理工作树中，并用真实文件状态、revision 和验证事件证明当前候选到底是什么状态。**
 
 ---
 
-## 18. 复习时怎样讲这一章
+## 12. 复习时建议按这条主线讲
 
-推荐围绕两个版本号讲：
+面试或复习时，不需要从类名开始背。先讲状态流会更容易说明白：
 
-> source SHA 固定“从哪一版代码开始”，workspace revision 固定“当前候选改到了第几版”。每次真实修改推进 revision，每次验证绑定 revision；最终 CandidatePatch 从真实 worktree 生成。只有当前 revision 被真实验证，候选才能交给上层考虑发布。
+> Domain Agent 先用 `ChangeRequest` 固定 source SHA，Coding Agent 再基于这个 SHA 创建独立 detached worktree。所有文件能力都绑定这块 workspace。每次真实文件变化都会推进 workspace revision，真实验证命令会把结果记录到当时的 revision。后续只要再次修改，旧验证就退出当前证据范围。finish 时 Harness 从真实 Git 工作树重新计算 changed files 和 patch，再加入确定性检查形成 `VerificationReport`。验证通过以后，上层 Domain Agent 才会继续准备远端变更。
 
-## 19. 代码定位
+如果还要再展开，就按“基线 → workspace → 路径 → revision → verification → snapshot → Domain Agent gate”这个顺序继续讲。
+
+---
+
+## 13. 代码定位
 
 | 想核对的问题 | 主要位置 |
 |---|---|
-| worktree 创建、快照与清理 | `gitagent/harness/coding_workspace.py` |
-| Coding patch 状态机 | `gitagent/agents/coding.py` |
-| Native 文件写/edit/bash | `gitagent/capability/providers/native.py` |
-| 文件与 Bash 权限策略 | `gitagent/capability/policy.py` |
-| 确定性代码检查 | `gitagent/harness/validation/code.py` |
-| ChangeRequest / CandidatePatch / VerificationReport | `gitagent/domain/models.py` |
+| worktree 创建、cache、snapshot、cleanup、revision 字段 | `gitagent/harness/coding_workspace.py` |
+| patch 初始化、finish 门槛、CandidatePatch 与 VerificationReport 构造 | `gitagent/agents/coding.py` |
+| revision 推进、Bash 前后状态比较、验证事件记录 | `gitagent/harness/context/state.py` |
+| workspace root 注入 InvocationContext | `gitagent/harness/execution.py` |
+| 文件路径检查、write/edit/delete 的 changed、Bash cwd | `gitagent/capability/providers/native.py` |
+| Bash 命令分类与真实验证识别 | `gitagent/capability/policy.py` |
+| 语法、配置和文本卫生的确定性检查 | `gitagent/harness/validation/code.py` |
+| ChangeRequest、CandidatePatch、VerificationReport 数据结构 | `gitagent/domain/models.py` |
+| 上层对 verification.passed 的发布门槛 | `gitagent/agents/repository.py`、`issues.py`、`pull_requests.py` |
 
-下一章接着回答候选之后的问题：[一份 CandidatePatch 怎样变成精确 Mutation Plan，并经过用户审批真正影响 GitHub](08-approval-and-remote-mutations.md)。
+下一章继续看候选离开本地 Coding Workspace 以后发生什么：[CandidatePatch 怎样进入 Mutation Plan，并经过审批真正影响 GitHub](08-approval-and-remote-mutations.md)。
