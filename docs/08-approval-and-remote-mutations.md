@@ -1,113 +1,338 @@
-# 08 Approval 与远端 Mutation：候选怎样获得真正影响 GitHub 的资格
+# 08 Approval 与远端 Mutation：已验证候选怎样一步步获得 GitHub 写入资格
 
-上一章停在 CandidatePatch：代码已经在本地真实修改并验证，但还没有影响 GitHub。本章继续这条链：**不同业务场景怎样把候选转换成 Mutation Plan，用户到底批准的是什么，批准以后为什么还要重新检查远端状态，多个步骤又怎样按精确顺序消费授权。**
+上一章停在 `CandidatePatch` 和 `VerificationReport`：代码已经在本地独立工作区里完成真实修改，也已经经过验证，但 GitHub 还没有发生变化。
 
-本章只讲“从候选到远端副作用”。持久化等待和重启恢复放到第 09 章。
+这一章继续沿着这条链往下走，重点讲清楚：**GitAgent 怎样把“已经验证的候选”或“准备执行的远端写动作”转换成可审批的结构化计划，怎样等待用户决定，批准以后又怎样精确消费授权并真正调用 GitHub。**
+
+这一章采用和第 07 章相同的讲法：先说明系统具体怎么做，再用 STAR 复盘这一层设计解决了什么问题。这样阅读顺序始终是“先看实现，再理解原因”。
+
+本章只讲 Approval 与远端 Mutation 的运行链路。进程退出后的持久化恢复、错误状态重建和 Trace/Audit 放在第 09 章。
 
 ---
 
-## 1. 先看远端写入资格链
+## 1. 先建立整体认识：远端写入链到底由哪些部分组成
+
+远端 Mutation 可以理解成一条“资格逐层收紧”的执行链。
+
+在这条链里，模型不能拿着一段自然语言直接修改 GitHub。真正进入 Provider 的写操作，最终都会变成一个带固定 capability id、固定参数和固定执行顺序的结构化调用。
 
 ```mermaid
 flowchart LR
-    C[CandidatePatch + Verification] --> D[Domain Agent]
-    D --> P[Mutation Plan]
-    P --> A[ApprovalRequest]
-    A --> U{用户决定}
-    U -->|拒绝| R[取消 / 返回反馈]
-    U -->|修改要求| V[回到业务流程修订]
-    U -->|批准| AUTH[精确 Authorization]
-    AUTH --> PRE[执行前再次校验]
-    PRE --> W[受保护 Capability 写入]
-    W --> NEXT{计划还有下一步?}
-    NEXT -->|是| PRE
-    NEXT -->|否| DONE[Plan 完成]
+    A[已验证 CandidatePatch\n或结构化远端写提案] --> B[形成 PlannedCapabilityCall]
+    B --> C[计划进入审批]
+    C --> D[ApprovalRequest]
+    C --> E[AgentContext.pending]
+    D --> F[等待用户输入]
+    E --> F
+    F --> G[审批意图分类]
+    G -->|approve| H[逐项消费精确授权]
+    G -->|reject / revise| I[结束旧审批并继续业务流程]
+    G -->|question / ambiguous| F
+    H --> J[Capability 权限检查]
+    J --> K[GitHub Provider]
+    K --> L[远端副作用]
 ```
 
-这条链里最值得先记住的是：
+先把几个核心对象分清楚，后面的流程会容易很多。
 
-**CandidatePatch 说明“代码候选是什么”；Mutation Plan 说明“准备怎样影响远端”；Approval 说明“用户精确授权哪一组动作”。**
+| 对象 | 它保存什么 | 它主要回答什么问题 |
+|---|---|---|
+| `CandidatePatch` | 本地最终文件内容、删除文件、patch、摘要等 | “准备发布的代码候选是什么” |
+| `PlannedCapabilityCall` | 一个 capability id 和一组参数 | “准备调用哪项远端能力，参数是什么” |
+| Mutation Plan | 按顺序排列的一组 `PlannedCapabilityCall` | “这次远端修改要按什么步骤执行” |
+| `ApprovalRequest` | approval id、Session、仓库、摘要、计划和审批状态 | “当前等待用户确认的提案是哪一份” |
+| `PendingCall` | approval id、摘要、待执行调用，以及必要的 provider call id | “Agent Loop 当前停在哪个待审批调用上” |
+| `PermissionPolicy` | 每个 Agent 对 capability 的 allow / ask / deny 规则 | “这个调用能直接执行、需要审批，还是直接拒绝” |
+| GitHub Provider | 真正调用 GitHub，并执行 mutation 自身的参数与版本检查 | “远端副作用怎样真正落地” |
 
-三者是不同对象，不能互相代替。
+这里最重要的关系可以记成三句话：
+
+**候选描述内容，计划描述动作，审批描述用户对这份精确动作计划的决定。**
+
+这三个层次会互相引用，但职责没有混在一起。
+
+### 1.1 STAR 复盘
+
+**S — Situation**：本地候选、用户确认和 GitHub 写操作属于三个不同阶段。如果它们只靠自然语言串在一起，运行时很难判断用户到底看过哪份内容、批准了哪项动作、当前正在执行哪一步。
+
+**T — Task**：给远端写入建立一条可以机器校验的结构化链，让“候选内容”“执行计划”“用户授权”和“Provider 副作用”各自有明确位置。
+
+**A — Action**：GitAgent 使用 `CandidatePatch` 保存代码候选，用 `PlannedCapabilityCall` 和 Mutation Plan 表示远端动作，用 `ApprovalRequest` 与 `PendingCall` 保存等待状态，再由 `PermissionPolicy` 和 Provider 完成真正调用。
+
+**R — Result**：一次 GitHub 写入可以沿着结构化对象逐层追踪。模型负责提出业务动作，Harness 负责把写入资格收紧到可以确定比较和确定执行的范围。
 
 ---
 
-## 2. Domain Agent 怎样把候选转换成 Mutation Plan
+## 2. 第一步：先把“准备怎样修改 GitHub”变成 Mutation Plan
 
-同一份代码候选在不同业务里应该采用不同发布方式，因此 Mutation Plan 由 Domain Agent 构造，而不是 Coding Agent。
+### 2.1 远端写计划有两条主要来源
 
-### Repository 修改
+当前实现里，Mutation Plan 并不只有一种生成方式。理解这一点非常重要。
 
-普通仓库修改可以形成“对默认分支提交候选”的计划，但必须绑定创建候选时观察到的默认分支 head SHA。
+第一条路径来自**已经验证的代码修改**。这类计划主要由 Harness 或 Domain Agent 的确定性逻辑生成。系统已经拿到 `CandidatePatch` 和通过的 `VerificationReport`，随后根据业务场景决定代码要发布到哪里。
 
-### Issue 修复
-
-Issue 修复通常不直接修改默认分支，而是形成：
-
-1. 创建修复分支；
-2. 把 CandidatePatch 提交到该分支；
-3. 发布/推送分支；
-4. 创建 Draft PR。
-
-### PR 内修复
-
-PR patch 绑定当前 PR 的 head branch 和原始 head SHA，候选准备提交到当前 PR 分支。
+第二条路径来自**Domain Agent 已经给出的结构化 GitHub 写调用**。例如发布 PR Review、Merge PR、发布 Issue 评论。Agent 先产生一个结构化 capability call；Dispatcher 和 Capability 层检查后发现它属于 `ask` 权限，于是把这一项调用转成待审批计划。
 
 ```mermaid
 flowchart TD
-    C[CandidatePatch] --> T{业务场景}
-    T -->|Repository| R[默认分支 commit plan]
-    T -->|Issue| I[branch → commit → push → Draft PR]
-    T -->|PR| P[当前 head branch commit plan]
+    A[远端写入需求] --> B{来源}
+    B -->|已验证代码候选| C[Harness / Domain 逻辑构造计划]
+    B -->|Agent 结构化写调用| D[Dispatcher preflight]
+    D --> E[Capability Policy 返回 ASK]
+    E --> F[把这一项调用排入审批]
+    C --> G[Mutation Plan]
+    F --> G
 ```
 
-因此 CandidatePatch 本身不携带“应该发布到哪里”的最终决定。发布语义属于业务层。
+所以，“Mutation Plan”表示的核心含义是**已经冻结下来、准备交给审批系统的一组具体远端调用**。它的来源可以不同。
+
+### 2.2 Repository 修改怎样形成计划
+
+Repository 场景用于直接修改默认分支。
+
+Coding Agent 完成 patch 后，Dispatcher 会先确认：
+
+- `code_candidate` 已存在；
+- `change_request` 已存在；
+- `verification` 已存在并且 `passed=true`。
+
+这些条件通过后，`repository_change_mutation_plan` 生成一个单步骤计划：把当前候选作为一次 `github.commit_to_default_branch` 调用提交到默认分支。
+
+这个调用会携带 `ChangeRequest.source_ref` 作为 `expected_head_sha`。也就是说，这份计划同时带着一句机器可检查的前提：**默认分支当前仍然应该停在生成候选时使用的那个 commit。**
+
+```mermaid
+flowchart LR
+    A[CandidatePatch] --> B[Verification passed]
+    B --> C[source_ref = S1]
+    C --> D[commit_to_default_branch plan]
+    D --> E[expected_head_sha = S1]
+```
+
+还有一层额外保护：普通模型调用路径不能直接提议 `github.commit_to_default_branch`。`validate_protected_capability` 会拒绝这种直接调用。默认分支提交必须从已经验证的 Repository mutation plan 进入审批链。
+
+### 2.3 Issue 修复怎样形成四步计划
+
+Issue 修复采用更保守的发布方式。经过验证的候选不会直接写默认分支，而会形成固定的四步计划：
+
+1. 从已审阅的默认分支 head 创建修复分支；
+2. 把 `CandidatePatch` 提交到这个分支；
+3. 确认这个分支已经可以作为远端分支使用；
+4. 创建 Draft PR。
+
+分支名由 Session 派生，形式类似 `gitagent/<session-suffix>`。创建分支和提交候选都携带同一个原始 `source_ref`。
+
+这并不矛盾。新分支刚创建时就指向 `source_ref`，因此紧接着向该分支提交候选时，预期 parent 仍然是这个 SHA。
+
+```mermaid
+flowchart LR
+    S[source_ref = S1] --> B[create_branch\n期望 base head = S1]
+    B --> C[commit candidate\n期望 branch head = S1]
+    C --> P[push / confirm branch]
+    P --> R[create Draft PR]
+```
+
+### 2.4 PR 内修复怎样形成计划
+
+PR patch 场景先读取当前 PR metadata，并把当前 PR head SHA 放进 `ChangeRequest.source_ref`。Coding Agent 基于这个 SHA 生成和验证候选。
+
+候选返回 PullRequestAgent 后，系统继续检查：
+
+- 验证已经通过；
+- `source_ref` 存在；
+- 当前 PR head branch 能确定；
+- PR 的 head repository 与当前 repository 一致。
+
+如果 PR 来自 fork，当前实现不会自动向对方 fork 的 source branch 写入。
+
+条件满足时，PullRequestAgent 会排入一个单步骤 `github.commit` 计划。它绑定当前 PR head branch、候选文件、删除文件、候选摘要和原始 head SHA。
+
+### 2.5 一张表记住三类代码候选的发布方式
+
+| 业务场景 | Mutation Plan | 关键版本约束 |
+|---|---|---|
+| Repository 修改 | 直接向默认分支提交一次候选 | 默认分支 head 必须等于 `source_ref` |
+| Issue 修复 | create branch → commit → push → Draft PR | 创建分支和第一次 commit 都绑定 `source_ref` |
+| PR 内修复 | 向当前 PR head branch 提交候选 | 目标 branch 和 head SHA 必须与已观察 PR 一致 |
+
+### 2.6 STAR 复盘
+
+**S — Situation**：同一份 `CandidatePatch` 在不同业务里需要不同发布语义。Repository 修改可以直接形成默认分支 commit；Issue 修复需要先进入分支和 Draft PR；PR patch 只能面向当前 PR 的 source branch。
+
+**T — Task**：在进入审批之前，把“发布到哪里、调用什么能力、按什么顺序、基于哪个版本”全部固定下来。
+
+**A — Action**：Repository、Issue 和 PR patch 分别构造不同的 `PlannedCapabilityCall`；计划中携带 branch、文件内容、删除文件、提交信息和 `expected_head_sha` 等具体参数。
+
+**R — Result**：用户后面审批的对象已经从模糊的“把这个改动发出去”收敛成明确的远端动作计划。业务发布语义在审批前已经确定。
 
 ---
 
-## 3. Mutation Plan 不是一段给用户看的自然语言
+## 3. 第二步：计划进入审批前，先做确定性保护检查
 
-计划会包含一组结构化的 `PlannedCapabilityCall`。每一步都有稳定 capability id 和规范化参数。
+有些 Mutation Plan 是 Harness 根据已验证候选直接构造出来的；还有一些远端写是模型通过 capability 直接提出的。对于后一类调用，Dispatcher 会在它进入 Approval 之前先做一次 `preflight_capability`。
 
-例如 Issue 修复的计划不是简单写“创建分支并提 PR”，而是把每项具体动作拆成明确调用和顺序。展示给用户的 Approval Summary 可以用更友好的文字，但真正授权仍然指向结构化计划。
+这里最重要的一层是 `validate_protected_capability`。它针对少数高风险 GitHub 写能力做业务约束检查。
 
-这样运行时才能回答：
+### 3.1 默认分支提交
 
-- 用户批准的是哪项 capability；
-- 参数是不是同一组；
-- 当前要执行的是第几步；
-- 是否有人在等待期间悄悄改了计划。
+`github.commit_to_default_branch` 在普通结构化调用路径中会被直接拦截。它只能从 Repository 已验证候选的专用计划路径执行。
+
+这样模型无法跳过 Coding Agent 和 Verification，直接拼一组文件参数要求写默认分支。
+
+### 3.2 Issue 回复发布
+
+当当前 Context 正处于 Issue reply workflow 时，`github.post_comment` 必须与已经审阅的 draft 完全对应：目标 Issue、正文和 workflow stage 都要匹配。
+
+模型临时换一段正文，或者拿同一轮流程去评论另一个 Issue，都会被业务 gate 拒绝。
+
+### 3.3 PR Review 发布
+
+`github.post_review` 需要满足：
+
+- 当前 Agent 是 PullRequestAgent；
+- 目标 `pr_number` 与当前活动 PR 一致；
+- `event` 只能是 `COMMENT`、`APPROVE`、`REQUEST_CHANGES`；
+- Review body 不能为空。
+
+这一步先确认“这是一份合法并且属于当前 PR 的 Review 提案”，随后才有资格进入用户审批。
+
+### 3.4 PR patch commit
+
+PR patch 有两层来源不同的约束，需要分开理解。
+
+PullRequestAgent 从 Coding Agent 接回候选后，会先确认 Verification 已通过、`source_ref` 存在、PR head branch 能确定，并且 source repository 属于当前仓库。随后它直接使用 `CandidatePatch` 构造单步骤 `github.commit` 计划，因此文件、删除文件、message 和 `expected_head_sha` 天然来自已验证候选。
+
+如果模型之后通过普通结构化调用路径再次提出 `github.commit`，`validate_protected_capability` 还会进一步核对：
+
+- 当前 Agent 是 PullRequestAgent；
+- 存在 Coding Agent 生成的 `CandidatePatch`；
+- `VerificationReport` 已通过；
+- 参数里的文件、删除文件、message、`expected_head_sha` 与候选和 `ChangeRequest` 一致；
+- branch 与已经观察到的 PR head branch 一致；
+- source repository 属于当前仓库，fork PR 不进入自动写分支路径。
+
+### 3.5 PR Merge
+
+`github.merge` 在进入 Approval 前会检查：
+
+- 当前 Agent 是 PullRequestAgent；
+- 最近一次 `merge_readiness` 的状态已经达到“准备合并”；
+- merge 参数中的 `expected_head_sha` 与最近观察到的 PR head SHA 一致；
+- `pr_number` 与当前观察到的 PR 一致。
+
+这里的 `merge_readiness` 来自 PullRequestAgent 对 PR metadata、代码审阅、有效 Review、CI workflow 等证据的综合判断。
+
+```mermaid
+flowchart TD
+    A[Agent 提出远端写 capability] --> B[Dispatcher preflight]
+    B --> C{protected capability?}
+    C -->|否| D[继续 Capability 权限判断]
+    C -->|是| E[确定性业务 gate]
+    E -->|失败| F[拒绝提案]
+    E -->|通过| D
+    D --> G{ALLOW / ASK / DENY}
+    G -->|ASK| H[进入 Approval]
+```
+
+### 3.6 STAR 复盘
+
+**S — Situation**：用户看到审批界面之前，模型可能已经构造出一个目标错误、内容不一致或缺少验证依据的写调用。如果这类调用先让用户审批，再到执行阶段才发现基础条件不成立，审批本身会变得混乱。
+
+**T — Task**：先把明显不合法、与当前业务状态不一致、绕过验证链的写提案挡在 Approval 外面。
+
+**A — Action**：Dispatcher 在普通 capability 提案进入审批前运行 protected validation；Repository 和 Issue 的候选发布路径也在专用 queue 函数中检查候选与验证状态。
+
+**R — Result**：能够进入 Approval 的提案已经通过一轮确定性业务检查。用户面对的是当前流程允许讨论和确认的写动作。
 
 ---
 
-## 4. ApprovalRequest 精确绑定哪些东西
+## 4. 第三步：把计划同时保存成 ApprovalRequest 和 PendingCall
 
-ApprovalStore 创建的请求会绑定当前 Session 和待执行动作。可以把授权身份理解成下面几部分共同决定：
+Mutation Plan 准备好以后，Dispatcher 的 `queue` 会做两件关键事情。
 
-| 绑定项 | 防止什么问题 |
+第一件事是调用 `ApprovalStore.create`，创建 `ApprovalRequest`。
+
+第二件事是在当前 `AgentContext` 上写入 `PendingCall`，让 Agent Loop 明确进入“等待用户处理这份提案”的控制状态。
+
+```mermaid
+flowchart LR
+    A[Mutation Plan] --> B[ApprovalStore.create]
+    A --> C[context.pending]
+    B --> D[ApprovalRequest]
+    C --> E[PendingCall]
+    D --> F[用户审批状态]
+    E --> G[Agent Loop 等待位置]
+```
+
+### 4.1 ApprovalRequest 保存什么
+
+一个 `ApprovalRequest` 会保存：
+
+| 字段 | 作用 |
 |---|---|
-| Session | 不能拿另一个会话的批准复用 |
-| capability id | 批准评论不能变成批准 merge |
-| 规范化参数 | 批准正文 A 不能改成正文 B |
-| 计划顺序 | 多步骤动作不能跳步或换顺序 |
-| 当前请求状态 | 已取消、失效或完成的授权不能再次消费 |
+| `approval_id` | 这一次审批的稳定身份 |
+| `session_id` | 它属于哪一个 Session |
+| `repository` | 提案记录面向哪个仓库 |
+| `summary` | 给用户理解方案的摘要 |
+| `calls` | 真正待授权的结构化调用列表 |
+| `decision` | 当前还未决定、Approve、Reject、Superseded 或 Invalidated 等状态 |
+| `_remaining` | 还没有被消费的精确调用序列 |
 
-这和“用户说了 yes”差别很大。自然语言只表达用户意图，运行时最后消费的是精确授权对象。
+创建 Request 时，ApprovalStore 会把每个 capability id 和 arguments 规范化成稳定字符串，放进 `_remaining`。
+
+规范化会固定参数键的顺序，所以参数对象即使来自不同构造路径，只要语义完全一致，就可以稳定比较；任何字段值发生变化，得到的精确调用快照也会变化。
+
+### 4.2 PendingCall 保存什么
+
+`PendingCall` 保存 approval id、summary 和同一组 calls。对于“模型先发出 capability call，随后 Capability 层返回 `approval_required`”这种路径，它还会记录原来的 `provider_call_id`。
+
+这个字段很有用：用户批准后执行真正调用时，第一步可以继续沿用原来的 provider tool call 身份，工具调用与后续工具结果仍然保持同一条关联链。
+
+### 4.3 用户看到的摘要和运行时授权依据是两层数据
+
+Approval Summary 用于帮助用户理解：会改哪个仓库、哪些文件、验证结果怎样、风险是什么、Draft PR 标题是什么等。
+
+如果当前有 `CandidatePatch`，服务层在用户询问提案详情时还可以把候选文件内容和 Diff 一起展示出来。
+
+真正用于授权比较的依据仍然是 `calls` 里的 capability id 和 arguments。Summary 适合阅读，结构化调用适合确定比较。
+
+### 4.4 一个需要准确记住的实现边界
+
+`ApprovalRequest` 里确实保存 `repository`，恢复持久化审批时也会校验 repository 是否一致。
+
+但当前 `ApprovalStore.authorize` 真正消费授权时，直接检查的是：
+
+- approval id 是否存在；
+- Session 是否一致；
+- decision 是否为 `Approve`；
+- capability id 与参数是否等于 `_remaining` 的第一项。
+
+`authorize` 本身没有再单独比较 repository 字段。因此复习实现时，最好把 repository 理解为 Approval Request 的上下文与恢复一致性信息，不要把它描述成 `authorize` 当前直接参与比较的字段。
+
+### 4.5 STAR 复盘
+
+**S — Situation**：用户界面需要可读摘要，运行时需要精确机器比较，Agent Loop 还需要知道自己停在什么位置。这三种需求放在同一个字符串里很难同时做好。
+
+**T — Task**：把“用户看到什么”“审批对象是什么”“运行控制停在哪里”分别保存下来，同时让三者指向同一份计划。
+
+**A — Action**：`ApprovalRequest` 保存审批事实和精确调用序列；`PendingCall` 保存 Agent Loop 的等待控制点；summary 负责展示，calls 负责授权比较。
+
+**R — Result**：审批界面可以保持可读性，运行时也能做严格匹配，暂停和恢复还拥有明确的控制状态。
 
 ---
 
-## 5. 用户回复怎样被解释成批准、拒绝还是修改
+## 5. 第四步：等待审批时，下一条用户输入先进入 Approval Intent Classifier
 
-当系统处于等待审批时，下一条用户输入不会首先回到 Main Agent 做新路由。应用先知道当前正在等待哪一个 Approval。
+当某个 AgentContext 存在 `pending` 时，Service 收到下一条用户输入后，会先找到当前真正处于等待状态的 Context，然后把用户输入和当前提案上下文交给 `ApprovalIntentClassifier`。
 
-用户可能说：
+Classifier 会把回复整理成五类动作：
 
-- “批准”；
-- “不要执行”；
-- “内容改短一点再给我看”；
-- “可以，但别创建 PR”。
-
-Approval Intent Classifier 会结合当前待审批上下文，把回复分类成批准、拒绝、修改要求或无法明确判断。
+| action | 含义 | 对 pending 的处理 |
+|---|---|---|
+| `approve` | 用户明确同意当前提案 | 进入真正执行 |
+| `reject` | 用户明确拒绝 | 关闭当前审批 |
+| `revise` | 用户要求修改提案内容或候选 | 结束旧授权链，回到修改流程 |
+| `question` | 用户在询问当前提案 | 保留 pending，返回提案说明 |
+| `ambiguous` | 无法可靠判断用户意图 | 保留 pending，请用户说清楚 |
 
 ```mermaid
 flowchart TD
@@ -115,268 +340,635 @@ flowchart TD
     C --> A[approve]
     C --> R[reject]
     C --> V[revise]
+    C --> Q[question]
     C --> X[ambiguous]
+    Q --> W[继续等待原 Approval]
+    X --> W
+    A --> E[执行原计划]
+    R --> F[结束旧 Approval]
+    V --> F
 ```
 
-分类结果只是对自然语言意图的解释。真正 approve 时，Authorization 仍然绑定原始精确计划；revise 则需要回到业务流程生成新候选或新计划，旧授权不会被偷偷改参数后继续使用。
+### 5.1 approve 怎样继续
 
----
+Classifier 返回 `approve` 后，Agent Loop 会调用 Dispatcher 的 `apply_user_decision`。
 
-## 6. 用户批准后为什么还不能直接调用 Provider
+Dispatcher 先把 ApprovalRequest 标记为 `Approve`，然后清掉 `context.pending`，把刚才保存下来的 `PendingCall` 交给 `execute_pending`。
 
-等待审批期间，外部世界可能变化。
+这里有一个很关键的先后顺序：**用户决定只改变 Approval 状态，真正 GitHub 写入由后面的 `execute_pending` 单独完成。**
 
-例如：
+### 5.2 reject 怎样继续
 
-- 默认分支已经有别人提交；
-- PR head SHA 已经更新；
-- PR 已经关闭；
-- Review 或 CI 状态变化；
-- 待发布评论对应的业务状态已经不同。
+对于普通拒绝，Dispatcher 会把当前 ApprovalRequest 标记为 `Reject`，清掉 pending，并把拒绝信息作为结构化结果或用户指令送回原工作流，让 Agent 继续收束。
 
-因此批准只回答“用户是否授权原计划”，不回答“原计划现在是否仍然正确”。
+### 5.3 question 和 ambiguous 怎样继续
 
-真正写入前，调用还会重新经过 Capability 权限和 protected validation。
+这两类不会消费，也不会关闭 Approval。
+
+`question` 会返回当前 proposal description；`ambiguous` 会返回一条澄清问题。下一条用户输入仍然围绕原来的 pending proposal 处理。
+
+### 5.4 revise 怎样继续
+
+修改请求会让旧计划失去继续授权的资格，不过不同工作流的处理方式略有区别。
+
+PR Review 有一个专门的文本修订路径。系统会基于用户指令生成新的 Review body，把旧审批标记为 `Superseded`，再针对新的 `github.post_review` 参数创建一个全新的 Approval。
+
+Repository 修改收到 revise 后，会把修订要求追加到 `ChangeRequest`，同时清掉旧 `code_candidate` 和 `verification`。随后工作流重新进入代码修改与验证过程。旧 pending 在通用 decision 处理里结束，后续新候选会产生新的计划。
+
+其他普通 revise 也不会继续复用旧 pending calls，而会把修订指令交还业务 Agent 重新推进。
 
 ```mermaid
 flowchart LR
-    A[Authorization] --> P[Capability permission]
-    P --> B[业务 preflight]
-    B --> C{前提仍成立?}
-    C -->|否| R[拒绝旧计划]
-    C -->|是| W[执行远端写]
+    A[Plan v1 + Approval v1] --> U[用户要求修改]
+    U --> X[结束 v1 授权链]
+    X --> B[重新生成内容或候选]
+    B --> C[Plan v2]
+    C --> D[Approval v2]
 ```
 
-这种“用户授权”和“当前事实检查”分开，是远端 mutation 的核心边界。
+### 5.5 STAR 复盘
+
+**S — Situation**：真实用户很少只回复固定的 yes/no。他们可能问详情、要求改一句话、否决其中一个动作，或者说一句语义含糊的话。
+
+**T — Task**：先理解用户在“当前已绑定提案”上的意图，同时避免自然语言分类器直接拥有 GitHub 写权限。
+
+**A — Action**：Service 把回复分类为 approve、reject、revise、question、ambiguous；Classifier 只产出 `WorkflowTurnDecision`，真正授权仍交给 ApprovalStore 和 Capability Policy。
+
+**R — Result**：自然语言理解负责把用户意思整理成结构化决定，授权系统继续保持确定性。用户询问或表达含糊时，原 Approval 还能继续保持等待状态。
 
 ---
 
-## 7. expected head SHA 怎样阻止把旧候选写到新代码上
+## 6. 第五步：批准后，PermissionPolicy 怎样逐项消费精确授权
 
-Repository 和 PR 修改都使用乐观并发思想。
+用户批准以后，`execute_pending` 会按照 `pending.calls` 的原顺序逐项执行。
 
-创建 CandidatePatch 时系统已经知道 source SHA。生成远端 commit 计划时，会把“期望当前 head 仍然等于这个 SHA”作为参数或前提。
+对每一步，Context 都通过 `invoke_approved` 把同一个 `approval_id` 带回 Capability 层。
 
-执行时重新读取/检查远端 head：
+Capability 层再次根据 Agent 的 invoke policy 判断当前 capability。远端 WRITE/DESTRUCTIVE 能力配置在 `ask` 中时，Policy 看到 approval id 后会调用 `ApprovalStore.authorize`。
 
 ```mermaid
-flowchart TD
-    C[候选 source SHA = S1] --> A[用户审批]
-    A --> H[读取当前远端 head]
-    H --> X{当前 head == S1?}
-    X -->|是| W[应用候选]
-    X -->|否| R[冲突：旧候选失效]
+flowchart LR
+    A[execute_pending] --> B[invoke_approved]
+    B --> C[PermissionPolicy]
+    C --> D[ApprovalStore.authorize]
+    D --> E{Session + decision + exact call + 顺序匹配?}
+    E -->|否| F[拒绝调用]
+    E -->|是| G[消费当前第一项授权]
+    G --> H[Provider invoke]
 ```
 
-如果已经变成 S2，系统拒绝，而不是自动把旧候选硬套上去。
+### 6.1 精确匹配到底检查什么
 
-这不是悲观锁。审批期间其他人仍然可以提交；GitAgent 只是在真正写入时确认“我之前验证过的前提还成立”。
+当前 `authorize` 会检查四件事。
+
+第一，`approval_id` 必须指向一个真实存在的 Request。
+
+第二，这个 Request 的 `session_id` 必须和当前 Session 一致。
+
+第三，Request 的 decision 必须已经是 `Approve`。
+
+第四，当前 capability id 与参数必须和 `_remaining[0]` 完全一致。
+
+只要其中任何一项不匹配，调用都会在进入 Provider 之前被拒绝。
+
+### 6.2 参数为什么要做规范化比较
+
+计划创建时，ApprovalStore 会把 capability id 和 arguments 转成规范化 JSON 形式。对象键会排序，空格等表示差异会被消除。
+
+这样比较关注的是结构化值本身。
+
+例如用户批准的是“给 PR #45 发布某段 Review body”，那么后面偷偷换成 PR #46、改正文、改 event，都会得到不同的精确调用快照，旧审批无法消费这项调用。
+
+### 6.3 顺序怎样被固定下来
+
+`_remaining` 是一个有顺序的队列。
+
+当前执行只能匹配队首。匹配成功后，这一项会先从 `_remaining` 移除，然后 Provider 才开始执行。
+
+因此多步骤计划无法跳步。Issue 修复计划如果第一步还没有消费，第四步的 Draft PR 调用无法拿到这份 Approval 的执行资格。
+
+### 6.4 Approval 更像一组一次性动作票据
+
+一份多步骤 Approval 可以覆盖多个远端动作，但每一项动作都只能按原顺序消费一次。
+
+它不会让 Agent 获得“接下来都可以写 GitHub”的通用权限。模型如果在执行中临时增加一项新 mutation，新调用没有出现在 `_remaining` 中，自然无法使用旧 approval id 通过检查。
+
+### 6.5 STAR 复盘
+
+**S — Situation**：如果批准只记录成一个布尔值，模型在用户同意后仍可能换参数、换 capability 或改变多步骤计划顺序。
+
+**T — Task**：把一次用户批准约束到当时看到的精确结构化调用，并让多步骤计划按固定顺序一次性消费。
+
+**A — Action**：ApprovalStore 保存规范化调用队列；PermissionPolicy 每次执行 `ask` capability 时重新调用 `authorize`；`authorize` 检查 Session、Approve 状态、当前队首 capability 和 arguments，然后消费队首。
+
+**R — Result**：用户批准的范围可以精确到“哪项能力、哪组参数、执行到第几步”。模型无法用同一个 approval id 自行扩大动作范围。
 
 ---
 
-## 8. Issue 修复计划怎样按顺序消费授权
+## 7. 第六步：多步骤 Mutation Plan 怎样真正执行
 
-多步骤计划的难点不只是“是否批准”，还包括“执行到了哪里”。
+`execute_pending` 的实现很直接：对 `pending.calls` 做顺序遍历，一步成功以后再执行下一步。
 
-Issue 修复可以依次创建分支、提交、发布，再建 Draft PR。后一步依赖前一步成功，因此不能并发，也不能因为用户批准整个计划就随便跳到最后。
+Issue 修复就是最典型的例子。
 
 ```mermaid
 stateDiagram-v2
     [*] --> CreateBranch
-    CreateBranch --> Commit: 成功
-    Commit --> Push: 成功
-    Push --> DraftPR: 成功
-    DraftPR --> Done: 成功
-    CreateBranch --> Failed: 失败
-    Commit --> Failed: 失败
-    Push --> Failed: 失败
-    DraftPR --> Failed: 失败
+    CreateBranch --> Commit: success
+    Commit --> Push: success
+    Push --> DraftPR: success
+    DraftPR --> Done: success
+    CreateBranch --> Invalidated: failed
+    Commit --> Invalidated: failed
+    Push --> Invalidated: failed
+    DraftPR --> Invalidated: failed
 ```
 
-ApprovalStore 会验证当前调用是否正是计划中的下一项。前一项没有完成时，后一项没有资格消费授权。
+### 7.1 每一步成功后发生什么
 
-这样“批准一组动作”仍然保留内部顺序约束。
+Provider 返回 success 后，Dispatcher 会记录 capability observation，并把工具结果写回 Agent 消息线程。
+
+随后 for-loop 才进入下一项调用。
+
+所有 calls 都成功以后，Dispatcher 会调用 `ApprovalStore.complete`，确认 decision 是 `Approve` 并且 `_remaining` 已经为空。
+
+如果列表执行完以后还有未消费授权，系统会把它当成工作流错误处理。
+
+### 7.2 中间一步失败后发生什么
+
+只要某一步返回 failed，Dispatcher 会立即：
+
+1. 把整个 approval 标记为 `Invalidated`；
+2. 清空剩余授权；
+3. 记录结构化 capability error；
+4. 停止执行后续步骤。
+
+这里没有自动继续跑剩余计划。
+
+### 7.3 已经成功的前置副作用不会自动回滚
+
+多步骤计划目前没有事务型 rollback。
+
+例如 create branch 已成功，后面的 commit 失败，那么前面创建出来的 branch 仍可能留在 GitHub。系统会让原 Approval 失效并停止后续步骤，但不会自动删除已经创建的 branch。
+
+所以，多步骤计划提供的是**顺序控制和失败截断**，并没有提供跨 GitHub API 的原子事务。
+
+这个边界和下一章的恢复设计关系很大。
+
+### 7.4 STAR 复盘
+
+**S — Situation**：Issue 修复包含多个有依赖关系的远端动作。后一步依赖前一步产生的远端状态，任何中间失败还可能留下已经发生的部分副作用。
+
+**T — Task**：保证调用按依赖顺序执行，一旦失败立即停止，并阻止剩余步骤继续消费旧授权。
+
+**A — Action**：`execute_pending` 顺序执行 calls；每一步由 ApprovalStore 消费当前队首；失败后 `invalidate` 整份 Approval 并结束循环；成功执行过的远端动作不自动回滚。
+
+**R — Result**：计划不会乱序或越过失败步骤继续执行。与此同时，调用者必须接受“多步骤远端工作流可能部分完成”这个事实，并在恢复流程中单独处理。
 
 ---
 
-## 9. 为什么授权不能被模型自行扩大
+## 8. 第七步：批准之后，真正的 GitHub 写入前还会检查什么
 
-模型可能在计划执行中又产生新的想法。例如用户批准“发布评论”，模型随后觉得“顺便加个标签”也不错。
+这一节需要非常准确，因为这里很容易把“提案前检查”和“批准后检查”混在一起。
 
-新的调用参数不在原 ApprovalRequest 中，就不拥有旧授权。它必须走自己的权限和审批逻辑。
+用户批准后，`execute_pending` 会通过 `invoke_approved` 直接进入 Capability 层。Capability 层会重新做 schema 校验和 PermissionPolicy 授权消费，然后调用 Provider。
 
-同理，用户批准 PR #10 的 merge，不意味着同一个 Session 里其他 PR 也获得 merge 权限。
+**Dispatcher 的 `validate_protected_capability` 当前不会在 `execute_pending` 中统一再跑一遍。**
 
-Approval 不是给 Agent 发一张“本轮可以写 GitHub”的通行证，而是一份**精确动作能力票据**。
-
----
-
-## 10. 修改计划以后旧 Approval 怎样处理
-
-用户要求修改草稿、变更分支名或调整候选以后，原计划的参数已经不再表示用户现在看到的内容。
-
-系统需要让旧 Approval 失效或被 supersede，再为新的精确计划建立新请求。
+因此，审批等待期间的“远端状态是否变化”主要依赖各个 GitHub mutation 自己的参数语义和 Provider 检查。
 
 ```mermaid
 flowchart LR
-    P1[Plan v1] --> A1[Approval v1]
-    A1 --> U[用户要求修改]
-    U --> X[使 v1 失效]
-    X --> P2[Plan v2]
-    P2 --> A2[新的 Approval v2]
+    A[用户 Approve] --> B[execute_pending]
+    B --> C[Capability schema + PermissionPolicy]
+    C --> D[ApprovalStore 精确授权]
+    D --> E[GitHub Provider]
+    E --> F[mutation 自身版本/参数检查]
+    F --> G[发送写请求]
 ```
 
-不能保留“用户曾经批准过类似事情”这个模糊事实，然后把它套到新计划。
+### 8.1 create_branch 怎样检查默认分支有没有变化
+
+`github.create_branch` 会先读取 base branch 当前 ref，得到真实 head SHA。
+
+如果真实 SHA 和计划里的 `expected_head_sha` 不相等，Provider 直接返回冲突，而且这个失败发生在创建 branch 的 POST 请求之前。
+
+因此，Issue 修复在等待审批期间如果默认分支从 S1 前进到 S2，旧计划不会从 S2 悄悄创建修复分支。
+
+### 8.2 commit 怎样检查目标分支有没有变化
+
+`github.commit` 先读取目标 branch 当前 ref。
+
+只有当前 branch head 与 `expected_head_sha` 相等，Provider 才继续读取 parent tree、创建 blob、tree 和 commit，最后用非 force 方式推进分支 ref。
+
+PR patch 和 Issue 修复中的 commit 都依赖这条检查。
+
+### 8.3 commit_to_default_branch 怎样检查默认分支有没有变化
+
+Repository 直接修改默认分支时，Provider 会重新解析默认分支并读取当前 head。
+
+当前 head 必须和候选生成时记录的 `source_ref` 一致，后续才创建 tree、commit 并推进默认分支。
+
+这条路径对“审批等待期间默认分支有人提交”有明确的执行时保护。
+
+### 8.4 merge 怎样绑定已审阅的 PR head
+
+`github.merge` 不会先单独 GET 一次 PR head。它会把计划中的 `expected_head_sha` 作为 `sha` 参数直接发送给 GitHub Merge API。
+
+GitHub 只会在当前 PR head 与这个 SHA 匹配时接受这次带版本条件的 merge 请求。
+
+因此 merge plan 仍然绑定到了已审阅 head，只是版本比较由 GitHub merge API 完成。
+
+### 8.5 push 当前做的事情
+
+当前 GitHub client 的 `push` 语义比较轻。因为前面的 commit 本身已经通过 GitHub API 更新了远端 branch ref，所以 `push` 这一步主要读取该 branch ref，确认分支存在，然后返回 pushed 状态。
+
+复习时不要把这一项理解成本地 Git CLI 再执行一次网络 push。
+
+### 8.6 create_draft_pr 和 post_review 的当前边界
+
+`create_draft_pr` 会强制 `draft=true`，然后直接调用 GitHub 创建 PR。它没有额外的 `expected_head_sha` 参数。
+
+`post_review` 在提案阶段经过 PullRequestAgent 的目标 PR、event 和 body 检查；批准后 Provider 会直接 POST Review。当前执行路径不会再次读取 PR metadata 来重新跑同一套 protected validation。
+
+这说明不同 mutation 的“批准后新鲜度检查”强度并不完全相同。
+
+### 8.7 Merge readiness 当前也不会在批准后统一重算
+
+Merge 提案进入 Approval 前，PullRequestAgent 已经计算 `merge_readiness`，其中会综合：
+
+- PR 是否 open；
+- PR 是否仍是 Draft；
+- Coding review 是否存在阻塞问题；
+- 目标与实现是否一致；
+- 每位 reviewer 当前有效 Review；
+- 当前相关 CI workflow run 状态。
+
+`validate_protected_capability` 会要求 readiness 已经达到“准备合并”，并把 merge 参数绑定到当时观察到的 PR head SHA。
+
+用户等待一段时间后再批准时，当前 Harness 不会重新获取 Review 和 CI 并重新计算 readiness。它依靠 merge 的 `expected_head_sha` 防止 head 悄悄变化；如果 Review 或 CI 在 head 不变的情况下发生变化，Harness 自己不会在批准恢复点重新取证。
+
+GitHub 仓库自己的 branch protection 可能继续拒绝不满足平台规则的 merge，但那属于 GitHub 端约束，不能当成当前 Harness 已经重新执行过 readiness 检查。
+
+### 8.8 把“审批前”和“批准后”的检查分开记
+
+| 检查 | 主要发生位置 | 批准后是否统一重跑 |
+|---|---|---|
+| PR merge readiness | PullRequestAgent + protected validation | 当前不会统一重算 |
+| PR Review 目标/event/body | protected validation | 当前不会统一重跑 |
+| PR patch 参数是否等于 CandidatePatch | protected validation | 当前不会统一重跑 |
+| Approval capability/arguments/order | PermissionPolicy + ApprovalStore | 会，每一步执行前都检查 |
+| create_branch 当前 base head | GitHub Provider | 会，在真实创建分支前读取 |
+| commit 当前 branch head | GitHub Provider | 会，在真实 commit 前读取 |
+| default-branch commit 当前 head | GitHub Provider | 会，在真实 commit 前读取 |
+| merge 当前 head 是否等于 expected SHA | GitHub Merge API 条件 | 会，通过 `sha` 条件约束 |
+
+### 8.9 STAR 复盘
+
+**S — Situation**：从提案形成到用户批准之间可能经过较长时间。代码分支、PR、Review、CI 等外部事实都有可能变化。
+
+**T — Task**：让执行阶段至少能重新验证那些与 mutation 正确性直接绑定的关键版本条件，同时明确哪些业务判断当前只发生在提案阶段。
+
+**A — Action**：create branch、commit 和 default-branch commit 在 Provider 内重新读取远端 head；merge 使用 GitHub API 的 `sha` 条件；ApprovalStore 每一步重新核对精确调用。PR readiness 和部分 protected validation 当前没有在批准后统一重跑。
+
+**R — Result**：代码版本漂移拥有比较明确的乐观并发保护。与此同时，读者也能看清当前实现的真实边界：版本新鲜度保护较强，所有业务证据的批准后重新取证还没有形成统一机制。
 
 ---
 
-## 11. PR Review 发布和 PR Merge 是两种不同的保护动作
+## 9. `expected_head_sha`：代码类远端 Mutation 的核心版本锚点
 
-PR Agent 可以生成代码审阅，但真正发布 Review 是远端写入。系统会把待发布 Review 正文、事件和目标 PR 固定成计划，再等待用户批准。
+第 07 章已经介绍了 `source_ref`：Coding Agent 基于一个精确 commit 构造候选。
 
-Merge 更严格，因为它改变 PR 生命周期和目标分支。除了 Approval，还要重新检查：
+到了第 08 章，这个精确 SHA 会继续进入远端 Mutation Plan，成为 `expected_head_sha`。
 
-- PR 当前仍 open；
-- 当前不是不允许合并的状态；
-- head SHA 与已评估版本一致；
-- 当前有效 Review 满足要求；
-- CI 当前状态满足要求；
-- 其他 merge readiness 条件仍成立。
-
-所以“用户批准 merge”不代表忽略业务阻塞项。
-
----
-
-## 12. 当前 Review 怎样参与 Merge 前置判断
-
-PR 历史里同一个审阅者可能先 REQUEST_CHANGES，后面又 APPROVE。运行时需要归一成每位审阅者当前有效 Review，而不是把所有历史事件都当永久阻塞。
+可以把这条链记成：
 
 ```mermaid
 flowchart LR
-    H[Review 历史] --> N[按 reviewer 归一]
-    N --> E[当前有效事件]
-    E --> M[merge readiness / protected merge]
+    A[读取 source_ref = S1] --> B[基于 S1 创建 Coding Workspace]
+    B --> C[生成 CandidatePatch]
+    C --> D[Verification passed]
+    D --> E[Mutation Plan 带 expected_head_sha = S1]
+    E --> F[用户审批]
+    F --> G[执行时检查远端版本]
 ```
 
-同理，CI 也关注当前相关 workflow 状态。新的提交产生新运行以后，不能让一条旧失败永远定义当前 head。
+### 9.1 Repository 修改的例子
 
-这些判断属于 PR 业务层，而不是 ApprovalStore 自己凭空理解 GitHub 语义。
+假设候选基于默认分支 S1 生成，并通过了全部验证。
+
+系统生成 `commit_to_default_branch(expected_head_sha=S1)` 的计划，然后等待用户。
+
+等待期间，其他开发者把默认分支推进到了 S2。
+
+用户此时点击批准，ApprovalStore 仍然可以确认“用户确实批准过这项 S1 计划”，但 Provider 重新读取默认分支后会看到 S2，于是拒绝旧 mutation。
+
+```mermaid
+flowchart TD
+    A[候选基线 S1] --> B[Approval 等待]
+    B --> C[远端 main 变成 S2]
+    C --> D[用户 Approve]
+    D --> E[Provider GET 当前 main]
+    E --> F{head == S1?}
+    F -->|否| G[409 conflict，停止写入]
+    F -->|是| H[创建并提交候选 commit]
+```
+
+### 9.2 这是一种乐观并发控制
+
+审批期间，GitAgent 不会锁住远端 branch，也不会阻止其他人继续提交。
+
+系统允许外部世界正常变化，只在真正执行 mutation 时比较“现在看到的版本”与“生成候选时依赖的版本”。
+
+这就是典型的 optimistic concurrency 思路。
+
+### 9.3 STAR 复盘
+
+**S — Situation**：用户审批是一个不可预测长度的等待窗口。锁住 GitHub 分支会严重干扰协作，而且普通 GitHub API 也没有为这种 Agent 审批流程提供长期锁语义。
+
+**T — Task**：允许其他人继续工作，同时阻止旧候选在基线已经变化后继续落到新版本上。
+
+**A — Action**：从 `ChangeRequest.source_ref` 把精确 SHA 带进 Mutation Plan，并在 create branch、commit、default-branch commit 或 merge 条件中使用 `expected_head_sha`。
+
+**R — Result**：远端无需长期加锁，旧版本候选也拥有明确的冲突检测点。发生版本漂移时，工作流需要重新取证、重新生成计划或重新审批。
 
 ---
 
-## 13. 为什么远端写的失败不能和读取一样自动重试
+## 10. Review 历史和 CI 怎样参与 Merge readiness
 
-读取类能力通常满足一个简单性质：同一个请求再读一次，不会多创建一个外部对象。
+Merge readiness 是 PR 提案阶段的一个重要结构化产物。
 
-写入不同。假设“发布评论”请求已经到达 GitHub，GitHub 成功创建了评论，但响应在网络中丢失。客户端看到的是超时，却不知道副作用是否发生。
+PullRequestAgent 会读取当前 PR metadata、Review 历史、workflow runs，再结合 Coding review 的结论生成三组信息：
 
-如果此时自动重试，可能发布两条相同评论。
+- `satisfied`：已经满足的条件；
+- `blockers`：当前明确阻塞 merge 的条件；
+- `remaining`：还缺少证据或需要人工确认的事项。
+
+最后根据这三组内容得到 readiness status：
+
+| 情况 | readiness status |
+|---|---|
+| 存在 blocker | `需要继续修改` |
+| 没有 blocker，但仍有 remaining | `处理少量事项后合并` |
+| blocker 和 remaining 都为空 | `准备合并` |
+
+只有最后一种状态才允许 `github.merge` 通过 protected validation 进入 Approval。
+
+### 10.1 Review 历史先归一成“每位 reviewer 当前有效状态”
+
+同一个 reviewer 可能先提交 `REQUEST_CHANGES`，后来又提交 `APPROVE`。
+
+Merge readiness 不会简单把所有历史事件永久叠加。`effective_review_events` 会先按 reviewer 归一，取每位 reviewer 当前有效的 Review 状态，再判断是否仍存在有效的 `REQUEST_CHANGES` 或已经出现有效的 `APPROVE`。
+
+```mermaid
+flowchart LR
+    A[Review 历史] --> B[按 reviewer 归一]
+    B --> C[当前有效 Review]
+    C --> D[merge_readiness]
+```
+
+### 10.2 CI 也只看当前相关 workflow runs
+
+PullRequestAgent 会从已经观察到的 workflow runs 中整理当前相关运行。
+
+只要存在失败 run，就产生 blocker；没有任何 CI 证据时进入 remaining；还有未完成 run 时也进入 remaining；全部完成且没有失败才算 satisfied。
+
+### 10.3 STAR 复盘
+
+**S — Situation**：PR Review 和 CI 都是历史型数据。同一 reviewer 可以多次改变意见，同一 PR 也会产生多轮 workflow run。
+
+**T — Task**：在产生 merge 提案前，把历史记录归一成当前有效状态，再决定当前是否已经具备 merge 资格。
+
+**A — Action**：Review 先按 reviewer 归一；CI 使用当前相关 runs；PullRequestAgent 把 PR 状态、代码审阅、Review 和 CI 组合成 `merge_readiness`。
+
+**R — Result**：Merge Approval 建立在一份明确的 readiness 结论上。需要同时记住第 8.7 节的边界：这个 readiness 当前在提案形成时计算，批准恢复后没有统一重新取证。
+
+---
+
+## 11. WRITE / DESTRUCTIVE Capability 失败后为什么不会自动重试
+
+这一节放在执行链讲清楚以后再看，会更容易理解。
+
+CapabilityLayer 对 Provider 调用有统一重试框架，但 `_recoverable` 明确限制：**只有 READ capability 才可能因为 TIMEOUT、UNAVAILABLE 或短时间 RATE_LIMITED 进行一次恢复重试。**
+
+WRITE 和 DESTRUCTIVE capability 不进入这条自动重试路径。
+
+### 11.1 远端写失败存在“副作用是否已经发生”的不确定窗口
+
+以发布 Review 为例：
 
 ```mermaid
 sequenceDiagram
-    participant G as GitAgent
-    participant H as GitHub
-    G->>H: 创建评论
-    H->>H: 评论已创建
-    H--xG: 响应丢失
-    Note over G: 本地只知道“结果未知”
+    participant A as GitAgent
+    participant G as GitHub
+    A->>G: POST Review
+    G->>G: Review 已创建
+    G--xA: 响应在网络中丢失
+    Note over A: 本地只看到调用失败或超时
 ```
 
-因此远端 mutation 的恢复策略必须区分：
+这时客户端无法仅凭超时判断 GitHub 有没有已经完成写入。
 
-- 明确没有执行；
-- 明确执行失败且无副作用；
-- 结果不确定，可能已经发生副作用。
+如果 CapabilityLayer 自动把同一个 WRITE 再发一次，就可能创建重复评论、重复 Review 或其他重复副作用。
 
-最后一种不能简单当作“可安全重试”。第 09 章会把错误分类和恢复边界一起说明。
+### 11.2 版本冲突类失败更容易判断
 
----
+create branch、commit、default-branch commit 在发现 `expected_head_sha` 不匹配时，会在真正写请求之前抛出冲突，并标记 `request_sent=false`。
 
-## 14. Approval 等待期间为什么可以跨进程恢复
+这一类错误有比较明确的“写请求尚未发送”语义。
 
-Approval 本身是稳定结构化对象，Agent Loop 的 waiting 状态也有明确调用身份。因此进程退出后，应用可以恢复“当前正在等待哪一个精确计划”的控制状态。
+但通用远端 WRITE 错误不能都拥有这种保证，所以 CapabilityLayer 采用更保守的统一策略：远端 mutation 不自动重试。
 
-但恢复不是把旧 Python future 重新接起来，而是从持久状态重建 AgentContext、pending call 和 ApprovalStore，再等待用户输入。
+### 11.3 多步骤计划失败后也不会自动重放整份计划
 
-恢复后真正执行时仍然按当前环境重新校验。旧审批对象不是对世界状态的永久证明。
+前面已经看到，`execute_pending` 中任何一步失败都会 invalidate 当前 Approval 并停止。
 
-详细的状态来源和恢复步骤放在下一章。
+系统不会因为“用户已经批准整个 Issue 修复计划”就从头再跑 create branch、commit、push、Draft PR。
 
----
+下一章会继续讨论：哪些失败可以安全恢复，哪些失败必须先重新读取远端事实再决定下一步。
 
-## 15. 一次 PR Merge 怎样走完资格链
+### 11.4 STAR 复盘
 
-假设用户问：“如果 PR #45 没问题就合并。”
+**S — Situation**：READ 超时通常可以再读一次；WRITE 超时时，外部副作用可能已经完成，只是响应没有成功回来。
 
-**收集事实**：PR Agent 读取当前 PR、head SHA、Review 和 CI，必要时调用 Coding Agent Review。
+**T — Task**：避免 Runtime 因为自动恢复机制制造重复远端对象或重复 mutation。
 
-**形成 readiness**：当前 open、非 Draft、代码审阅无 blocking issue、人工 Review 和 CI 满足要求。
+**A — Action**：CapabilityLayer 的自动 recoverable 条件只放行 READ；WRITE 和 DESTRUCTIVE 出错后直接返回结构化失败，多步骤 Approval 同时停止并失效。
 
-**生成计划**：PR Agent 构造精确 merge capability 调用，参数包含目标 PR 和必要版本约束。
-
-**进入 Approval**：系统把待执行动作展示给用户，同时保存 pending 控制状态。
-
-**用户批准**：应用把回复识别为 approve，ApprovalStore 对原精确调用授权。
-
-**执行前重验**：重新确认 PR 状态和当前 head。假设此时 head 已变化，那么旧 code review 和旧 readiness 不再证明新 head 安全，系统拒绝旧 merge 计划。
-
-**只有前提仍成立才执行**：调用真实 GitHub merge 能力，成功后完成 Approval，并返回业务结果。
-
-这说明“批准”处在资格链中间，不是最后一个检查点。
+**R — Result**：远端写失败处理更保守，重复副作用风险下降。代价是恢复流程需要重新确认外部事实，不能依赖透明重试解决。
 
 ---
 
-## 16. STAR 复盘：为什么审批不能只是一个 yes/no 弹窗
+## 12. 用四个完整场景把整条链串起来
+
+前面的模块拆开看完以后，再把常见场景从头走一遍。
+
+### 12.1 Repository：直接修改默认分支
+
+```mermaid
+flowchart TD
+    A[RepositoryAgent 提出代码修改] --> B[CodingAgent 生成 CandidatePatch]
+    B --> C[Verification passed]
+    C --> D[构造 commit_to_default_branch plan\nexpected_head_sha = source_ref]
+    D --> E[ApprovalRequest + PendingCall]
+    E --> F[用户 Approve]
+    F --> G[ApprovalStore 精确授权]
+    G --> H[Provider 读取当前默认分支 head]
+    H --> I{仍等于 source_ref?}
+    I -->|否| J[冲突并 invalidate Approval]
+    I -->|是| K[创建 tree / commit 并推进默认分支]
+```
+
+这个场景最适合记住“Verified Candidate → Mutation Plan → Approval → expected head check → Remote Mutation”这条主链。
+
+### 12.2 Issue：修复问题并创建 Draft PR
+
+```mermaid
+flowchart LR
+    A[Verified Candidate] --> B[四步计划]
+    B --> C[一次 Approval]
+    C --> D[create branch]
+    D --> E[commit]
+    E --> F[push confirm]
+    F --> G[create Draft PR]
+```
+
+同一个 Approval 覆盖四项已经固定的动作，每一步按 `_remaining` 顺序消费。
+
+任何一步失败，剩余计划停止，旧 Approval 失效；已经完成的前面步骤不会自动撤销。
+
+### 12.3 PR patch：把已验证候选提交到当前 PR branch
+
+PullRequestAgent 先把当前 PR head SHA 作为 `source_ref` 交给 Coding Agent。
+
+候选通过验证后，系统检查当前 PR branch、source repository 和候选参数，再创建单步骤 `github.commit` Approval。
+
+用户批准后，Provider 重新读取该 branch head。只有它仍然等于候选的原始 head SHA，commit 才会继续。
+
+### 12.4 PR Merge：先形成 readiness，再审批精确 merge call
+
+```mermaid
+flowchart TD
+    A[读取 PR / Reviews / CI / Diff] --> B[Coding review]
+    B --> C[计算 merge_readiness]
+    C --> D{status = 准备合并?}
+    D -->|否| E[拒绝 merge 提案]
+    D -->|是| F[构造 merge call\npr_number + expected_head_sha]
+    F --> G[Capability 返回 ASK]
+    G --> H[Approval]
+    H --> I[用户 Approve]
+    I --> J[精确授权消费]
+    J --> K[GitHub Merge API\n带 sha 条件]
+```
+
+这个场景还要额外记住：readiness 在提案前形成；批准后当前 Harness 不会统一重新读取 Review 和 CI。merge 的 head 版本仍然通过 `expected_head_sha` 得到保护。
+
+---
+
+## 13. 这一模块的职责边界怎样划分
+
+把源码按职责重新归纳，可以得到下面这张图。
+
+```mermaid
+flowchart TD
+    A[Domain Agent / Coding Result] --> B[业务计划形成]
+    B --> C[StructuredCallDispatcher]
+    C --> D[ApprovalStore]
+    C --> E[AgentContext.pending]
+    D --> F[PermissionPolicy]
+    F --> G[CapabilityLayer]
+    G --> H[GitHub Provider]
+    H --> I[GitHub]
+```
+
+| 层 | 主要职责 | 不应该承担的职责 |
+|---|---|---|
+| Domain Agent | 决定业务动作、收集业务证据 | 自己发放最终授权 |
+| Coding Agent | 生成并验证本地候选 | 决定用户是否同意远端写 |
+| StructuredCallDispatcher | 业务 preflight、排队 Approval、恢复后执行 pending plan | 代替 GitHub Provider 实现所有远端细节 |
+| ApprovalStore | 保存审批状态、精确调用队列、一次性顺序授权 | 理解 PR Review/CI 的业务语义 |
+| PermissionPolicy | 根据 Agent policy 决定 ALLOW/ASK/DENY，并接入 ApprovalStore | 自己生成业务候选 |
+| GitHub Provider | 执行真实 GitHub API 和 mutation 自身检查 | 判断自然语言用户意图 |
+
+这张表很适合复习时定位问题。
+
+如果你在问“为什么这个 Merge 连 Approval 都进不去”，先看 PullRequestAgent readiness 和 protected validation。
+
+如果你在问“用户明明批准了，为什么参数改一点就执行不了”，看 ApprovalStore 的 exact-call 比较。
+
+如果你在问“用户批准后 main 更新了，为什么 commit 被拒绝”，看 GitHub Provider 的 `expected_head_sha` 检查。
+
+如果你在问“超时后为什么没有自动再发一次”，看 CapabilityLayer 的 READ-only recoverable 策略。
+
+---
+
+## 14. 整体 STAR：这套 Approval + Mutation 设计最终解决了什么
+
+前面已经按阶段做过 STAR，这里再把整章合起来复盘一次。
 
 ### S — Situation
 
-代码候选形成到用户真正回复之间，远端状态可能变化；同一计划可能包含多个写步骤；自然语言回复也可能表示批准、拒绝或修改要求。远端写一旦发生，网络失败还可能让本地无法确定副作用是否已经落地。
+Agent 可以读取大量仓库信息，也能生成代码、Review、评论和 Merge 决策。但 GitHub 写操作具有真实外部副作用，而且用户审批可能引入较长等待。等待期间 branch head 可能移动，多步骤计划还可能执行到一半失败。
 
 ### T — Task
 
-系统需要让用户授权和具体动作一一对应，让计划修改后旧授权立即失效，让每一步执行仍然验证当前事实，并避免把不确定写失败当成普通可重试错误。
+系统需要把“模型建议做什么”收敛成一组精确远端调用，让用户确认这组调用；批准后只能执行原计划里的动作；代码类 mutation 还要在真正写入时检查关键版本前提。
 
 ### A — Action
 
-GitAgent 由 Domain Agent 把 CandidatePatch 转换成结构化 Mutation Plan；ApprovalRequest 绑定 Session、capability、规范化参数和步骤顺序；用户自然语言先分类成意图，再对精确计划授权；执行前重新经过权限和业务 preflight；代码发布用 expected head SHA 做版本检查；多步骤计划顺序消费授权；计划修订会 supersede 旧 Approval；不确定远端写失败不盲目重试。
+GitAgent 先把已验证候选或结构化写提案转换成 `PlannedCapabilityCall`；在进入 Approval 前执行对应业务 gate；`ApprovalStore` 保存精确调用队列，`PendingCall` 保存 Agent Loop 等待位置；用户回复先分类成结构化审批意图；批准后 `PermissionPolicy` 逐项调用 `ApprovalStore.authorize`；Provider 再执行 mutation 自身的版本与参数检查；WRITE/DESTRUCTIVE 调用失败后不做透明自动重试。
 
 ### R — Result
 
-模型不能因为一次用户同意就获得泛化写权限，旧候选也不能在远端变化后悄悄继续发布。代价是远端工作流更长，冲突时需要用户或 Agent 重新取证、重新构造候选和重新审批。
+模型无法因为一次用户同意就获得宽泛 GitHub 写权限，多步骤计划也无法跳步执行。代码候选通过 `expected_head_sha` 与自己验证过的版本保持联系，远端版本漂移可以在关键写路径上被发现。
 
-核心收益是：**用户批准的是一个仍需满足当前事实的精确计划，而不是对 Agent 的长期信任授权。**
+同时，这套实现仍有清楚的边界：多步骤 mutation 没有事务 rollback；部分业务 protected validation 在 Approval 前执行，批准后不会统一重跑；Merge readiness 也没有在恢复审批时重新取证。理解这些边界，比把系统概括成“用户批准后再检查一遍然后写 GitHub”更准确。
 
 ---
 
-## 17. 这一章最容易混淆的地方
+## 15. 最容易混淆的几个点
 
-| 误解 | 正确理解 |
+| 容易产生的理解 | 当前实现 |
 |---|---|
-| CandidatePatch 已验证，所以可以直接 push | 不可以。还缺业务发布计划和远端授权 |
-| 用户说“批准”以后就跳过权限检查 | 不会。授权和当前状态检查是两层 |
-| Approval 绑定的是一段自然语言 | 不是。真正消费的是精确 capability + 参数 + 顺序 |
-| old approval 可以用于修订后的新计划 | 不可以。参数变化后应生成新授权 |
-| 网络超时的远端写一定没发生 | 不能这样假设 |
-| Merge 只需要用户批准 | 不是，还要满足当前 PR / Review / CI / head 等业务前提 |
+| `CandidatePatch` 验证通过后就能直接写 GitHub | 还要形成业务 Mutation Plan，并经过远端写权限与 Approval |
+| Mutation Plan 全部由 Domain Agent 手工生成 | 已验证代码路径有确定性 plan builder；普通远端写也可能由结构化 capability call 在 `ASK` 后自动排成单项 Approval |
+| Approval 只保存一个 yes/no | ApprovalRequest 还保存 calls，并维护有顺序的 `_remaining` 精确调用队列 |
+| 用户批准后模型可以调整调用参数 | 参数变化后 exact-call 匹配失败，旧 approval id 无法授权 |
+| 多步骤 Approval 可以从任意一步开始 | 只能匹配 `_remaining[0]`，所以必须按原顺序消费 |
+| 所有 protected validation 都会在批准后重新运行 | 当前不会统一重跑；批准后主要重新做 Capability 授权和 mutation 自身的远端版本检查 |
+| Merge Approval 后一定重新读取 Review 和 CI | 当前 Harness 没有这一步；提案前 readiness 已计算，执行时主要用 expected head SHA 约束版本 |
+| WRITE 超时以后 Runtime 会自动重试一次 | 自动恢复重试只面向 READ，远端 WRITE/DESTRUCTIVE 不自动重试 |
+| Issue 四步计划失败后会整体回滚 | 当前只停止并 invalidate；已经成功的前置 GitHub 副作用可能保留 |
+| `push` 等于执行本地 `git push` | 当前 GitHub client 中它主要确认 branch ref 已存在 |
 
 ---
 
-## 18. 复习时怎样讲这一章
+## 16. 复习时可以怎样讲这一章
 
-推荐围绕“资格链”讲：
+如果面试或复习时需要在几分钟内把这一模块讲清楚，可以沿着下面这条线：
 
-> 本地先形成基于精确 source SHA、当前 revision 已验证的 CandidatePatch；Domain Agent 再把它变成业务特定 Mutation Plan；用户审批绑定精确调用和顺序；真正执行时仍重新检查 Capability 权限和当前远端事实。任何一层前提变化，旧授权都不能把旧候选强行发布。
+> 第 07 章先产生基于精确 `source_ref` 的 `CandidatePatch` 和验证结果。第 08 章再根据 Repository、Issue、PR 等业务场景把它转换成结构化 Mutation Plan；普通 Review、Merge、评论等远端写也会先变成结构化 capability call。计划进入 Approval 后，ApprovalStore 保存 exact capability + arguments + 顺序，AgentContext 保存 pending 控制点。用户回复先经过 intent classifier，真正批准后 PermissionPolicy 才逐项消费 Approval。随后 Provider 执行 GitHub mutation；代码类写操作通过 `expected_head_sha` 检查关键版本前提。多步骤计划中途失败会让旧 Approval 失效并停止，远端 WRITE 不做自动透明重试。当前 protected validation 主要发生在提案阶段，批准后没有统一重新计算 PR readiness，这一点需要单独记住。
 
-## 19. 代码定位
+这段话基本覆盖了本章的主设计链和关键边界。
+
+---
+
+## 17. 代码定位
 
 | 想核对的问题 | 主要位置 |
 |---|---|
-| ApprovalRequest / ApprovalStore | `gitagent/harness/constraints/approval.py` |
-| Repository / Issue Mutation Plan | `gitagent/harness/mutation_plans.py` |
-| 结构化调用等待和执行 pending plan | `gitagent/harness/structured_call_dispatcher.py` |
-| 用户审批意图识别 | `gitagent/application/approval_intent.py` |
-| 服务层继续审批 | `gitagent/application/service.py` |
-| PR protected validation / merge readiness | `gitagent/agents/pull_requests.py` |
-| GitHub commit / push / review / merge | `gitagent/infra/github/client.py` |
+| `ApprovalRequest` / `ApprovalStore` / exact-call 顺序授权 | `gitagent/harness/constraints/approval.py` |
+| Repository / Issue 代码候选 Mutation Plan | `gitagent/harness/mutation_plans.py` |
+| Approval queue、pending 执行、protected validation | `gitagent/harness/structured_call_dispatcher.py` |
+| `PendingCall` 数据结构 | `gitagent/agent_loop/models.py` |
+| `invoke_approved` 与 Capability 调用上下文 | `gitagent/harness/context/state.py` |
+| Capability 的 ALLOW / ASK / DENY 与 Approval 消费 | `gitagent/capability/policy.py` |
+| WRITE 不自动重试的 Capability 执行策略 | `gitagent/capability/layer.py` |
+| 用户 approve / reject / revise / question / ambiguous 分类 | `gitagent/application/approval_intent.py` |
+| 等待审批后的 Service 恢复与 PR Review 修订 | `gitagent/application/service.py` |
+| PR patch、merge readiness | `gitagent/agents/pull_requests.py` |
+| Review 历史归一 | `gitagent/domain/reviews.py` |
+| create branch / commit / default commit / Review / Merge 的 GitHub 实现 | `gitagent/infra/github/client.py` |
+| 各 Agent 对 GitHub mutation 的 `ask` 配置 | `capabilities.yaml` |
 
-下一章解决这条链最容易被忽略的问题：[如果进程退出、错误发生或 Session 重启，GitAgent 凭什么知道任务之前进行到哪里](09-persistence-recovery-observability.md)。
+下一章继续回答这条链的另一个问题：[如果进程退出、写调用失败或 Session 重启，GitAgent 怎样恢复之前的控制状态，并判断哪些动作还能安全继续](09-persistence-recovery-observability.md)。
