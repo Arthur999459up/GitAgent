@@ -2,7 +2,7 @@
 
 第 03 章已经讲过 Agent Loop：模型先决定“下一步想做什么”，GitAgent 再真正执行，并把结果写回去，让模型继续判断。
 
-这一章只把其中的 **“模型思考这一轮”** 拆开来看。重点不是某个 Prompt 怎么写，而是回答四个更基础的问题：
+这一章只把其中的 **“模型思考这一轮”** 拆开来看。重点放在四个更基础的问题，Prompt 的具体写法只作为背景：
 
 1. 模型这一轮到底能看到什么？
 2. Main Agent 和 child Agent 的消息从哪里来？
@@ -25,7 +25,7 @@
 
 模型第一次被调用时，并不会自动获得整个仓库，也不会自己打开 `auth.py`。它只能看到 GitAgent 这一轮明确发给它的消息，以及这一轮允许它使用的 tool schemas。
 
-因此，第一轮模型很可能不会直接给出结论，而是先提出一个“读取 `auth.py`”的 tool call。
+因此，第一轮模型很可能先提出一个“读取 `auth.py`”的 tool call，拿到证据以后再给出结论。
 
 ### T｜要解决的问题：模型的“想做”怎样变成系统的“真的做了”
 
@@ -124,7 +124,7 @@ AgentContext = 当前 Agent 的完整工作台
 
 如果所有运行时对象都必须先改写成 Prompt，Agent 的控制逻辑就会和模型表达方式绑死。现在把两层分开后，waiting、workspace、cache 等状态可以继续使用确定的数据结构；只有模型这一轮真正需要的内容才进入上下文。
 
-这也是后面理解 Context Builder、Reasoner 和 ChatClient 的基础：它们都不是在“复制整个 Agent”，而是在逐步构造和解释 **模型可见视图**。
+这也是后面理解 Context Builder、Reasoner 和 ChatClient 的基础：它们逐步构造和解释 **模型可见视图**，完整 Agent Runtime 仍由 Harness 单独维护。
 
 ---
 
@@ -145,7 +145,7 @@ Main Agent  ：从 Session 的持久事件历史重建
 child Agent ：从自己的 system prompt + 父 Agent 委派任务开始
 ```
 
-这不是实现细节，而是多 Agent 上下文隔离的关键边界。
+这属于多 Agent 上下文隔离的关键边界，会直接影响父子 Agent 的信息范围和恢复语义。
 
 ### A｜具体做法一：Main 从 durable Session history 构造当前线程
 
@@ -323,7 +323,7 @@ ModelResponse
 
 更重要的是，Provider-specific 适配发生在 outbound 副本上，canonical 消息线程不需要为了兼容某个服务而整体变形。这样持久化、恢复和内部调度都可以依赖相对稳定的消息格式。
 
-所以 Reasoner 与 ChatClient 分开，并不是为了“多加一层抽象”，而是明确区分两个问题：
+所以 Reasoner 与 ChatClient 分开，目的在于明确区分两个问题，额外的抽象层只是实现这种职责划分的代价：
 
 **Reasoner 回答“GitAgent 希望从模型得到什么”；ChatClient 回答“这个模型服务具体怎么调用、返回值具体怎么读”。**
 
@@ -397,7 +397,7 @@ tool result:         call-123
 
 ### A｜具体做法：结构化流程同时检查目标 function、数量和 schema
 
-当调用方要求 typed structured output 时，系统不是看到“有个 tool call”就算成功，而是按顺序检查：
+当调用方要求 typed structured output 时，系统会按顺序检查目标 tool、调用数量和参数结构，单纯出现一个 tool call 还不能判定成功：
 
 ```mermaid
 flowchart LR
@@ -513,7 +513,7 @@ flowchart TD
 | 普通输出 vs typed structured output | 区分人类可读结果和机器合同 | 程序需要从自然语言重新猜字段 |
 | 分阶段错误类型 | 区分请求、Provider、输出协议失败 | 重试、恢复和观测只能把所有错误混成一类 |
 
-可以看到，这些层并不是为了追求“架构看起来复杂”，而是在处理几种本来就不同的问题：运行状态、模型上下文、Provider 传输、结构化协议、真实执行和持久历史。把它们强行放在一个函数里，代码会变短，但边界会变得更难验证。
+可以看到，这些层分别处理运行状态、模型上下文、Provider 传输、结构化协议、真实执行和持久历史。额外层次会增加代码量，但能让这些原本不同的问题拥有清楚、可验证的边界。
 
 ---
 

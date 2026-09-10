@@ -884,46 +884,7 @@ sequenceDiagram
 
 ---
 
-# 第九部分：STAR 总复盘
-
-## 23. 用 STAR 复述这一章
-
-### S — Situation
-
-GitAgent 的一次任务会跨多个 Agent、多个 Turn 和人工审批等待。进程可能在等待期间退出，也可能在某个 Turn 执行中崩溃。与此同时，运行过程中存在模型协议错误、Provider 短暂故障、远端写入结果未知和持久化文件损坏等不同失败类型。
-
-### T — Task
-
-系统需要同时保证：
-
-1. 当前 Session/Turn 状态可查询；
-2. 模型消息和调用历史可按顺序重放；
-3. 等待中的 Agent 控制树可以跨进程重建；
-4. 恢复出来的 parent/child/call/approval 关系能够重新验证；
-5. 失败恢复遵守副作用边界；
-6. 运行过程有足够证据支持 CLI 展示、调试和指标分析。
-
-### A — Action
-
-GitAgent 使用 SQLite 保存 Session、Turn、working state 和 `agent_context`；使用每 Session 一份 append-only Event Log 保存消息和稳定运行事件；模型消息在执行过程中直接进入 Event Log；进入等待时递归序列化 AgentContext；重启后从 Event Log 恢复消息，从 `agent_context` 恢复控制树，再验证拓扑、call correlation 和 mutation plan。
-
-启动阶段先补可由 SQLite 推导的 Event terminal marker，再把遗留 `started` Turn 标记为 interrupted。Event Log 只容忍有明确故障模型的最终坏尾项。
-
-错误恢复按层处理：模型协议错误在 Agent Loop 内纠正；LLM provider 有自己的有限重试；READ Capability 对少数 transient provider error 最多多尝试一次；WRITE/DESTRUCTIVE 遇到结果不确定时停止自动重放；FailureGuard 阻止同一 run 重复提交完全相同的失败调用。
-
-TraceBus 提供实时事件，稳定子集经 SessionEventRecorder 进入 Event Log；AuditLog 保存当前进程内的 Capability audit trail；指标层从 SQLite、Event Log 和当前 Snapshot 做只读 projection。
-
-### R — Result
-
-这套设计让系统在重启以后能够回到一个可证明的等待控制点，同时保持消息历史、业务状态和实时观测各自的职责边界。
-
-代价也很明确：SQLite 与 JSONL 之间需要 startup repair；Snapshot schema 必须长期维护；恢复逻辑需要做较多结构校验；独立的长期 Audit sink 目前仍未提供。
-
-从工程角度看，这些复杂度换来的是更可控的失败语义：已经确认的状态可以恢复，无法确认的副作用会停下来重新取证。
-
----
-
-## 24. 复习时最值得抓住的六个区别
+## 23. 复习时最值得抓住的六个区别
 
 | 容易混淆的概念 | 应该怎样理解 |
 |---|---|
@@ -938,7 +899,7 @@ TraceBus 提供实时事件，稳定子集经 SessionEventRecorder 进入 Event 
 
 ---
 
-## 25. 代码定位：复习时去哪里核对实现
+## 24. 代码定位：复习时去哪里核对实现
 
 | 想核对的问题 | 主要位置 |
 |---|---|

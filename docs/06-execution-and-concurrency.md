@@ -42,17 +42,6 @@ flowchart LR
 
 因此，线程池只承担其中一部分工作。真正决定“这一批调用能不能安全跑完”的，是 profile、分组、admission、group quiescence 和 ordered commit 共同形成的执行协议。
 
-### STAR 小结
-
-| STAR | 本节对应内容 |
-|---|---|
-| S — Situation | 一次模型响应可能同时包含多项工具调用和子 Agent 调用。 |
-| T — Task | Harness 需要让可并发的工作重叠执行，同时保持模型调用顺序可以被稳定解释。 |
-| A — Action | 系统把一批调用依次经过 profile、group、prepare、admission、run、quiesce、commit。 |
-| R — Result | 物理完成顺序可以变化，AgentContext 的逻辑推进仍然稳定。 |
-
----
-
 ## 2. 第一步：先给每个调用一张“执行说明书”
 
 Execution Coordinator 不根据函数名临时猜测并发关系。每个调用在进入调度前都会获得一个 `ExecutionProfile`。它可以理解成 Runtime 使用的执行说明书，里面有三部分信息。
@@ -102,17 +91,6 @@ flowchart TD
     V -->|信息不足| U[UNKNOWN + conservative claims]
 ```
 
-### STAR 小结
-
-| STAR | 本节对应内容 |
-|---|---|
-| S — Situation | Runtime 需要在真正运行前知道每项调用的并发、资源和失败语义。 |
-| T — Task | 把这些语义从具体工具实现中提取出来，交给统一协调器使用。 |
-| A — Action | Provider 或 AgentSpec 生成 `ExecutionProfile`；异常和缺失信息统一降级为 `UNKNOWN`。 |
-| R — Result | Coordinator 可以用统一规则调度不同 Provider 和不同 Agent，同时对未知行为保持保守。 |
-
----
-
 ## 3. 第二步：按原调用顺序切分 execution group
 
 拿到 profiles 后，Coordinator 从第一个调用开始向后扫描，形成一个个 execution group。
@@ -146,17 +124,6 @@ flowchart LR
 这里最值得注意的是“连续”两个字。Coordinator 不会扫描整批调用后把所有 concurrent 项重新拼成一组。D 后面的 E 也不会提前跨过 D 运行。
 
 这样一来，模型产生的调用序列天然形成一道道顺序边界。组内可以利用并发，组与组之间按照原序推进。
-
-### STAR 小结
-
-| STAR | 本节对应内容 |
-|---|---|
-| S — Situation | 一批调用中可能交替出现独立读取、共享资源访问和独占操作。 |
-| T — Task | 找出可以一起运行的局部区间，同时保留模型原有顺序边界。 |
-| A — Action | Coordinator 只合并连续、均为 concurrent、且 claims 两两兼容的调用。 |
-| R — Result | 调度能获得局部并发，又不会通过全局重排让后面的调用跨过前面的逻辑边界。 |
-
----
 
 ## 4. ResourceClaims：把“共享状态冲突”说清楚
 
@@ -202,17 +169,6 @@ flowchart TD
 ```
 
 FIFO 会牺牲一部分极端情况下的吞吐量，因为队首调用暂时拿不到资源时，后面的兼容调用也不能直接插队。换来的结果是资源 admission 的行为更容易预测，也避免长期等待者被持续越过。
-
-### STAR 小结
-
-| STAR | 本节对应内容 |
-|---|---|
-| S — Situation | 多个 batch 和嵌套 Agent 可能同时触碰同一 workspace 或 repository。 |
-| T — Task | 在整个 Runtime 范围内协调共享资源访问。 |
-| A — Action | 用 read/write claims 描述资源，再由 FIFO `ResourceClaimManager` 在运行前原子申请和释放。 |
-| R — Result | 调用即使来自不同 batch，也要经过同一套资源冲突规则。 |
-
----
 
 ## 5. 第三步：Prepare 当前 group
 
@@ -305,17 +261,6 @@ flowchart LR
 
 从运行结构看，这会让一条嵌套 Agent 链保持在已经占用的 worker 内，不再继续向共享 domain pool 递归提交新任务，也让嵌套 cancellation tree 更容易沿当前执行链传播。
 
-### STAR 小结
-
-| STAR | 本节对应内容 |
-|---|---|
-| S — Situation | 即使调用语义允许并发，线程、Provider 和共享资源的实际容量仍然有限。 |
-| T — Task | 把不同来源的容量约束分层管理。 |
-| A — Action | Capability/Domain 使用独立 lane；Capability 再经过 provider semaphore；最后统一申请 ResourceClaims。 |
-| R — Result | 并发量由真实瓶颈逐层收紧，不会只依赖一个粗粒度数字。 |
-
----
-
 ## 7. 第五步：Run 可以乱序完成，但当前 group 要先稳定下来
 
 组内任务提交后，worker 会真正访问 Provider、工作区或子 Agent。多个任务的完成顺序由真实耗时决定。
@@ -398,17 +343,6 @@ Dispatcher 随后会把最终 observation 追加成对应 `call_id` 的 tool res
 | Run | 获得真实执行结果，并在必要时及时保护物理状态一致性 |
 | Commit | 按模型顺序把结果转换成 Agent 可依赖的逻辑事实 |
 
-### STAR 小结
-
-| STAR | 本节对应内容 |
-|---|---|
-| S — Situation | 并发任务的完成顺序不可预测，AgentContext 中很多状态又带有顺序语义。 |
-| T — Task | 在利用并发的同时，保证模型看到的调用历史、缓存、revision 和失败记录有稳定顺序。 |
-| A — Action | group 先 quiesce，再按原调用位置逐项 Commit。 |
-| R — Result | 物理执行可以乱序，逻辑事实仍按照模型发出的顺序建立。 |
-
----
-
 ## 9. waiting：审批出现在批次中间时怎样暂停
 
 waiting 是理解 ordered commit 的一个很好的例子。
@@ -466,17 +400,6 @@ waiting 允许系统保存“已经执行但尚未提交”的结果。持久化
 Coordinator 会先把当前失败调用本身 Commit 成稳定的失败事实，再判断 `failure_stops_batch`。如果 profile 是 FENCE，它会为后续尚未 settled 的 calls 生成 cancelled tool result，并结束 batch。
 
 这样失败本身不会凭空消失，模型下次仍然能看到“哪一项失败、后面的哪些调用因此没有继续”。
-
-### STAR 小结
-
-| STAR | 本节对应内容 |
-|---|---|
-| S — Situation | 有些失败只影响当前读取，有些失败会破坏后续动作的前提。 |
-| T — Task | 明确失败传播边界。 |
-| A — Action | Profile 用 `ISOLATED` 或 `FENCE` 声明失败语义；Coordinator 在 ordered commit 后决定是否停止 batch。 |
-| R — Result | 独立失败不会无谓拖停整批调用，关键顺序边界失败也不会被后续动作直接越过。 |
-
----
 
 ## 11. Cancellation：怎样把父任务、future 和子 Agent 一起收束
 
@@ -622,41 +545,7 @@ Agent 调 Agent 后会形成运行树。CancellationHandle 把 futures、资源�
 
 ---
 
-## 15. STAR 总复盘
-
-### S — Situation
-
-GitAgent 一轮模型响应可以包含多个 CapabilityCall，也可以混合 AgentCall。这些调用的耗时、共享资源、Provider 限制、副作用和失败传播范围都不同；子 Agent 还会继续产生嵌套执行。
-
-### T — Task
-
-Harness 需要同时满足四个目标：利用独立任务的等待时间、保护共享资源、保持模型调用顺序、让 waiting / failure / cancellation 都能收束成可恢复的逻辑状态。
-
-### A — Action
-
-GitAgent 采用了一条分层执行链：
-
-1. Provider 或 AgentSpec 为每项调用给出 `ExecutionProfile`；
-2. Coordinator 只把连续且 claims 兼容的 concurrent 调用组成一组；
-3. 当前 group 按原顺序 Prepare；
-4. Capability 和 Domain Agent 进入各自 lane；
-5. Capability 再经过 provider semaphore；
-6. 所有执行单元运行前都要申请 ResourceClaims；
-7. group 内任务可以并发 Run；
-8. group 先进入稳定状态，再按照模型原顺序 Commit；
-9. waiting 保存已执行但未提交的结果；
-10. `ISOLATED` / `FENCE` 控制失败传播；
-11. cancellation tree 负责收束 futures、资源等待与嵌套 Agent。
-
-### R — Result
-
-独立读取和领域子任务可以真正重叠执行；共享 workspace、repository 与 Provider 不会被无约束争用；AgentContext 的 tool call、缓存、revision、verification 与失败事实仍有稳定顺序；发生审批暂停或父任务取消时，系统也能把当前执行批次收束到可解释状态。
-
-这套方案付出的成本也很明确：Provider 与 Agent 必须提供可靠的执行语义，Runtime 要维护 outcome 暂存、资源队列和 cancellation tree，并发度有时会为了顺序稳定与保守安全而降低。
-
----
-
-## 16. 复习时最容易混淆的概念
+## 15. 复习时最容易混淆的概念
 
 | 容易混淆的说法 | 更准确的理解 |
 |---|---|
@@ -671,7 +560,7 @@ GitAgent 采用了一条分层执行链：
 
 ---
 
-## 17. 面试或复述时怎样讲这一章
+## 16. 面试或复述时怎样讲这一章
 
 建议先画下面这条主线，再展开细节：
 
@@ -699,7 +588,7 @@ flowchart LR
 
 ---
 
-## 18. 代码定位
+## 17. 代码定位
 
 | 想核对的问题 | 主要位置 |
 |---|---|

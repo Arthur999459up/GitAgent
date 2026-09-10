@@ -100,7 +100,7 @@ Memory 和 RAG 的结果最终都需要经过筛选，再注入当前 Context。
 
 **标准回答**
 
-难点不是“怎么开线程”，而是 **并发执行不能破坏共享状态的一致性**。常见做法是资源声明 / 锁、独立 Workspace、版本号或乐观并发控制，并把“物理并行执行”和“逻辑状态提交顺序”分开。
+并发最难的地方在于 **不能破坏共享状态的一致性**，开线程只是实现手段。常见做法是资源声明 / 锁、独立 Workspace、版本号或乐观并发控制，并把“物理并行执行”和“逻辑状态提交顺序”分开。
 
 ### Q13. RAG 的完整流程是什么？为什么常用 Hybrid Retrieval + Rerank？
 
@@ -147,7 +147,7 @@ Prompt 只是 soft constraint，真正的安全必须由 Runtime 强制执行。
 
 **标准回答**
 
-主要不是为了“Agent 更多更强”，而是为了 **职责隔离、Context 隔离和最小权限**。Main Agent 负责路由，领域 Agent 处理 Repository / Issue / PR，Coding Agent 单独处理代码修改，避免代码探索产生的大量上下文污染主 Agent。
+主要目标是 **职责隔离、Context 隔离和最小权限**，并不追求单纯增加 Agent 数量。Main Agent 负责路由，领域 Agent 处理 Repository / Issue / PR，Coding Agent 单独处理代码修改，避免代码探索产生的大量上下文污染主 Agent。
 
 ### Q18. GitAgent 的 Context Compaction 为什么这样设计？怎么证明有效？
 

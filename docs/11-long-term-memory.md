@@ -4,7 +4,7 @@
 
 这一章继续往前走一步，讨论跨 Session 的长期记忆。重点放在 GitAgent 当前实现本身：**一轮已经完成的交互怎样进入 Memory 提取流程，候选记忆怎样写成 Page，未来任务怎样检索这些 Page，以及这些内容怎样被更新、停用和整理。**
 
-本章采用 STAR 作为整体讲解骨架，但阅读顺序会先把系统结构摆出来。先知道“它具体怎么运转”，再讨论各处设计解决了什么问题。这样复习时更容易把源码、运行流程和设计理由串在一起。
+本章沿写入、读取和维护三条链路展开。先把状态和数据流走通，再在对应位置解释为什么这样设计、失败时怎样处理，以及当前实现还有哪些边界。
 
 ---
 
@@ -54,7 +54,7 @@ flowchart LR
 
 ---
 
-# S — Situation：长期记忆处在什么运行环境里
+# 第一部分：长期记忆处理哪类信息
 
 ## 2. Memory 在 Session 与实时外部事实之间的位置
 
@@ -76,7 +76,7 @@ GitAgent 的 Session 能保存 Turn、事件、工作状态和恢复信息。它
 
 ---
 
-# T — Task：这个模块需要完成哪些事情
+# 第二部分：长期记忆需要满足哪些要求
 
 ## 3. 从实现目标看，Memory 系统要同时解决六件事
 
@@ -91,11 +91,11 @@ GitAgent 的 Session 能保存 Turn、事件、工作状态和恢复信息。它
 | 不拖垮主业务 | Memory 提取失败时，已经完成的业务 Turn 仍保持成功状态 |
 | 可恢复、可审计 | 进程重启后能继续未完成的提取；Page 是可检查的持久文件，索引可以重建 |
 
-下面进入 STAR 中最重要的 A，也就是系统具体采取了哪些动作。
+下面沿真实运行顺序进入写入、检索和维护流程。
 
 ---
 
-# A — Action：GitAgent 的长期记忆具体怎样实现
+# 第三部分：长期记忆怎样写入、检索和维护
 
 ## 4. 第一步：业务 Turn 先完成，随后才进入 Memory 流程
 
@@ -842,24 +842,9 @@ flowchart TD
 
 ---
 
-# R — Result：这套设计最后带来了什么
+# 第四部分：用完整场景检查设计边界
 
-## 13. 把前面的实现重新压成一张 STAR 结果表
-
-| STAR | GitAgent 当前做法 | 最终效果 |
-|---|---|---|
-| Situation | Session 历史、跨会话知识、实时外部事实生命周期不同 | 需要单独的长期知识层 |
-| Task | 保存少量稳定知识，支持跨 Session 检索，同时允许更新、过期和删除 | Memory 必须有写入、读取、维护和恢复四类能力 |
-| Action | completed Turn + durable cursor + bounded extraction context + isolated Extractor + Page Store + lexical Search + ephemeral guidance + Dream | 模型判断长期价值，程序控制边界、一致性与生命周期 |
-| Result | 新 Session 能复用长期偏好和项目背景，Memory 失败不破坏主业务，旧信息能逐步退出正常检索 | 跨会话连续性提高，同时保留实时验证和恢复能力 |
-
-如果面试或复习时要用一句完整的话串起来，可以这样讲：
-
-> GitAgent 在业务 Turn 已经完成以后，把待提取序号先持久化；Context Builder 只把最近背景和 cursor 之后的新 completed Turn 交给隔离的 Memory Extractor；Extractor 只输出结构化候选，Page Store 再负责校验、去重、同名更新和安全落盘。未来任务按当前账号、仓库和 query 读取 active Memory，Index 提供摘要地图，Search 选少量相关 Page，并以 ephemeral guidance 注入当前模型请求。TTL、Disable、Forget 和 Dream 再负责让旧知识逐步退出正常使用，提取失败则依靠 durable cursor 在后续恢复。
-
----
-
-## 14. 用一个完整例子把写入和读取链路串起来
+## 13. 用一个完整例子把写入和读取链路串起来
 
 假设用户在仓库 A 的一次 completed Turn 中明确说：
 
@@ -913,7 +898,7 @@ Main 和后续 child Agent 能在本次请求里看到这条长期约定。
 
 ---
 
-## 15. 当前实现最值得注意的几个边界
+## 14. 当前实现最值得注意的几个边界
 
 为了复习时不把“理想设计”和“当前代码”混在一起，下面这些点要单独记住。
 
@@ -932,7 +917,7 @@ Main 和后续 child Agent 能在本次请求里看到这条长期约定。
 
 ---
 
-## 16. Memory、Session、RAG 和实时工具怎样分工
+## 15. Memory、Session、RAG 和实时工具怎样分工
 
 这几个系统都可能给 Agent 提供“当前用户消息之外的信息”，但生命周期和权威性不同。
 
@@ -953,31 +938,7 @@ Main 和后续 child Agent 能在本次请求里看到这条长期约定。
 
 ---
 
-## 17. 从复习角度，怎样分四段讲完这个模块
-
-如果需要在几分钟内完整介绍长期记忆，可以按下面四段顺序讲。
-
-### 第一段：写入触发
-
-业务 Turn 先完成，Memory Hook 再登记 durable pending cursor。提取失败只影响 Memory，不回滚业务结果。进程重建以后可以根据 pending/extracted 差值继续补偿。
-
-### 第二段：提取与落盘
-
-Context Builder 把 completed Turn 分成 context-only 和新 evidence，只保留有限历史；隔离 Extractor 根据固定 schema 产生少量 candidates；Page Store 再负责字段校验、secret 拒绝、去重、同名更新、manual 保护、原子文件写入和索引重建。
-
-### 第三段：未来检索
-
-新任务按 account + repository 读取 private/project active Page。Search 用轻量词法规则从元数据选最多少量相关 Page；完整 Index 加 selected Page body 组成 Memory Context，以 ephemeral guidance 进入当前 Main 和 Domain Agent 请求。
-
-### 第四段：生命周期维护
-
-TTL 让时间敏感 Page 退出 active；disable 保留文件但暂停检索；forget 删除文件；Dream 在满足时间和 Session 数条件后整理 supersedes 和重复自动 Page，并重建索引。stale Page 仍可检索，但会提示重新验证当前仓库/GitHub 事实。
-
-把这四段讲顺，整个模块基本就串起来了。
-
----
-
-## 18. 最后再看一次完整数据流
+## 16. 最后再看一次完整数据流
 
 ```mermaid
 flowchart TD
@@ -1016,7 +977,7 @@ flowchart TD
 
 ---
 
-## 19. 源码定位：复习时应该看哪些文件
+## 17. 源码定位：复习时应该看哪些文件
 
 | 想核对的问题 | 主要文件 | 重点 |
 |---|---|---|
@@ -1035,17 +996,3 @@ flowchart TD
 
 ---
 
-## 20. 一页复习版
-
-最后只保留下面这些句子，也能把核心设计复原出来：
-
-1. GitAgent 只在业务 Turn 已经 completed 以后触发长期记忆流程。
-2. Session 持久层保存 `pending_through_seq` 和 `extracted_through_seq`，所以提取可以增量执行，也能在失败后恢复。
-3. Extraction Context Builder 只给 Extractor 有限 completed Turn，并明确区分 context-only 与新 evidence。
-4. Memory Extractor 是隔离元代理，只产出结构化 candidates，没有仓库、GitHub、审批和 Session mutation 能力。
-5. Page Store 才负责真正的持久化规则：字段校验、secret 过滤、signature 去重、name 更新、manual 保护、安全路径、锁和原子写入。
-6. Memory Page 是权威内容，`MEMORY.md` 是可以从 Page 重建的 active 摘要索引。
-7. 当前 Search 使用轻量词法匹配，主要搜索 name、description、tags、category，默认只选少量 Page，并限制总正文预算。
-8. Memory 通过当前请求的 ephemeral guidance 进入 Main 和 Domain Agent，不会反复写进永久聊天历史。
-9. stale 仍可使用但要核验；TTL 到期会退出 active；disable 保留文件；forget 删除文件；Dream 负责 supersedes、重复自动 Page 和索引整理。
-10. 当前 repository / GitHub 证据和当前用户指令始终应重新确认，长期 Memory 提供的是跨 Session 的稳定背景与工作偏好。

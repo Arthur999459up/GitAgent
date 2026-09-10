@@ -5,7 +5,7 @@
 - **Context Governance**：每次调用模型之前，怎样从历史事实构造当前模型真正能看到的消息；上下文变大以后，又怎样安全压缩。
 - **Read State**：Agent 多次读取仓库文件时，怎样记住已经读过哪些范围，减少重叠读取，并在工作区发生变化后让旧状态失效。
 
-这一章的阅读顺序刻意安排成：**先看系统怎么做，再讨论为什么采用这些设计。** 每个核心模块都会先给出执行流程，随后用 STAR 回看设计动机。
+这一章沿两条状态链展开：先说明模型输入怎样构造和压缩，再解释文件读取状态怎样记录、失效和恢复。关键设计点会直接说明动机、边界和代价，方便把机制和原因放在同一条运行链里理解。
 
 ---
 
@@ -110,26 +110,6 @@ sequenceDiagram
 
 所以恢复出来的消息线程已经包含过去发生过的压缩决定。
 
-### 2.2 再用 STAR 回看这一步的设计动机
-
-**S — Situation**
-
-一个 Session 里同时有 Main 和多个 Domain run，持久化层保存的是按时间追加的事件，模型接口需要的是连续且满足 tool 协议的消息数组。
-
-**T — Task**
-
-系统需要从同一份事件事实中，稳定恢复出某个 Agent 当前应该看到的模型线程，同时兼容历史中的压缩结果。
-
-**A — Action**
-
-GitAgent 使用 Projector 按 Agent 身份和 `run_id` 选择事件，再统一转成 canonical message；tool call/result 通过 `call_id` 重新关联，compaction event 在投影阶段直接应用。
-
-**R — Result**
-
-消息历史有明确的恢复路径。进程重启以后，不需要依赖一份长期保存的“最终 prompt 副本”，只要事件仍然完整，就能重新得到对应 Agent 的模型视图。
-
----
-
 ## 3. 第二步：在持久消息之外，加入本轮才需要的上下文
 
 ### 3.1 先看它怎么做
@@ -181,26 +161,6 @@ Domain Agent 的 system message 本身属于它的消息线程。临时 guidance
 
 这些状态没有必要全部转成聊天文字塞给模型。
 
-### 3.3 STAR 复盘
-
-**S — Situation**
-
-Main 当前 system、Domain guidance、Memory 读取结果等信息的生命周期并不相同。全部永久复制进同一类历史，会让消息越来越大，也会让恢复逻辑难以判断哪些内容应该继续沿用。
-
-**T — Task**
-
-模型每轮都要拿到这一轮有效的信息，同时持久消息线程需要保持稳定、可重放。
-
-**A — Action**
-
-GitAgent 让持久消息继续走事件历史和 Agent 消息线程；Main 的当前 system 在构造请求时加入，Domain 的临时 guidance 只叠加到本轮请求。Domain Agent 在压缩后更新持久消息状态时，会重新放回原始 system prompt。
-
-**R — Result**
-
-模型能够拿到本轮需要的信息，临时 guidance 又不会随着每次请求持续写进永久线程。Main 恢复后可以重新使用当前 system，Domain 的持久消息则继续按自己的 run 进行重放。
-
----
-
 # 第二部分：上下文太大以后怎样压缩
 
 ## 4. 第三步：所有消息先经过统一 token 压力检查
@@ -245,26 +205,6 @@ flowchart LR
 
 每一级都会重新计算 token。前一级已经把压力降下来时，后面的更激进策略不会继续执行。
 
-### 4.2 STAR 复盘
-
-**S — Situation**
-
-长任务会持续累积消息、工具参数、工具结果和 tool schemas。一次性采用最激进的裁剪会过早损失上下文，完全不处理又会撞上模型窗口上限。
-
-**T — Task**
-
-系统需要随着上下文压力逐步增加压缩强度，并且每次压缩后重新判断是否已经足够。
-
-**A — Action**
-
-GitAgent 使用 Light → Summary → Emergency 的固定阶段，并在每个阶段结束后重新做 token 计算。
-
-**R — Result**
-
-低压力时保留更多细节，高压力时逐步收缩历史。压缩强度和实际请求大小直接关联，行为更容易预测和测试。
-
----
-
 ## 5. Light：先处理体积大的旧 tool result
 
 ### 5.1 先看它怎么做
@@ -290,26 +230,6 @@ flowchart TD
 ```
 
 这里保留的是 tool message 的协议外壳。`tool_call_id` 不会因为正文被压缩而消失。
-
-### 5.2 STAR 复盘
-
-**S — Situation**
-
-文件正文、搜索结果、日志等 tool result 往往比普通对话大很多，而且这些内容通常已经参与过前面的推理。
-
-**T — Task**
-
-优先回收大块 token，同时尽量少动用户消息、assistant 结论和调用关系。
-
-**A — Action**
-
-Light 阶段只替换达到一定体积的 tool result，并保留对应 tool call 的身份关系。
-
-**R — Result**
-
-很多长任务只靠这一层就能把请求压回安全区，后续历史仍保留较完整的对话结构。
-
----
 
 ## 6. Summary：按原子 span 把早期历史收成 checkpoint
 
@@ -356,26 +276,6 @@ checkpoint 内容由固定规则从被折叠消息中提取：
 
 这里的“deterministic”主要体现在：**边界选择和 checkpoint 拼接遵循固定程序，不交给模型临场自由判断。**
 
-### 6.3 STAR 复盘
-
-**S — Situation**
-
-Light 只能回收大 tool result。随着会话继续增长，普通对话、工具调用、近期推理也会累计到很大。
-
-**T — Task**
-
-系统需要进一步压缩较早历史，同时避免把一个工具调用协议切成两半。
-
-**A — Action**
-
-GitAgent 先划分 atomic span，再只在 span 边界选择 checkpoint 截止位置。早期完整 span 进入 checkpoint，近期 span 保持原样。
-
-**R — Result**
-
-模型得到“早期压缩视图 + 近期完整细节”。压缩过程仍然能够维持 tool call/result 的结构完整性。
-
----
-
 ## 7. Emergency：先守住最小必要上下文，再尽量保留最近历史
 
 ### 7.1 先看它怎么做
@@ -407,26 +307,6 @@ flowchart TD
 如果被省略的历史还能压成 checkpoint 并放进窗口，系统就加上 checkpoint；如果 checkpoint 本身也放不下，就只保留选中的必要消息和近期 span。
 
 如果连“当前 user + 活跃工具协议”这一最低集合都已经超过窗口，系统直接抛出 `ContextWindowExceeded`，停止继续构造无效请求。
-
-### 7.2 STAR 复盘
-
-**S — Situation**
-
-上下文已经接近窗口极限，继续追求完整历史会让下一次模型调用连最基本的输入空间都没有。
-
-**T — Task**
-
-优先保证当前任务还能继续执行，并保护尚未结束的工具协议。
-
-**A — Action**
-
-Emergency 先固定最近 user message 和 open tool span，再从最近历史向前补充；剩余历史尽量转成 checkpoint。最低集合都放不下时立即失败。
-
-**R — Result**
-
-极端压力下，系统仍然优先保住当前任务入口和活动协议，同时给近期上下文最高保留优先级。
-
----
 
 ## 8. tool call/result 协议是压缩过程里的硬边界
 
@@ -460,26 +340,6 @@ sequenceDiagram
 假设历史顺序是“assistant 发出 `c1` → tool 返回 `c1` → assistant 给出下一步结论”。
 
 如果按“只保留最近 N 条”截断，很容易只剩 tool result，或者只剩 assistant call。模型接口看到的调用链会失去对应关系。
-
-### 8.3 STAR 复盘
-
-**S — Situation**
-
-工具调用在模型协议里依靠 `call_id` 形成成对关系。消息条数和协议边界没有直接对应关系。
-
-**T — Task**
-
-任何压缩都必须保证剩余消息仍然是一条合法的模型调用历史。
-
-**A — Action**
-
-GitAgent 先建立 atomic span，压缩边界只落在 span 之间；压缩前后都运行 tool protocol 校验，Emergency 额外保护 open span。
-
-**R — Result**
-
-上下文可以缩短，但不会留下孤立 tool result、悬空 tool call 或被普通消息打断的未完成协议。
-
----
 
 # 第三部分：压缩结果怎样跨重启继续生效
 
@@ -526,26 +386,6 @@ Main 的 `ContextBuilder` 在构造请求时发现 compaction 后，会直接记
 Domain Agent 通过 `AgentContext.model_messages()` 触发同一套压缩，再由 Application 提供的 compaction sink 把计划写入事件历史，并记录压缩前后的 token 使用量。
 
 两条路径最终都使用同一种 compaction event 语义。
-
-### 9.3 STAR 复盘
-
-**S — Situation**
-
-如果压缩只修改当前进程中的 message list，重启以后重新读取原始事件时，早期大段历史又会全部出现。
-
-**T — Task**
-
-压缩后的模型视图需要能够跨进程重放，而且恢复结果要和压缩发生后的线程保持一致。
-
-**A — Action**
-
-GitAgent 把 replacement、checkpoint、保留索引写成 `compaction_checkpoint` 事件；Projector 在恢复时重新应用这些增量。
-
-**R — Result**
-
-上下文压缩拥有可重放的持久化语义。进程重启不会自动回到压缩前的完整消息视图。
-
----
 
 # 第四部分：文件读取状态是怎样工作的
 
@@ -616,26 +456,6 @@ Ledger 用 `(repository, path, ref)` 作为一个文件读取状态的身份键�
 
 校验通过后，才把新的范围加入 coverage，并根据 `truncated` 更新 EOF。
 
-### 11.2 STAR 复盘
-
-**S — Situation**
-
-Coding Agent 会频繁探索同一仓库。一个文件可能先读前 200 行，随后又请求 100–300 行，批量读取还可能同时包含已读和未读文件。
-
-**T — Task**
-
-系统需要避免重复访问已经观察过的区间，同时保证新返回的范围元数据可信。
-
-**A — Action**
-
-GitAgent 把文件读取拆成 Prepare、Execute、Complete。Prepare 计算缺口，Execute 只读取缺口，Complete 校验 Provider 结果后再更新 ledger。
-
-**R — Result**
-
-重复 I/O 明显减少；读取状态有统一入口维护；错误的 Provider 元数据不会直接污染后续 coverage 判断。
-
----
-
 ## 12. Coverage 怎样表示“这个文件到底读到哪里了”
 
 ### 12.1 先看区间合并
@@ -672,26 +492,6 @@ GitAgent 把文件读取拆成 Prepare、Execute、Complete。Prepare 计算缺�
 
 因此，多次调用同一个“默认从头读”的文件读取能力时，Ledger 会逐步把读取窗口向后推进，而不会反复从第 1 行开始。
 
-### 12.3 STAR 复盘
-
-**S — Situation**
-
-只记录一个 `read=true` 无法表达长文件的分段读取，也无法判断一个新请求和旧范围重叠了多少。
-
-**T — Task**
-
-读取状态需要精确到行区间，还要支持“继续读下一段”的自然行为。
-
-**A — Action**
-
-GitAgent 用 coverage ranges 保存已读区间，通过 gap 计算得到下一次真实请求；没有显式起始行时，从第一个未覆盖位置继续。
-
-**R — Result**
-
-系统能够区分“整段读过”“只读过一部分”“中间还有缺口”，分段探索长文件时不会重复读取已经覆盖的大块内容。
-
----
-
 ## 13. EOF 怎样让 Ledger 知道文件已经结束
 
 ### 13.1 先看它怎么做
@@ -703,26 +503,6 @@ Provider 返回文件片段时会同时告诉 Harness 结果是否被截断。
 例如请求 1–500，文件实际只有 230 行。Provider 返回到第 230 行并标记 `truncated=false`，Ledger 随即记录 `eof_line=230`。
 
 以后再请求 200–1000 时，Ledger 会把可计算范围限制到 EOF，230 之后不会再制造新的读取请求。
-
-### 13.2 STAR 复盘
-
-**S — Situation**
-
-仅有 coverage 时，系统知道哪些行读过，却不知道文件在什么位置结束。一个很大的 limit 可能让 Agent 反复尝试读取文件尾部之外的区域。
-
-**T — Task**
-
-读取状态需要区分“这里还没读”和“这里已经没有内容”。
-
-**A — Action**
-
-完整返回时记录 `eof_line`，后续 gap 计算会先受 EOF 限制。
-
-**R — Result**
-
-文件末尾成为明确状态，后续读取不会继续访问已经确认不存在的行区间。
-
----
 
 ## 14. 批量读取怎样处理“一部分已经读过”的情况
 
@@ -743,26 +523,6 @@ Provider 返回文件片段时会同时告诉 Harness 结果是否被截断。
 Complete 阶段再把新结果和“已经覆盖”的项分别整理回当前调用的结果视图。
 
 对完全覆盖的项，返回的是类似 `already_read + coverage` 的状态说明。Ledger 不会从内部拼出旧文件正文，因为它根本没有保存正文副本。
-
-### 14.2 STAR 复盘
-
-**S — Situation**
-
-批量读取中，不同文件的历史 coverage 可能完全不同。如果整批照原参数重新执行，会浪费大量重复 I/O。
-
-**T — Task**
-
-在保持一次批量调用语义的同时，只把真正缺失的读取任务交给 Provider。
-
-**A — Action**
-
-Prepare 对每一项独立算缺口，再重建一份只包含实际读取项的 provider 参数；Complete 把新结果和已覆盖状态重新对应到原请求。
-
-**R — Result**
-
-批量读取也能共享同一份 coverage 状态，已经观察过的文件不会因为和新文件一起批量请求就再次访问底层。
-
----
 
 # 第五部分：读取状态什么时候失效，什么时候恢复
 
@@ -805,26 +565,6 @@ workspace revision 的推进还会进一步查看这次原始结果是否表明 
 
 > **读取状态关心“旧读结果还敢不敢继续复用”，workspace revision 关心“工作区事实是否形成了新的代码版本”。**
 
-### 15.3 STAR 复盘
-
-**S — Situation**
-
-文件一旦被修改，旧 coverage 虽然还能说明“过去读过哪些行”，却无法证明这些行仍然代表当前 worktree。
-
-**T — Task**
-
-任何可能改变仓库内容的成功写操作之后，都要避免旧读取状态继续影响新的事实判断。
-
-**A — Action**
-
-当前实现采用保守策略：成功 WRITE / DESTRUCTIVE capability 后整体清空两类读取状态；bash 导致 worktree 变化时也执行同样清理。
-
-**R — Result**
-
-下一次读取会从当前仓库状态重新建立 coverage。实现简单，安全边界清晰，代价是某个局部文件修改也会让其他文件的读取状态一起失效。
-
----
-
 ## 16. repository、path、ref 共同限定一份 FileCoverage
 
 ### 16.1 先看它怎么做
@@ -840,26 +580,6 @@ FileReadLedger 内部使用三元组作为读取身份：
 - ref 相同且 repository/path 相同时，才能共享这一份行覆盖状态。
 
 这对远端仓库读取尤其重要。例如同一个 `config.py`，Main branch 和某个 PR head 对应的 ref 不同，Ledger 会维护两份独立 coverage。
-
-### 16.2 STAR 复盘
-
-**S — Situation**
-
-路径字符串只能说明文件名，无法单独说明文件来自哪个仓库版本。
-
-**T — Task**
-
-读取覆盖必须绑定到足够明确的仓库身份，避免跨 repository 或跨 ref 复用。
-
-**A — Action**
-
-GitAgent 把 repository、path、ref 一起作为 FileCoverage 的 key。
-
-**R — Result**
-
-同名文件在不同仓库来源下不会共享覆盖状态，读取判断和当前目标版本保持一致。
-
----
 
 ## 17. Pause Snapshot 会保存读取状态，恢复后继续使用
 
@@ -887,26 +607,6 @@ flowchart LR
 ```
 
 因此，一个 Agent 在暂停前已经读过 `a.py` 1–200，恢复后仍然知道这段范围已经覆盖。
-
-### 17.2 STAR 复盘
-
-**S — Situation**
-
-等待用户输入时进程可能结束。只恢复模型消息，却丢掉读取 coverage，会让恢复后的 Agent 把同一批文件重新读一遍。
-
-**T — Task**
-
-读取控制状态需要和等待中的 Agent 控制树一起恢复。
-
-**A — Action**
-
-Pause Snapshot 序列化通用 read cache 与 FileReadLedger，恢复 AgentContext 时重新装载。
-
-**R — Result**
-
-暂停前后的读取行为保持连续，长任务恢复以后不会因为进程变化立刻丢失所有“已经观察过”的运行状态。
-
----
 
 # 第六部分：把两套机制放回一次真实长任务
 
@@ -976,41 +676,11 @@ flowchart TD
 
 ---
 
-## 19. 这一整套设计的总 STAR
-
-### S — Situation
-
-长 Agent 会话同时面临四类压力：
-
-1. 消息历史持续增长，最终会碰到模型 context window；
-2. tool call/result 有严格的 `call_id` 协议，压缩不能破坏调用链；
-3. Coding Agent 会重复读取大量文件，需要记住已经观察过的范围；
-4. 文件会在任务中被修改，旧读取状态随时可能过期，进程还可能在中途暂停和恢复。
-
-### T — Task
-
-Harness 需要同时维持两种一致性：
-
-- **模型上下文一致性**：压缩以后，消息仍然满足 provider 协议，并且重启后可以恢复出相同的压缩视图；
-- **仓库读取一致性**：重复读取尽量被消除，文件变化以后旧 coverage 不再继续影响当前事实，暂停恢复后读取状态仍然连续。
-
-### A — Action
-
-GitAgent 把历史事件投影成 canonical messages，在请求构造阶段加入当前 system 与临时 guidance，然后统一进行 token 压力检查。压缩按 Light、Summary、Emergency 三档推进，边界建立在 atomic span 上，并把 compaction plan 持久化为事件。
-
-文件读取侧单独使用 FileReadLedger，以 `(repository, path, ref)` 记录 coverage 和 EOF；Prepare 只生成未覆盖缺口，Complete 校验 Provider 返回后再更新状态。普通 READ capability 另有通用 `read_cache`。写操作成功或 bash 改变 worktree 后，两类读取状态都会清空；等待中的 Context 会把它们一起保存进 Pause Snapshot。
-
-### R — Result
-
-长会话能够持续控制模型输入体积，tool 协议在压缩后仍然完整，压缩决定可以跨重启重放。Coding Agent 对同一文件的重复访问也被显著减少，仓库变化后又会重新建立读取事实。
-
-整章最终可以压成一句复习结论：
-
-> **消息侧用 atomic span 守住模型协议，用 compaction event 守住恢复一致性；读取侧用 coverage 守住“读过哪里”，用失效清理守住“当前事实”。**
+这一章可以用一条关系收束：**消息侧用 atomic span 守住模型协议，用 compaction event 守住恢复一致性；读取侧用 coverage 记录“读过哪里”，用失效清理保证后续读取重新面对当前事实。**
 
 ---
 
-## 20. 最容易混淆的概念
+## 19. 最容易混淆的概念
 
 | 容易混淆的说法 | 应该怎样理解 |
 |---|---|
@@ -1028,7 +698,7 @@ GitAgent 把历史事件投影成 canonical messages，在请求构造阶段加�
 
 ---
 
-## 21. 复习时建议按这条顺序讲
+## 20. 复习时建议按这条顺序讲
 
 如果面试或复盘时需要在几分钟内讲清楚本章，可以沿着下面这条链：
 
@@ -1059,7 +729,7 @@ flowchart LR
 
 ---
 
-## 22. 代码定位：复习时应该去哪里核对
+## 21. 代码定位：复习时应该去哪里核对
 
 | 想核对的问题 | 主要位置 |
 |---|---|

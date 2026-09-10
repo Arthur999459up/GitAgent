@@ -4,7 +4,7 @@
 
 GitAgent 把这些事情集中放进 Capability 系统。
 
-这一章的学习顺序刻意按照“先看系统怎样做，再理解设计原因”来安排。阅读时先建立完整执行链，再分别理解 Catalog、Registry、Provider、PermissionPolicy 等组件。每个关键设计点后面都会用 STAR 做一次复盘，帮助复习时把背景、目标、实现和结果连起来。
+这一章先建立完整执行链，再分别理解 Catalog、Registry、Provider、PermissionPolicy 等组件。正文会直接解释每个机制解决的问题、运行边界和代价，复习时可以沿 Capability 的生命周期把这些设计串起来。
 
 ---
 
@@ -103,17 +103,6 @@ flowchart LR
 
 同一个 Capability 在不同层承担不同意义，这也是 Capability 对象需要携带结构化元数据的原因。
 
-### 2.3 STAR 复盘
-
-| STAR | 这一设计点对应的内容 |
-|---|---|
-| S — Situation | 模型工具既需要给 LLM 看，也需要给权限、调度和底层执行使用 |
-| T — Task | 用一个稳定对象表达“这项动作是什么”，同时保留到具体实现的明确连接 |
-| A — Action | 用 `Capability` 保存动作契约，用 `CapabilityBinding` 保存执行绑定，再组合成 `CapabilityRegistration` |
-| R — Result | 模型协议、权限控制和 Provider 实现可以围绕同一个 capability id 协作，各层职责仍然清楚 |
-
----
-
 ## 3. 启动阶段：Capability 系统怎样被组装起来
 
 理解运行时调用之前，先看应用启动时这一整套系统怎样建立。
@@ -208,17 +197,6 @@ Provider 都加载完成以后，PermissionPolicy 会检查当前 Registry 中�
 
 所以启动阶段不仅确认“工具能不能加载”，还会确认“权限配置能不能和这些工具正确配合”。
 
-### 3.6 STAR 复盘
-
-| STAR | 这一设计点对应的内容 |
-|---|---|
-| S — Situation | 能力来自配置、本地 handler、GitHub Client、远端 MCP、Skill 文件和动态知识库，启动时状态并不完全相同 |
-| T — Task | 在 Agent 开始推理前，建立一份经过校验的运行时能力集合 |
-| A — Action | Catalog 读取静态定义，应用创建 Provider，Provider `load()` 生成 registration，Layer 按 source 写入 Registry，最后校验权限 |
-| R — Result | Agent 开始运行时，Registry 已经拥有一份可解析、带状态、带 schema、带执行绑定的能力快照 |
-
----
-
 ## 4. Catalog 与 Registry：一个保存配置意图，一个保存当前运行状态
 
 这两个名字很接近，也是复习时最容易混淆的一组概念。
@@ -273,17 +251,6 @@ flowchart TD
 
 远端服务临时离线、Skill 文件缺失、知识库状态变化，都可能让运行时状态和静态配置不同。
 
-### 4.4 STAR 复盘
-
-| STAR | 内容 |
-|---|---|
-| S — Situation | 静态配置相对稳定，外部服务和本地资源的可用状态会变化 |
-| T — Task | 同时保存稳定授权边界和当前运行事实 |
-| A — Action | Catalog 保存静态定义，Registry 保存 Provider 当前注册结果，并按 source 原子替换 |
-| R — Result | 系统可以刷新运行状态，同时保留稳定 capability id 和本地配置边界 |
-
----
-
 ## 5. Provider：不同底层工具怎样接入统一 Capability 协议
 
 ### 5.1 Provider 的公共职责
@@ -324,17 +291,6 @@ flowchart LR
 - RAGProvider 的 target 保存知识库身份和当前状态。
 
 CapabilityLayer 不需要理解这些 target 的内部结构，只需要把 registration 对应的 binding 交还给正确 Provider。
-
-### 5.3 STAR 复盘
-
-| STAR | 内容 |
-|---|---|
-| S — Situation | 文件操作、GitHub API、HTTP MCP、Skill 文本和知识库检索拥有完全不同的调用方式 |
-| T — Task | 给上层提供一套稳定调用协议，同时保留各来源自己的实现细节 |
-| A — Action | 每类来源实现 Provider，由 Binding 保存 Provider 所需目标，Layer 只通过统一 `load/invoke/refresh` 接口交互 |
-| R — Result | Agent Loop 和 Harness 无需针对每一种 SDK 或 transport 编写独立调用流程 |
-
----
 
 ## 6. Discover：当前 Agent 怎样得到自己的工具集合
 
@@ -398,17 +354,6 @@ flowchart LR
 Discover 控制“模型能看到什么”。Invoke 授权控制“系统最终允许执行什么”。
 
 模型工具列表会影响模型行为，所以越聚焦越容易降低误选工具的概率。执行阶段仍然必须重新授权，因为模型返回的调用属于外部输入，不能只依赖先前发给模型的工具列表。
-
-### 6.5 STAR 复盘
-
-| STAR | 内容 |
-|---|---|
-| S — Situation | 不同 Agent 职责不同，完整工具集既庞大又包含不适合当前角色的动作 |
-| T — Task | 只把当前角色需要且当前可用的工具交给模型，同时保留执行阶段的最终权限检查 |
-| A — Action | Registry 先按 AVAILABLE 过滤，PermissionPolicy 再按 Agent discover pattern 过滤，Harness 转成 function schema |
-| R — Result | 模型看到的工具集合更小、更符合角色，真实调用仍然受 invoke 权限保护 |
-
----
 
 ## 7. Invoke：一次 Capability 调用怎样真正执行
 
@@ -556,17 +501,6 @@ FailureGuard 的失败事实并不会在任意工作线程结束时立即写入�
 
 这样做可以让并发执行时的“实际完成顺序”和“Agent 观察到的提交顺序”保持清晰边界。
 
-### 7.12 STAR 复盘
-
-| STAR | 内容 |
-|---|---|
-| S — Situation | 模型调用属于外部生成输入，而且底层能力可能产生文件、网络或远端仓库副作用 |
-| T — Task | 在真实执行前逐层确认调用有效，在执行后统一整理结果和失败语义 |
-| A — Action | Dispatcher preflight → FailureGuard → Registry → schema → authorize → Provider → 恢复 → output schema → ordered commit |
-| R — Result | 每次调用拥有清晰检查路径，模型错误、权限错误、底层错误和返回结构错误可以被分开识别 |
-
----
-
 ## 8. PermissionPolicy：系统怎样控制“看得见”和“真的能执行”
 
 ### 8.1 权限配置采用默认拒绝
@@ -620,17 +554,6 @@ PermissionPolicy 仍会要求 `InvocationContext` 中存在 active workspace roo
 因此 `native.bash` 的 capability 权限只解决“这个 Agent 有没有 Bash 入口”，命令策略继续解决“这一条具体命令能不能执行”。
 
 需要特别注意：当前 Native Bash 是宿主机进程执行机制。工作树范围和命令策略可以降低误操作风险，但它们不等同于操作系统级文件系统或网络 sandbox。
-
-### 8.5 STAR 复盘
-
-| STAR | 内容 |
-|---|---|
-| S — Situation | 一个 Agent 可能只负责阅读，另一个 Agent 可能需要改文件、发评论或合并 PR，各动作风险差异很大 |
-| T — Task | 同时控制模型可见范围和最终执行资格，并让高风险动作获得额外约束 |
-| A — Action | 默认拒绝；discover 控制可见性；invoke 使用 allow/ask/deny；Coding Workspace 和 Bash 再结合上下文做专门判断 |
-| R — Result | Agent 职责可以通过配置明确表达，执行阶段还有最终授权入口，高风险动作不会仅凭模型选择就直接发生 |
-
----
 
 ## 9. NativeProvider：本地文件与命令能力怎样设计
 
@@ -725,17 +648,6 @@ NativeProvider 的 `describe_execution()` 会告诉 Harness：
 
 因此 Capability 除了负责“能不能执行”，还向下一章的 Execution 层提供“应该怎样调度”的语义。
 
-### 9.6 STAR 复盘
-
-| STAR | 内容 |
-|---|---|
-| S — Situation | Coding Agent 需要查找、读取、修改和验证真实项目文件，本地工具如果过于自由，操作意图和影响范围很难判断 |
-| T — Task | 把本地开发动作拆成可验证、可限制、可调度的结构化操作 |
-| A — Action | 分离 glob/grep/read/edit/write/bash；限制授权 root；精确 edit 要求唯一匹配；Provider 给出读写执行 profile |
-| R — Result | 文件操作拥有明确证据链，路径和修改范围更容易控制，并发调度也能依据读写语义进行 |
-
----
-
 ## 10. MCPProvider：GitHub 本地适配和远端 MCP 怎样共用一套接入方式
 
 ### 10.1 先理解 MCPProvider 自己负责什么
@@ -826,17 +738,6 @@ MCPProvider 会把常见 transport / client 异常转换成 Provider 级错误�
 
 对于写操作，它还会关注请求是否可能已经发出。连接断开时如果远端副作用存在不确定性，会按更谨慎的超时语义处理。
 
-### 10.6 STAR 复盘
-
-| STAR | 内容 |
-|---|---|
-| S — Situation | GitHub Client 和远端 Context7 的连接形式不同，但从 Agent 角度都属于结构化外部工具 |
-| T — Task | 让它们进入统一 Capability 协议，同时保留不同 transport 的实现方式 |
-| A — Action | MCPProvider 用 server_id + remote_name 绑定工具；local adapter 调本地 client；streamable_http 调远端 transport；refresh 只更新已配置映射 |
-| R — Result | Agent 使用相同调用流程，连接细节集中在 Provider / Transport，远端变化也不会自行扩张本地能力集合 |
-
----
-
 ## 11. SkillProvider：怎样把“做事方法”接入 Capability 系统
 
 ### 11.1 Skill 的运行方式
@@ -870,17 +771,6 @@ Skill 调用只给模型增加一段方法上下文。
 
 Skill 本身不会因此获得新的文件、GitHub 或 Bash 权限。
 
-### 11.3 STAR 复盘
-
-| STAR | 内容 |
-|---|---|
-| S — Situation | 某些任务难点在处理方法和步骤顺序，单纯增加底层工具无法保证模型采用合适流程 |
-| T — Task | 让模型按需加载可靠工作方法，同时不改变执行权限 |
-| A — Action | 把可信 `SKILL.md` 暴露成 READ Capability，模型需要时主动调用并获取全文 |
-| R — Result | 方法指导可以模块化复用，真实副作用依旧受普通 Capability 权限和 Provider 控制 |
-
----
-
 ## 12. RAGProvider：动态知识库怎样表现成普通只读能力
 
 ### 12.1 RAG Capability 怎样生成
@@ -907,15 +797,6 @@ Provider 调用 KnowledgeBaseManager 完成检索，并返回结构化结果，�
 - 可选 notice 和耗时信息。
 
 对 Agent Loop 来说，RAG 仍然按照 discover → schema → authorize → invoke → CapabilityResult 这条主流程执行。
-
-### 12.3 STAR 复盘
-
-| STAR | 内容 |
-|---|---|
-| S — Situation | 知识库数量和状态会动态变化，内部还有索引、同步、检索等复杂机制 |
-| T — Task | 让 Agent 以简单统一方式查询当前可用知识库 |
-| A — Action | RAGProvider 根据 KnowledgeBaseManager 动态生成 READ Capability，并统一 query / result schema |
-| R — Result | Agent 无需理解向量索引内部生命周期，只需调用 `rag.*` 能力完成检索 |
 
 RAG 的索引和知识库生命周期适合单独深入，本章只关注它怎样接入 Capability 层。
 
@@ -964,17 +845,6 @@ WRITE / DESTRUCTIVE 调用情况复杂得多。
 
 因此当前 CapabilityLayer 只对少量 READ 错误做最多一次自动恢复。
 
-### 13.4 STAR 复盘
-
-| STAR | 内容 |
-|---|---|
-| S — Situation | 每个 Provider 的异常体系不同，写调用还存在“请求是否已经生效”的不确定性 |
-| T — Task | 给 Agent Loop 提供稳定错误类型，并避免恢复机制扩大副作用 |
-| A — Action | Provider 先做来源级错误翻译，Layer 再统一成 CapabilityError；自动恢复只覆盖少量可判断的 READ 情况 |
-| R — Result | 上层可以统一处理失败，同时保留认证、冲突、限流、超时、不可用等关键语义 |
-
----
-
 ## 14. FailureGuard：系统怎样阻止模型反复撞同一个错误
 
 ### 14.1 FailureGuard 怎样记录一次失败
@@ -1003,17 +873,6 @@ Execution 可能并行运行多个只读 Capability。
 - FailureGuard 记住当前 run 中已经正式提交的失败事实，可以阻止后面再次盲试同一 capability + arguments。
 
 Provider 自己的网络重试又属于另一层，它处理的是单次调用内部的临时连接失败。
-
-### 14.4 STAR 复盘
-
-| STAR | 内容 |
-|---|---|
-| S — Situation | 模型看到失败后可能重复生成完全相同调用，尤其在错误信息没有被充分利用时 |
-| T — Task | 阻止当前 run 中已经证明失败的同一动作无限循环 |
-| A — Action | 用规范化调用身份记录失败，并在有序 commit 后更新 FailureGuard |
-| R — Result | 重复失败可以快速被识别，减少无意义步骤，同时不把并发线程完成顺序混入 Agent 状态 |
-
----
 
 ## 15. 把所有部分串起来：一次“查资料并修改代码”的完整 Capability 链
 
@@ -1130,69 +989,7 @@ Agent 能据此判断应该换参数、重新读取、等待、停止调用还�
 
 ---
 
-## 17. 整章 STAR 总结
-
-### S — Situation：系统面对什么现实情况
-
-GitAgent 的动作来源很多：本地工作区、GitHub API、远端 MCP、Skill、RAG。它们的 schema、连接方式、权限风险、可用状态、并发语义和异常类型都不同。
-
-同时，模型生成的调用不能直接被当成可信执行指令。每个 Agent 还有自己的职责边界。
-
-### T — Task：Capability 系统要完成什么任务
-
-系统需要建立一条稳定边界，让模型始终通过结构化能力做事，并且在真实执行前回答下面几个问题：
-
-1. 这项能力当前存在吗？
-2. 当前 Agent 看得到它吗？
-3. 参数符合契约吗？
-4. 当前上下文允许执行吗？
-5. 应该交给哪个 Provider？
-6. 出错以后怎样统一表达？
-7. 这次调用怎样参与并发和有序提交？
-
-### A — Action：GitAgent 具体怎样实现
-
-GitAgent 使用 Catalog 保存静态能力定义和 Agent 权限配置；Provider 把不同来源转换成 CapabilityRegistration；Registry 保存当前运行时快照；discover 生成每个 Agent 的可见能力集合；Harness 把 Capability 转换成模型 function tools；Dispatcher 处理工作流 preflight；CapabilityLayer 在 invoke 中完成参数校验、Registry 解析、权限授权、Provider 调用、有限恢复、输出校验和结果归一；FailureGuard 在 ordered commit 后记录失败事实；Provider 另外提供执行 profile 给 Execution 层使用。
-
-### R — Result：最终得到什么
-
-上层 Agent 使用一套稳定协议就能访问多种底层资源。
-
-新增或替换 Provider 时，不需要改写 Agent Loop 的基本调用协议。权限配置、错误处理、动态刷新和并发描述都有集中入口。模型获得的是经过筛选的结构化动作集合，真实副作用继续受运行时授权和 Provider 边界控制。
-
-可以把最终结构压缩成下面这张图：
-
-```mermaid
-flowchart TD
-    CFG[capabilities.yaml<br/>静态能力与 Agent 策略] --> CAT[Catalog]
-    CAT --> APP[Application composition]
-    APP --> P1[NativeProvider]
-    APP --> P2[MCPProvider]
-    APP --> P3[SkillProvider]
-    APP --> P4[RAGProvider]
-
-    P1 --> LOAD[Provider load]
-    P2 --> LOAD
-    P3 --> LOAD
-    P4 --> LOAD
-
-    LOAD --> REG[Registry 当前快照]
-    REG --> DISC[discover]
-    DISC --> TOOL[LLM function tools]
-    TOOL --> MODEL[模型 StructuredCall]
-    MODEL --> DISP[Dispatcher preflight]
-    DISP --> INV[CapabilityLayer.invoke]
-    INV --> POL[PermissionPolicy]
-    INV --> REG
-    INV --> PROV[对应 Provider]
-    PROV --> RESULT[CapabilityResult]
-    RESULT --> OC[ordered commit]
-    OC --> FG[FailureGuard / Audit / Context]
-```
-
----
-
-## 18. 复习时应该怎样讲这套系统
+## 17. 复习时应该怎样讲这套系统
 
 如果面试或复习时需要在几分钟内讲清楚，建议按下面顺序。
 
@@ -1218,7 +1015,7 @@ flowchart TD
 
 ---
 
-## 19. 常见混淆点
+## 18. 常见混淆点
 
 | 容易混淆的说法 | 更准确的理解 |
 |---|---|
@@ -1235,7 +1032,7 @@ flowchart TD
 
 ---
 
-## 20. 代码定位：复习某个问题时应该看哪里
+## 19. 代码定位：复习某个问题时应该看哪里
 
 本章不通过大段代码解释设计。真正需要核对实现时，可以按问题定位文件。
 
@@ -1260,7 +1057,7 @@ flowchart TD
 
 ---
 
-## 21. 一句话收尾
+## 20. 一句话收尾
 
 > GitAgent 的 Capability 系统先把各种底层动作注册成统一的运行时能力，再按 Agent 角色筛选给模型；模型发起调用后，系统继续经过工作流检查、schema 校验、权限授权和 Provider 执行，最后用统一结果协议提交回 Agent。
 

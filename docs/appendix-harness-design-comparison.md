@@ -71,7 +71,7 @@ Agent Loop 判断
 
 `call_id`、open call、waiting、child return 都属于 Harness 的正式状态。
 
-它的重点不是让模型自由地“想一步做一步”，而是让 Harness 能回答：
+它的重点是让 Harness 能明确回答下面这些控制问题，模型自由地“想一步做一步”只占其中一部分：
 
 - 现在到底有哪些动作还没闭合？
 - 这个 tool result 属于哪个 call？
@@ -88,13 +88,13 @@ Agent Loop 判断
 
 ### 面试一句话
 
-> GitAgent 没有追求最小 Agent Loop，而是把“可恢复、可审计、能安全接业务副作用”需要的控制状态显式化；Pi 更偏最小核心，DSH 更偏可组合宿主，而 Claude Code/Codex 是更成熟的通用 Coding Agent runtime。
+> GitAgent 选择把“可恢复、可审计、能安全接业务副作用”需要的控制状态显式化，因此 Agent Loop 比最小核心更重；Pi 更偏最小核心，DSH 更偏可组合宿主，Claude Code/Codex 则属于更成熟的通用 Coding Agent runtime。
 
 ---
 
 # 2. Tools / Capability：真正差异不是有没有 MCP
 
-GitAgent 的关键不是“支持很多工具”，而是所有工具在进入 Agent Loop 前先变成统一的 `Capability`：
+GitAgent 的关键在于所有工具进入 Agent Loop 前都会先变成统一的 `Capability`，工具数量本身并非设计重点：
 
 ```text
 不同 Provider
@@ -224,7 +224,7 @@ Main 不负责所有细节；Domain Agent 持有 GitHub 业务语义；Coding Ag
 
 ### 面试一句话
 
-> GitAgent 的 Multi-Agent 目标不是做通用 swarm，而是用固定角色减少一个 Agent 同时承担路由、GitHub 业务和 coding 的上下文与权限耦合；这种设计可控但灵活性低于 Claude Code/DSH 的通用 subagent 体系。
+> GitAgent 的 Multi-Agent 目标是用固定角色减少单个 Agent 同时承担路由、GitHub 业务和 coding 带来的上下文与权限耦合，并未扩展成通用 swarm；这种设计可控，但灵活性低于 Claude Code/DSH 的通用 subagent 体系。
 
 ---
 
@@ -305,7 +305,7 @@ Protected Preflight
 GitHub Mutation
 ```
 
-用户批准的不是一句“可以修改”，而是精确调用计划。
+用户批准的是一份精确调用计划，宽泛的“可以修改”不足以成为运行时授权。
 
 这特别适合 GitHub 业务，因为：
 

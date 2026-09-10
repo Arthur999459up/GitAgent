@@ -35,7 +35,7 @@ Coding Agent 是叶子节点。它不会再创建新的 Agent，也不会自己�
 
 ## 2. Main Agent 实际做什么
 
-Main Agent 拿到的是整个会话层面的目标。它的第一项工作不是读代码，而是把请求放进正确的业务领域。
+Main Agent 拿到的是整个会话层面的目标。它首先把请求放进正确的业务领域，读代码等领域工作交给后续 Agent。
 
 例如用户说：
 
@@ -132,7 +132,7 @@ stateDiagram-v2
 
 ### 路径 C：Issue 代码修复
 
-修复必须先有 Issue 的真实读取结果，再形成 ChangeRequest 和 CodingTask。Coding Agent 返回验证过的候选以后，Issue Agent 不直接写默认分支，而是构造“修复分支 → 提交 → 发布分支 → Draft PR”的业务计划。
+修复必须先有 Issue 的真实读取结果，再形成 ChangeRequest 和 CodingTask。Coding Agent 返回验证过的候选以后，Issue Agent 会构造“修复分支 → 提交 → 发布分支 → Draft PR”的业务计划，避免把候选直接落到默认分支。
 
 ```mermaid
 flowchart LR

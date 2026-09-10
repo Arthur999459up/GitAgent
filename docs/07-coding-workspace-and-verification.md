@@ -2,7 +2,7 @@
 
 前一章讲的是 Execution 层怎样安排调用、控制并发并按逻辑顺序提交结果。本章继续往下看 Coding Agent 的 patch 模式，重点回答一件事：**当模型决定修改代码以后，GitAgent 怎样把“我要改代码”逐步变成一份可以检查、可以验证、可以交给上层继续处理的本地候选。**
 
-这一章先讲实现过程，再讨论设计原因。每个关键环节都会先说明“系统具体怎么做”，随后用 STAR 做一次复盘：Situation 说明当时面对的问题，Task 说明这一环节要解决什么，Action 回扣已经介绍过的实现动作，Result 说明最终得到什么效果以及还留下哪些边界。
+这一章沿着真实状态变化讲实现过程，并在关键位置解释设计原因、边界和代价。复习时重点关注 `source_ref`、workspace、revision、verification 之间怎样互相约束。
 
 本章只覆盖本地候选构造和验证。候选怎样进入远端 Mutation Plan、怎样经过审批并最终影响 GitHub，放在第 08 章讨论。
 
@@ -68,18 +68,6 @@ flowchart TD
 
 因此，这一阶段完成以后，系统已经得到一个明确答案：**本次代码修改从哪个不可变 Git commit 开始。**
 
-### 2.2 STAR 复盘
-
-**S — Situation**：分支名会移动。任务开始时的 `main` 和几分钟后的 `main` 可能已经指向不同 commit，如果整个流程只记分支名，后面很难判断模型究竟基于哪份代码完成修改。
-
-**T — Task**：给一次 patch 任务确定稳定、可核对的代码起点，让后续工作树创建、差异计算和远端发布准备都能围绕同一个版本展开。
-
-**A — Action**：`ChangeRequest` 保存精确 `source_ref`；缺失时先解析默认分支当前 SHA；`CodingWorkspace` 只接收精确 SHA；worktree 建好后再核对实际 HEAD。
-
-**R — Result**：任务的基线从“一个会移动的名字”变成“一个固定 commit”。后面即使远端分支继续前进，本地候选仍然知道自己从哪份代码出发。
-
----
-
 ## 3. 第二步：基于这个 commit 创建独立 Coding Workspace
 
 ### 3.1 系统具体怎么做
@@ -122,18 +110,6 @@ cache 中不仅有 Git 对象，还包含 worktree 管理相关的 Git 元数据
 
 每个任务拥有独立目录，可以隔离文件内容；资源 claim 进一步保护共享 Git 元数据。两个机制负责不同层次的问题。
 
-### 3.3 STAR 复盘
-
-**S — Situation**：Coding Agent 可能同时处理多个仓库任务。同一仓库如果每次都完整 clone，会重复下载大量 Git 对象；多个任务直接共用同一个可写工作目录，又容易互相污染。
-
-**T — Task**：既复用昂贵的仓库数据，又给每次 patch 提供独立修改现场，同时控制共享 Git 元数据上的并发冲突。
-
-**A — Action**：系统复用 repository cache，为每个任务创建 detached worktree，并在 cache 准备和清理时使用仓库级 `ResourceClaims` 做协调。
-
-**R — Result**：大部分 Git 对象可以复用，每个 patch 仍然有自己的文件工作区；同仓库的关键 Git 管理动作会被串行保护。代价是 Harness 需要维护 cache、worktree 和资源生命周期。
-
----
-
 ## 4. 第三步：把 Coding Agent 的工具绑定到当前 workspace
 
 ### 4.1 系统具体怎么做
@@ -165,18 +141,6 @@ Bash 还有单独的命令策略。Coding profile 会放行经过识别的观察
 文件能力可以严格检查最终路径是否仍落在 workspace 根目录下。Bash 的保证范围更窄：Harness 能控制命令分类、启动 cwd 和传入环境，但当前实现没有提供容器、namespace、seccomp 一类操作系统级隔离。
 
 因此，Coding Workspace 适合称为**受管理的 Git 候选工作区**。它能够约束 GitAgent 自己的文件工具并管理工作目录，仍需把 Bash 子进程看作本机进程来理解其安全边界。
-
-### 4.4 STAR 复盘
-
-**S — Situation**：如果模型可以自由指定任意绝对路径或任意 cwd，一次 patch 很容易写到任务目录之外；符号链接还可能让看起来正常的相对路径最终跳出目标仓库。
-
-**T — Task**：让每次文件操作都自动落在当前 patch 的逻辑工作区里，并在 Provider 层统一执行路径边界检查。
-
-**A — Action**：Harness 把 workspace root 注入 `InvocationContext`；Provider 只接受受约束的相对路径并检查解析后的真实位置；Bash 固定从当前 workspace 启动，并经过 coding Bash policy 分类。
-
-**R — Result**：模型调用更简单，工作区边界也由运行时集中管理。文件工具拥有明确的目录约束；Bash 仍保留操作系统进程层面的能力边界，这一点需要单独记住。
-
----
 
 ## 5. 第四步：每次真实变化怎样推进 workspace revision
 
@@ -223,18 +187,6 @@ flowchart LR
 ```
 
 这个细节很重要，因为“代码变化”并不只来自 write/edit/delete 三个文件工具。Harness 关心的是最终 Git 工作树是否发生真实变化。
-
-### 5.4 STAR 复盘
-
-**S — Situation**：验证结果只有和某一版候选绑定才有意义。仅仅记录“模型执行过三次 edit”无法判断文件是否真的发生变化；Bash 还可能在模型没有显式调用文件工具时改变工作树。
-
-**T — Task**：建立一个简单的候选版本标记，让每轮真实变化都能使后续验证证据失效或重新建立。
-
-**A — Action**：文件工具通过 `changed` 报告真实变化；Commit 阶段推进 revision；Bash 通过执行前后 `worktree_state` 对比检测额外副作用；发生变化时同步清理旧读取状态。
-
-**R — Result**：revision 与工作树真实变化保持联系。系统可以用一个轻量整数追踪“当前候选已经走到哪一版”，无需为每轮编辑都创建 Git commit。
-
----
 
 ## 6. 第五步：验证怎样和当前 revision 建立联系
 
@@ -295,18 +247,6 @@ stateDiagram-v2
 ```
 
 因此，旧验证不会随着后续编辑自动“迁移”到新候选上。
-
-### 6.5 STAR 复盘
-
-**S — Situation**：模型很可能在“测试通过”以后继续修改代码。如果系统只保存一个全局 `tests_passed=true`，后续修改会继续继承旧绿灯，验证证据就会失真。
-
-**T — Task**：让每一条真实验证都能回答“它验证的是哪一版工作树”，同时保留失败和验证不可用的信息。
-
-**A — Action**：Harness 先分类真实验证命令，再把验证事件与当前 revision 一起记录；正常执行时更新 `last_validated_revision`；后续 mutation 推进 revision；finalization 只接受当前 revision 的验证事件作为当前证据。
-
-**R — Result**：验证从一个模糊的任务级布尔值变成带版本语义的运行证据。测试失败仍然可以被完整记录，上层可以据此阻止后续发布。
-
----
 
 ## 7. 第六步：什么时候可以把工作树收束成 CandidatePatch
 
@@ -383,18 +323,6 @@ Runtime 会把所有记录过的真实验证事件转换成 `VerificationCheck`�
 
 因此，Coding Agent 完成 patch 后，上层继续依赖的是稳定的领域对象和验证结果，不需要长期持有那块临时目录。
 
-### 7.6 STAR 复盘
-
-**S — Situation**：模型的自然语言总结可能漏文件，也可能把已经失败的测试说成成功。如果最终候选继续依赖模型自述，上层难以得到可靠输入。
-
-**T — Task**：在 patch 收束时，从机器可观察事实重新构造候选，并把真实验证、失败原因和确定性检查统一整理成结构化报告。
-
-**A — Action**：finish 先检查 changed files 和当前 revision 验证事件；snapshot 从 Git 工作树计算文件变化和 patch；确定性检查补充语法与配置证据；Runtime 生成 `CandidatePatch`、`VerificationReport`，写回实际 target files，然后清理 worktree。
-
-**R — Result**：Domain Agent 接收到的是一份由真实文件状态生成的候选，以及一份明确表达 PASS、FAIL、WARN、skipped/不可用信息的验证报告。后续业务层可以基于结构化事实决定是否进入远端变更阶段。
-
----
-
 ## 8. 把 revision 和验证放在一起看：真正的状态机是什么样
 
 理解这个模块时，可以把 `source_ref` 当成横向不变的起点，把 `revision` 当成任务内部不断向前走的版本号。
@@ -459,31 +387,7 @@ flowchart TD
 
 ---
 
-## 11. 整个模块的 STAR 总结
-
-### S — Situation
-
-LLM 可以很快提出代码修改，但工程系统需要面对几个现实问题：远端分支会移动，多个任务可能并行，模型可能写错路径，工具调用可能没有产生真实变化，测试以后还可能继续修改，Bash 也可能暗中改变工作树，模型对 changed files 和验证结果的自然语言总结也可能不完整。
-
-### T — Task
-
-GitAgent 需要建立一条可以核对的本地候选链路：固定修改基线，创建独立工作区，限制工具访问范围，记录真实候选变化，把验证证据绑定到候选版本，最后从 Git 工作树事实生成候选，并把验证结果结构化交给上层。
-
-### A — Action
-
-系统用 `ChangeRequest.source_ref` 固定 commit 基线；用 repository cache 加 detached worktree 准备 Coding Workspace；通过 `InvocationContext.workspace_root` 把 Native 工具绑定到当前任务；通过 `changed` 和 Bash worktree state 对比推进 revision；通过 Bash policy 识别真实验证命令并把验证事件记录到对应 revision；finalization 从 snapshot 生成 `CandidatePatch`，追加确定性检查形成 `VerificationReport`，再清理临时 worktree。
-
-### R — Result
-
-最终得到两类稳定输出：一类是描述“代码实际变成什么样”的 `CandidatePatch`，另一类是描述“这些变化经历了哪些验证、结果怎样”的 `VerificationReport`。Domain Agent 可以继续根据 `verification.passed` 和具体业务规则判断候选能否进入远端变更阶段。
-
-这套设计的核心价值可以压缩成一句话：
-
-> **模型负责探索和修改，Harness 负责把修改落到受管理工作树中，并用真实文件状态、revision 和验证事件证明当前候选到底是什么状态。**
-
----
-
-## 12. 复习时建议按这条主线讲
+## 11. 复习时建议按这条主线讲
 
 面试或复习时，不需要从类名开始背。先讲状态流会更容易说明白：
 
@@ -493,7 +397,7 @@ GitAgent 需要建立一条可以核对的本地候选链路：固定修改基�
 
 ---
 
-## 13. 代码定位
+## 12. 代码定位
 
 | 想核对的问题 | 主要位置 |
 |---|---|

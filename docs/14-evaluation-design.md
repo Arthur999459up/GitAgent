@@ -1,833 +1,1078 @@
-# 14 Harness 评测设计：怎样验证 GitAgent 不只是“回答对了”，而是真的按约束完成任务
+# 14 Evaluation Harness：GitAgent 的评测系统是怎样设计和运行的
 
-前面 13 章已经把 GitAgent 的运行 pipeline 讲完了。最后一章不再增加新的 Agent 或工具，而是回答一个更实际的问题：**我们怎样知道前面的设计真的按预期工作？**
+前面章节已经讲完 GitAgent 怎样接收用户输入、调用 Domain Agent、执行 Capability、等待审批、持久化状态并在故障后恢复。本章接着回答一个工程问题：**这些机制怎样被系统化地验证。**
 
-GitAgent 的评测不是只把最终回复交给另一个模型打分。它会从样本契约开始，准备受控环境，通过真实应用入口执行任务，同时收集调用事件和外部状态，最后把确定性检查与语义 Judge 组合起来。
+这一章先建立评测系统的运行模型，再讨论设计取舍。阅读顺序始终沿着一次真实 Trial 展开：
 
-本章先把这条评测 pipeline 走完整，再用 STAR 复盘为什么需要这么多层证据。
+**Sample 定义成功条件 → TrialPlan 决定怎么跑 → Fixture 准备环境 → LiveApplication 执行 → Event 与 Observer 收集证据 → Deterministic Grader 检查硬约束 → Judge 检查语义 → Aggregate 汇总指标。**
+
+为了避免只记零散知识点，下面每个核心部分都按照 STAR 展开：
+
+- **S（Situation）**：这个环节接手时，系统已经有什么信息；
+- **T（Task）**：这个环节需要解决什么具体任务；
+- **A（Action）**：重点说明实际怎样设计、数据怎样流动；
+- **R（Result）**：先总结产出，再解释这样安排解决了什么问题。
+
+本章不会罗列实现代码。需要核对实现时，文末给出对应文件位置。
 
 ---
 
-## 1. 先看整套评测 Harness 怎么跑
+## 1. 先建立整套评测系统的地图
+
+### S · 当前系统处在什么位置
+
+GitAgent 的一次任务可能经过 Main Agent、Repository / Issues / Pull Requests / Coding Agent，还可能经过 Capability 并发、Approval、Persistence、Context Compaction 和 Recovery。
+
+因此，评测面对的是一条完整运行链。最终回复只是这条链最后留下的一份输出。
+
+### T · 评测需要产出什么
+
+对每个样本，评测系统需要留下足够证据，回答下面几类问题：
+
+1. 任务有没有走到正确的 Agent 和 Capability；
+2. WRITE / DESTRUCTIVE 操作有没有遵守 Approval；
+3. 远端或本地状态有没有发生预期变化；
+4. 并发、压缩、恢复等专项机制有没有真实触发；
+5. 最终回答有没有覆盖用户真正需要的信息；
+6. 当前 Trial 是否具备判分前提。
+
+### A · 一次 Sample 怎样流过整个 Harness
 
 ```mermaid
 flowchart LR
-    D[Evaluation Dataset] --> P[Trial Plan]
-    P --> F[Fixture / Baseline]
-    F --> A[真实 LiveApplication]
-    A --> E[Event Slice]
-    A --> O[Final Answer]
+    D[Evaluation Dataset] --> P[TrialPlan]
+    P --> F[FixtureManager]
     F --> B[Before Snapshot]
-    A --> C[After Snapshot]
-    B --> DIFF[Observer Diff]
-    C --> DIFF
+    F --> L[LiveApplication]
+    L --> E[Event Slice]
+    L --> A[Final Answer]
+    L --> C[After Snapshot]
+    B --> O[Observer Diff]
+    C --> O
     E --> G[Deterministic Grader]
-    DIFF --> G
-    O --> J[Judge Request]
-    G --> J
-    J --> R[Per-sample Result]
-    R --> M[Aggregate Metrics]
+    O --> G
+    G --> J[Judge Request]
+    A --> J
+    J --> M[Final Metrics]
 ```
 
-一项评测大致经过七步：
+这条链可以分成四层：
 
-1. **数据集定义任务和成功契约**；
-2. **Fixture Manager 准备任务所需真实对象**；
-3. **Observer 记录执行前基线**；
-4. **Runner 通过真实应用入口执行用户输入**；
-5. **事件和执行后状态分别被收集**；
-6. **Deterministic Grader 检查硬约束，Judge 检查语义质量**；
-7. **只在满足相应前提的样本上汇总指标**。
+| 层次 | 主要组件 | 主要产物 |
+|---|---|---|
+| 任务契约 | Dataset、EvalSample | 用户输入、route、trace、must_not、final_state、answer_reference |
+| 真实执行 | TrialPlan、FixtureManager、LiveApplication | 一次可复现的 Trial |
+| 证据采集 | EventTracker、Observer、TrialRecord | 运行轨迹、前后状态、最终回答、故障信息 |
+| 判分汇总 | Deterministic Grader、Judge、Aggregate | 硬约束结果、语义结果、最终指标 |
 
-这意味着评测关心的不只是“Agent 最后说了什么”，还关心“它通过什么路径得到结论、外部世界实际发生了什么”。
+### R · 这套结构最终得到什么
+
+一次 Trial 会形成三类互相补充的证据：
+
+- **Event Trace**：GitAgent 在内部怎样运行；
+- **Observer Diff**：GitHub 或本地仓库实际发生了什么变化；
+- **Final Answer + Judge**：最终回答在语义上是否完成用户任务。
+
+这样设计的原因在于三类证据各自能看到不同事实。只看其中一类，都会留下盲区。后面的章节会先把每一层怎样工作讲清楚，再回到这些设计取舍。
 
 ---
 
-## 2. 当前数据集到底覆盖哪些东西
+## 2. Dataset：先把自然语言任务变成“可以判分的契约”
 
-当前 `gitagent-evaluation-dataset.json` 一共 56 条样本，集中验证三个专项机制。
+### S · 输入一开始只有什么
 
-| 组 | 样本数 | 主要验证内容 |
+用户输入通常只描述“想完成什么”。例如：
+
+> 找到某个 Issue，发布指定评论。
+
+这句话足够驱动 Agent，却没有完整说明评测程序应该检查哪些事实。评测还需要知道正确路由、关键调用、禁止行为、最终状态和回答要点。
+
+当前数据集 `gitagent-evaluation-dataset.json` 固定包含 56 条样本：
+
+| 指标组 | 样本数 | 主要覆盖内容 |
 |---|---:|---|
-| M2 上下文治理 | 20 | 长任务是否触发 compaction，压缩以后协议和任务结果是否仍然成立 |
-| M3 串行 / 并行统一对比 | 24 | 同一类任务在 serial / parallel 配置下是否保持正确，并且是否真的产生执行重叠 |
-| M6 故障恢复 | 12 | waiting、进程重启、坏事件尾部、外部状态变化以后能否合法恢复 |
+| M2 | 20 | Context Governance 与自动 compaction 后的任务正确性 |
+| M3 | 24 | serial / parallel 两种完整执行策略的正确性、真实重叠与耗时 |
+| M6 | 12 | waiting、进程退出、事件尾部损坏、外部状态变化等恢复场景 |
 
-这里需要先明确覆盖边界：这 56 条不是“GitAgent 所有功能完整 benchmark”。它重点验证当前工程里最值得单独观察的 Harness 机制。
+数据集加载时还会检查 schema 版本、根字段、样本总数、样本 key 和 `task_name:id` 是否一致，以及 metric group 是否属于 M2 / M3 / M6。
 
-例如 RAG 召回质量、所有类型的代码修复、不同模型之间的综合能力差异，并没有因为这套评测存在就自动被证明。
+### T · EvalSample 要解决什么
 
----
+`EvalSample` 的任务是把“用户怎么说”和“系统怎样判定成功”放在同一个契约里。
 
-## 3. EvalSample 怎样把自然语言任务变成可判分契约
+一个样本包含这些核心信息：
 
-一个评测样本不只有 `user_input`。自然语言告诉 Agent 要做什么，但 Grader 还需要知道“怎样才算做对”。
-
-可以把一个 `EvalSample` 理解成下面这组信息：
-
-```text
-EvalSample
-  ├─ task_name / id
-  ├─ metric_group
-  ├─ user_input[]
-  ├─ setup_ref
-  ├─ label
-  │   ├─ route
-  │   ├─ trace
-  │   ├─ must_not
-  │   └─ final_state
-  └─ answer_reference
-```
-
-各部分承担不同职责。
-
-| 字段 | 回答的问题 |
+| 字段 | 用途 |
 |---|---|
-| `user_input` | 用户实际对 GitAgent 说什么 |
-| `setup_ref` | 运行前需要准备什么环境 |
-| `route` | Main 应该进入哪个领域 Agent |
-| `trace` | 哪些关键证据或动作必须出现 |
-| `must_not` | 什么行为绝对不能出现 |
-| `final_state` | 运行结束后应该处于什么业务状态 |
-| `answer_reference` | 最终答案至少应该覆盖哪些语义要点 |
+| `user_input` | 真正提交给应用的一个或多个用户输入 |
+| `setup_ref` | 本 Trial 需要哪类测试环境或 fixture |
+| `metric_group` | 该样本属于 M2、M3 还是 M6 |
+| `label.route` | 预期经过哪些 Agent |
+| `label.trace` | 必须出现的关键语义步骤或 Capability 证据 |
+| `label.must_not` | 明确禁止出现的行为 |
+| `label.final_state` | 执行结束后真实状态应满足什么条件 |
+| `answer_reference` | 最终回答需要覆盖哪些语义要点 |
 
-例如“先拟评论，我确认后再发布”不仅需要检查最后有没有给出合适文本，还可以在 `must_not` 中表达“用户批准前不得出现远端评论副作用”。
+### A · 契约是怎样被后续组件消费的
 
-这样安全约束不会只依赖 Judge 阅读自然语言后自由发挥。
-
----
-
-## 4. label 里的 trace 是“语义轨迹”，不是唯一脚本
-
-评测数据不会要求 Agent 每一步工具调用都和某份固定脚本逐字一致。
-
-例如为了理解一个仓库，Agent 可以先 search 再 read，也可以直接读取已经知道位置的文件。只要拿到了任务要求的真实证据，这两种路径都可能合理。
-
-因此 trace 更接近“语义 gold trace”：
-
-- 领域路由可能是硬要求；
-- 某些必要 Capability 必须出现；
-- 普通 READ 调用允许可以取得等价证据的路径；
-- WRITE / DESTRUCTIVE 行为需要满足 Approval 契约；
-- `must_not` 明确禁止绕过安全边界的动作；
-- `final_state` 检查任务最终停在哪里。
+数据流可以这样理解：
 
 ```mermaid
 flowchart TD
-    L[Label] --> R[Route constraint]
-    L --> T[Required semantic trace]
-    L --> N[Must-not actions]
-    L --> S[Expected final state]
+    S[EvalSample] --> U[user_input]
+    S --> SETUP[setup_ref]
+    S --> L[label]
+    S --> AR[answer_reference]
+
+    SETUP --> F[FixtureManager]
+    U --> R[Runner]
+    L --> G[Deterministic Grader]
+    AR --> J[Judge]
+
+    L --> ROUTE[route]
+    L --> TRACE[trace]
+    L --> NO[must_not]
+    L --> STATE[final_state]
 ```
 
-所以这套评测既不是只评最终答案，也不是把 Agent 当传统 workflow engine 要求完全复刻一条预定义调用序列。
+其中 `trace` 采用 **semantic gold trace**。它表达“哪些关键事实必须成立”，不要求模型完整复刻一份逐行脚本。
+
+例如一个仓库调查任务可能要求：
+
+- Main 必须进入 Repository Agent；
+- 必须获得某些文件、符号或搜索结果提供的证据；
+- 不允许出现写操作；
+- 最终仓库保持不变。
+
+Agent 可以根据上下文选择等价的 READ 路径。只要关键证据确实取得，普通读取顺序可以存在合理差异。
+
+### R · 这样组织样本带来什么结果
+
+样本同时具备“驱动执行”和“驱动判分”两种能力。Runner 从中得到输入和环境要求，Grader 从中得到硬约束，Judge 从中得到语义参考。
+
+这样安排解决了一个核心问题：自然语言任务通常允许多条合理路径，安全要求和最终状态又需要明确约束。semantic gold trace 保留了 Agent 的行动空间，同时给硬约束留下了稳定检查点。
 
 ---
 
-## 5. TrialPlan 怎样把一个 Sample 变成一次实际运行
+## 3. TrialPlan：一个 Sample 怎样展开成真正要执行的 Trial
 
-Runner 不直接把 Sample 丢给模型，而是先形成 `TrialPlan`。
+### S · Sample 和实际运行次数并不总是一一对应
 
-TrialPlan 会确定：
+M2 大多数样本运行一次即可得到目标证据。M3 需要比较 serial 和 parallel 两种策略，还需要 warmup 和多次 measured trial。M6 中部分样本需要专门的故障流程。
 
-- 当前 sample；
-- 属于哪个 metric group；
-- 当前 variant；
-- 是不是 warmup；
-- 是第几次重复；
-- 当前运行需要哪些环境和配置。
+因此，数据集中的“一条样本”和 Runner 中的“一次运行”属于两个层次。
 
-特别是 M3，每个任务需要分别在 serial 和 parallel 变体下执行。
+### T · TrialPlan 要固定哪些运行身份
+
+`TrialPlan` 会把一次具体运行需要的身份固定下来，包括：
+
+| 信息 | 含义 |
+|---|---|
+| sample key | 当前跑哪条样本 |
+| metric group | 当前属于哪个专项 |
+| variant | normal、serial 或 parallel |
+| replicate | 第几次重复 |
+| warmup | 当前是否只用于预热 |
+| account | 使用哪个评测账户 |
+
+这些字段组合成稳定的 trial identity，后续事件、Observer 产物和结果都围绕这个身份保存。
+
+### A · 三类指标组怎样生成 Trial
+
+#### M2：normal 路径
+
+M2 使用正常运行配置。每条样本建立独立 Session，通过完整应用链执行，收集 compaction 和任务正确性证据。
+
+#### M3：serial / parallel A/B 路径
+
+M3 会为同一 Sample 建立两种 variant：
+
+```mermaid
+flowchart TD
+    S[一个 M3 Sample] --> SW[serial warmup]
+    S --> PW[parallel warmup]
+    SW --> SM[serial measured trials]
+    PW --> PM[parallel measured trials]
+    SM --> C[对比正确性、overlap 与 latency]
+    PM --> C
+```
+
+默认目标是每个 variant 收集 5 次有效 measured trial。Runner 还会：
+
+- 每个 variant 先做 warmup；
+- serial 和 parallel 的执行先后顺序交替，减少固定顺序带来的偏差；
+- 当某次运行因为环境条件无效时允许有限额外尝试；
+- 每个 variant 最多尝试到 `repetitions + 2`，避免外部条件持续异常时无限循环。
+
+#### M6：按恢复场景选择专用执行路径
+
+M6 会根据 Sample 类型进入不同路径，例如：
+
+- 在 durable pending approval 或 waiting 状态形成后终止进程；
+- 给事件日志追加损坏尾部，再验证有效前缀是否可恢复；
+- 在已经自然发生 auto compaction 的 Session 上做重启恢复；
+- 在 Approval waiting 期间改变远端状态，再继续旧 Session。
+
+### R · 为什么需要 TrialPlan 这一层
+
+TrialPlan 把“评测任务定义”和“实验执行方式”分开了。Dataset 可以保持稳定，Runner 可以根据指标组展开不同实验。
+
+这对 M3 尤其重要。同一条任务内容会被 serial 和 parallel 两侧共同使用，差异由运行 variant 控制。这样可以避免维护两套几乎相同的样本文本。
+
+---
+
+## 4. 运行配置隔离：每个实验先得到自己的 RuntimeConfig
+
+### S · Eval 会真的访问模型、GitHub 和持久化状态
+
+真实评测不能让不同 variant 共用同一份运行目录，否则 Session、Event、Memory 或 SQLite 状态可能互相污染。
+
+M3 还需要明确控制串行和并行策略。
+
+### T · 环境层要生成一份可控的评测配置
+
+Eval 会从项目原始配置派生运行配置，并保留真实服务连接需要的信息。同时覆盖评测关心的实验参数。
+
+### A · normal、serial、parallel 怎样区分
+
+运行配置的主要变化如下：
+
+| variant | 关键设置 |
+|---|---|
+| normal | 保留正常 execution 策略 |
+| all_serial | Capability 总并发、各 provider 并发、Domain Agent 并发都限制为 1 |
+| all_parallel | Domain Agent 最大并发提升到 3，其余能力沿用基础并发配置 |
+
+此外，评测统一把模型 temperature 设为 0，并把 state、event、memory 路径指向当前 run 的隔离目录。
+
+M3 还有一层输入控制。原始 Sample 只描述任务内容，Runner 会根据 variant 给任务增加一句简短的执行方式说明：serial 要求独立任务逐个执行，parallel 要求独立任务同时发起并在完成后统一汇总。
+
+### R · 这代表 M3 在比较什么
+
+M3 比较的是两种**完整系统运行策略**。差异既包含运行并发配置，也包含对 Agent 的执行方式提示。
+
+因此，M3 得到的 speedup 应理解为“当前 serial 策略与 parallel 策略在这些样本上的整体差异”。它不适合被解释成某一个线程池参数的纯微基准收益。
+
+---
+
+## 5. FixtureManager：先把外部世界准备到可测试状态
+
+### S · 一些样本会读写真实 GitHub 对象
+
+Issue 评论、PR Review、Merge、远端分支变化等任务依赖外部状态。如果目标对象不存在、状态不对或已经被之前的 Trial 改坏，本次结果就失去可比性。
+
+### T · FixtureManager 要建立可控起点
+
+FixtureManager 根据 `setup_ref` 和 Sample id 准备当前 Trial 需要的 Issue、PR、branch 或其他测试资源，并记录哪些资源由本次 eval run 创建和拥有。
+
+### A · 一个 fixture 的生命周期怎样走
 
 ```mermaid
 flowchart LR
-    S[一个 M3 Sample] --> A[serial warmup]
-    S --> B[parallel warmup]
-    S --> C[serial measured trials]
-    S --> D[parallel measured trials]
+    S[读取 setup_ref / Sample] --> P[prepare_case]
+    P --> O[创建或恢复 eval-owned 对象]
+    O --> R[调整到目标初始状态]
+    R --> T[执行 Trial]
+    T --> C[reset_case]
+    C --> E[Suite 结束 cleanup]
 ```
 
-当前默认每个性能 variant 需要 5 次有效 measured trial，并先做 warmup。Runner 还会限制无效尝试的额外次数，避免环境持续异常时无限重跑。
+典型工作包括：
 
-因此“一个样本”与“一次模型运行”不是同一个层次。
+1. 找到或创建评测专用 Issue；
+2. 把标题、正文、标签、评论等恢复到预期状态；
+3. 为 PR 样本创建临时 branch 和 PR；
+4. 对 Merge 场景准备 review 与 CI 条件；
+5. 对需要“外部世界主动变化”的恢复样本使用第二账户制造变化；
+6. Trial 结束后只清理本次 case 或 suite 明确拥有的资源。
+
+对于需要修改默认分支的特殊 recovery fixture，还要求显式环境授权，并在清理前再次确认分支 head 没有出现意外变化。
+
+### R · 这样设计解决了什么
+
+FixtureManager 让一次测试从“碰巧遇到某种 GitHub 状态”变成“主动建立目标前提”。
+
+同时，资源所有权记录限制了清理范围。评测系统只处理自己创建或明确接管的对象，降低测试 Harness 对真实仓库造成额外破坏的风险。
 
 ---
 
-## 6. Fixture Manager 怎样准备真实测试环境
+## 6. Observer：在 Agent 运行前后各拍一张“真实世界快照”
 
-部分评测只读取仓库，不需要特殊远端对象；另一些任务会涉及 Issue、PR、分支、评论或 Merge。
+### S · Event 能说明调用发生过，却不能独立证明外部状态
 
-这类任务执行前，`FixtureManager` 会根据 `setup_ref` 准备评测自己拥有的测试对象。
+某个 `tool_result` 显示调用成功，只说明 GitAgent 收到了这样的执行结果。对于远端写入，评测还希望从 GitHub 当前状态再确认一次。
 
-它的职责包括：
+### T · Observer 要建立独立于 Agent 自述的状态证据
 
-- 确保目标 Issue / PR 存在；
-- 确保某个 PR 处于需要的初始状态；
-- 创建或重置评测拥有的 branch；
-- 为恢复测试准备可以被主动改变的远端状态；
-- 运行后清理评测拥有的对象。
+Observer 在 Trial 执行前后读取与当前 Sample 有关的真实状态，然后把差异规范化成 mutation 列表。
 
-```mermaid
-flowchart TD
-    S[setup_ref] --> F[FixtureManager]
-    F --> I[Issue fixture]
-    F --> P[PR fixture]
-    F --> B[Branch fixture]
-    F --> L[Local runtime fixture]
-```
+### A · Observer 当前具体观察哪些内容
 
-这里强调“评测拥有的对象”很重要。测试 Harness 不能因为需要清理环境，就随意删除仓库里所有未知资源。
+根据样本目标，快照可以包含：
 
----
+- 目标 Issue 的状态、标签、指派人、评论等；
+- 目标 PR 的状态、merged、head/base、Review、评论、changed files 等；
+- 默认分支当前 commit；
+- 指定远端文件是否存在及内容 hash；
+- 本地测试仓库的 HEAD 和 worktree status。
 
-## 7. Observer 先记录 baseline，再在任务结束后比较真实状态
-
-Fixture 准备完成以后，Observer 会在 Agent 执行前捕获一份基线快照。
-
-根据样本类型，快照可能包括：
-
-- Issue 当前字段和评论；
-- PR 当前状态、head、Review、评论；
-- 远端 branch；
-- 本地运行时状态；
-- 特定持久化或 Memory 状态；
-- 评测关注的其他外部资源。
-
-任务完成以后再捕获一份新快照，并计算 diff。
+流程如下：
 
 ```mermaid
 flowchart LR
-    B[Before Snapshot] --> D[Observer.compare]
-    A[After Snapshot] --> D
-    D --> X[真实状态变化]
+    P[Fixture prepared] --> B[Before Snapshot]
+    B --> A[Agent 执行]
+    A --> C[After Snapshot]
+    B --> D[observer_diff]
+    C --> D
+    D --> M[Semantic Mutations]
 ```
 
-这个 diff 是独立于 Agent 自述的证据。
+`observer_diff` 会把变化整理成较稳定的 mutation 类型，例如：
 
-例如工具结果说“评论创建成功”，Observer 可以进一步检查目标 Issue 是否真的出现对应评论；反过来，如果网络响应丢失但评论已经实际创建，Observer 也有机会看到真实副作用。
+| mutation | 表示的真实变化 |
+|---|---|
+| `issue_comment` | Issue 新增评论 |
+| `issue_update` | Issue 字段变化 |
+| `pr_review` | PR 新增 Review |
+| `pr_merge` | PR 从未合并变为已合并 |
+| `pr_head` | PR head commit 变化 |
+| `default_branch` | 默认分支 commit 变化 |
+| `local_change` | 本地仓库状态变化 |
+
+每个 mutation 还会生成 fingerprint，后面用于识别重复副作用。
+
+### R · Observer 的价值在哪里
+
+Event Trace 描述“系统尝试做了什么”，Observer 描述“目标状态最后真的怎样变化”。两者一起使用，可以区分调用记录与真实副作用。
+
+Observer 还承担 secret leak 检查的一部分。Runner 导出的事件、回答和控制结果会进入敏感值检测，避免为了评测可观测性把已知 secret 直接写进产物。
 
 ---
 
-## 8. Runner 为什么一定经过 LiveApplication
+## 7. Runner：通过真实 LiveApplication 执行，而不绕过应用层
 
-评测不是直接调用 `RepositoryAgent.run()` 或某个内部函数。
+### S · GitAgent 的关键能力分布在多层
 
-Runner 会构造真实 `LiveApplication`，建立真实 Session，并通过和正常使用相同的核心应用入口提交输入。
+Session、Turn、Main 路由、Domain Agent、Capability、Approval、Persistence 和 Recovery 都位于完整应用链上。
 
-```mermaid
-flowchart TD
-    E[EvalRunner] --> A[LiveApplication]
-    A --> S[GitAgentService]
-    S --> M[Main Agent]
-    M --> D[Domain / Coding Agent]
-    S --> P[Persistence / Approval / Recovery]
-    D --> C[Capability / Execution]
-```
+如果评测直接调用某个 Domain Agent 的内部方法，很多层级交接就不会经过。
 
-这样一次评测真正覆盖：
+### T · Runner 要复用真实用户入口
 
-- Session / Turn；
-- Main 路由；
-- child Agent；
-- Capability 权限；
-- Execution 并发；
-- Approval waiting；
-- Persistence；
-- Context compaction；
-- Recovery。
+EvalRunner 构造 `LiveApplication`，建立真实 Session，再通过应用 facade 提交用户输入和少量 eval 控制命令。
 
-如果为了评测方便直接调用一个下层函数，很多 Harness 最重要的模块交接根本不会经过测试。
-
----
-
-## 9. EventTracker 怎样收集运行轨迹
-
-一次 Trial 运行时，Runner 会记录属于该试次的事件切片。
-
-这些事件用于还原：
-
-- 哪个 Agent 何时开始和结束；
-- 哪项 Capability 何时调用；
-- 调用参数和终止结果是什么；
-- 是否出现 Approval Proposal；
-- 是否发生 compaction；
-- 是否出现 waiting / resume；
-- serial / parallel 执行区间怎样重叠。
+### A · 一次普通 Trial 的实际执行顺序
 
 ```mermaid
 sequenceDiagram
-    participant A as Agent
-    participant E as Event History / Trace
-    participant T as EventTracker
-    A->>E: agent start
-    A->>E: capability call
-    A->>E: capability result
-    A->>E: agent end
-    T->>E: 截取本 Trial 对应事件
+    participant R as EvalRunner
+    participant F as FixtureManager
+    participant O as Observer
+    participant A as LiveApplication
+    participant E as EventTracker
+
+    R->>F: prepare_case
+    R->>A: 创建新 Session
+    R->>E: 记录当前 event seq
+    R->>O: capture before
+    loop user_input
+        R->>A: handle / control action
+    end
+    R->>E: collect event slices
+    R->>O: capture after
+    R->>O: compare before / after
+    R->>F: reset_case
 ```
 
-Event Slice 主要描述“GitAgent 是怎样运行的”，Observer Diff 描述“外部世界实际变成了什么”。两者后面一起进入确定性判分。
+在真正执行 Sample 之前，Runner 还会检查测试仓库 grounding：
+
+- 本地 mirror 必须存在；
+- worktree 必须干净；
+- 本地 commit 必须和远端默认分支 commit 一致。
+
+如果这些前提不成立，相关样本会被记录为 invalid。这样可以避免 Agent 根据一份旧镜像得出结论，然后把环境漂移误算成模型行为。
+
+### R · 通过 LiveApplication 能覆盖哪些真实边界
+
+一次 Trial 会真正经过当前系统的 Session 生命周期、Agent 路由、Capability 调度、Approval 和 Persistence 等路径。
+
+这样安排让评测更接近用户实际使用 GitAgent 时发生的事情。它付出的成本是运行更重、外部依赖更多，因此后面必须明确区分 failed 与 invalid。
 
 ---
 
-## 10. TrialRecord 为什么把答案、事件、状态和错误放在一起
+## 8. EventTracker 与 TrialRecord：把一次运行保存成稳定证据包
 
-Runner 完成一次执行后，会形成 `TrialRecord`。
+### S · Grader 不应该依赖仍在内存里的 Application 对象
 
-它至少需要记录：
+一次完整 benchmark 可能持续较久，也可能中断后继续。Grader 需要读取已经落盘的事实进行判分。
 
-- sample / variant / repetition 身份；
-- 是否 warmup；
-- trial status；
-- 最终回答；
-- elapsed time；
-- event slice；
-- before / after observer snapshot；
-- 故障与恢复元数据；
-- 错误或 invalid reason。
+### T · Runner 要把 Trial 期间发生的事情完整归档
 
-这让后续 Grader 不需要依赖仍然存活的 Python 对象。
+EventTracker 负责截取属于当前 Trial 的 Event；TrialRecord 负责保存该次运行的身份、状态、答案、耗时和产物路径。
 
-TrialRecord 是“这次评测运行发生了什么”的稳定中间产物，和 GitAgent 自己的 Session Persistence 是两套不同状态。
+### A · Event Slice 怎样确定边界
 
----
-
-## 11. 为什么 Trial 有 completed、failed、invalid 等不同结果
-
-一项测试没有通过，不一定都表示 GitAgent 行为错误。
-
-可以先区分三类情况：
-
-| 状态 | 含义 |
-|---|---|
-| completed | 评测前提成立，并且正常拿到可判分运行 |
-| failed | 评测前提成立，但运行结果本身失败/违反要求 |
-| invalid | 评测条件没有真正成立，无法把这次运行用于目标指标 |
-
-例如：
-
-- 模型服务整体不可用；
-- 测试账户缺失；
-- 需要的 PR fixture 无法准备；
-- 恢复测试想注入某种故障，但 Agent 根本没走到目标等待点；
-
-这些情况不能伪装成“恢复失败”或“并发失败”。它们首先意味着这次 Trial 没有真正测试到目标条件。
-
-无效运行不是通过，也不能在汇总时悄悄消失。
-
----
-
-## 12. RecoveryController 怎样主动制造可重复的故障
-
-M6 不是等待系统偶尔崩溃，而是主动把任务推进到特定控制点，再注入故障。
-
-当前环境层可以覆盖多种恢复场景，例如：
-
-- 在目标 Turn 运行中让进程退出；
-- 给 Event History 追加损坏尾部；
-- 等 pending capability 已经持久化后再重启；
-- 在 Approval waiting 以后改变远端状态；
-- 检查 durable context 是否已经准备好。
-
-```mermaid
-flowchart TD
-    A[先运行到目标控制点] --> T{目标状态真的出现?}
-    T -->|否| I[Trial invalid]
-    T -->|是| F[注入故障]
-    F --> R[重建 Application / Session]
-    R --> U[继续用户输入]
-    U --> V[检查恢复结果]
-```
-
-这一步特别重要：**必须先证明故障真正作用在目标状态上，才能评价恢复能力。**
-
-如果 Agent 根本没进入 Approval waiting，却直接重启程序，最后正常回答并不能证明 Approval recovery 有效。
-
----
-
-## 13. 一个“审批后远端状态变化”的恢复 Trial 怎么跑
-
-用一个具体例子把前面串起来。
-
-用户要求：“PR #45 如果满足条件就合并。”
-
-**阶段 1：准备 fixture。** 测试环境确保目标 PR 处于预期可操作状态，Observer 保存 before snapshot。
-
-**阶段 2：真实运行 GitAgent。** Main → PR Agent → 必要代码 Review → merge readiness → 生成 Merge ApprovalRequest。
-
-**阶段 3：确认 durable waiting 已建立。** RecoveryController 检查 pending capability 已经出现在持久控制状态中。
-
-**阶段 4：主动制造外部变化。** 在用户批准之前改变目标 PR head 或其他受保护前提。
-
-**阶段 5：重启应用并恢复 Session。** Event History 重建消息，Pause Snapshot 重建 waiting 控制树。
-
-**阶段 6：用户输入“批准”。** 真实 Service 继续旧 Approval。
-
-**阶段 7：受保护 preflight 发现远端已经变化。** 旧 merge 计划被拒绝。
-
-**阶段 8：Observer 比较 after snapshot。** 确认没有错误地执行旧 merge。
-
-在这种 Sample 中，“没有合并”反而可能是正确结果，因为测试目标是验证旧授权不会越过新事实。
-
----
-
-## 14. Deterministic Grader 先检查哪些硬事实
-
-TrialRecord 形成以后，`grade_sample` 会先做确定性判断。
-
-它会从事件中建立工具调用和 Agent 执行关系，再结合 label 与 Observer Diff 检查。
-
-主要可以分为几类。
-
-### 调用协议
-
-- Tool call 有没有对应终止结果；
-- 有没有孤立 tool result；
-- 同一调用有没有重复终止；
-- child Agent start / end 是否可以正确配对。
-
-### 路由
-
-- Issue 任务是否经过 Issue Agent；
-- PR 任务是否经过 PR Agent；
-- 普通仓库任务是否经过 Repository Agent。
-
-### Capability 契约
-
-- 必需 capability 是否成功出现；
-- 禁止 capability 是否被调用；
-- 参数是否满足样本定义的关键条件。
-
-### Approval
-
-- WRITE / DESTRUCTIVE 调用是否先经过 Proposal；
-- Approval 是否绑定同一个 Session、capability 和 arguments；
-- 用户拒绝后是否仍发生副作用；
-- 多步骤计划是否按顺序执行。
-
-### 外部状态
-
-- Observer 是否看到期望 mutation；
-- 是否出现多余 mutation；
-- 只读任务有没有不应有的副作用。
-
-### Recovery
-
-- 故障是否真的触发；
-- durable context 是否成立；
-- 恢复后是否继续正确控制点；
-- 是否产生重复副作用。
-
-这些判断适合确定性规则，因为它们主要是身份、顺序、参数和状态关系。
-
----
-
-## 15. Tool / Agent event 为什么必须先配成执行区间
-
-并发评测需要知道“哪些调用在时间上真的重叠”。仅看 `tool_started` 数量不够，也不能只用 Agent 名称关联开始和结束。
-
-Grader 会把 start/end 事件按稳定身份配成 interval。
+每当 Tracker 第一次接触一个 Session，会先记录该 Session 当前最后一个 event sequence。Trial 完成时再次读取最后 seq，只收集这个区间中新产生的事件。
 
 ```mermaid
 flowchart LR
-    S1[call A start] --> I1[A interval]
-    E1[call A end] --> I1
-    S2[call B start] --> I2[B interval]
-    E2[call B end] --> I2
-    I1 --> O[Overlap statistics]
-    I2 --> O
+    S0[Trial 开始前 last_seq] --> RUN[执行 Trial]
+    RUN --> S1[Trial 结束 end_seq]
+    S0 --> SLICE[after_seq < event.seq <= end_seq]
+    S1 --> SLICE
 ```
 
-同类型 Coding Agent 可能在一个任务中出现多个 run，所以要依靠 run/call 身份，而不是简单按名称配对。
+如果 Trial 跨恢复过程接触多个 Session scope，Tracker 会分别保存 slice，最后统一排序。
 
-有了 interval，Grader 才能计算：
+TrialRecord 主要记录：
 
+| 内容 | 用途 |
+|---|---|
+| trial / sample / variant / replicate | 确定运行身份 |
+| status / invalid_reason / error | 判断本次运行能否用于指标 |
+| latency_ms | M3 性能统计 |
+| final_answer | Judge 输入 |
+| event_slices / events_path | 运行轨迹证据 |
+| observer_path | 外部状态证据 |
+| fault | Recovery 故障是否真实触发 |
+| action_log | `handle`、`/new`、`/switch`、fault 等评测调度动作及其执行结果 |
+
+最终回答从 Trial 事件中的最后一条 `assistant_message` 提取，因此回答和运行轨迹仍然属于同一个 Trial 证据包。
+
+### R · 这样保存有什么好处
+
+Grader 可以完全围绕落盘产物工作，不需要保留原 Application 对象。Eval resume 也能识别哪些 Trial 已经完成并复用它们。
+
+这同时建立了清晰审计边界：后面任何指标都可以追溯到具体 Trial、事件切片和 Observer snapshot。
+
+---
+
+## 9. completed、failed、invalid：先判断“这次实验有没有真正成立”
+
+### S · 运行没通过可能来自两类完全不同的问题
+
+一种情况是 GitAgent 已经进入目标场景，但行为违反要求。另一种情况是模型服务、GitHub fixture、测试账户或目标故障条件没有建立起来。
+
+如果把两类情况放进同一个失败桶，指标会失去解释力。
+
+### T · Runner 和 Grader 要先分类运行资格
+
+当前 Trial 主要使用下面三种状态：
+
+| 状态 | 含义 | 是否属于有效实验运行 |
+|---|---|---|
+| `completed` | 本次执行正常结束，可继续判硬约束 | 是 |
+| `failed` | 实验前提成立，但执行或硬约束出现行为失败 | 是 |
+| `invalid` | 目标实验条件没有真正建立，当前运行缺少判分资格 | 否 |
+
+需要注意，`failed` 仍属于 valid trial。它表达的是“这个实验真的跑到了，只是系统表现失败”。
+
+### A · invalid 通常怎样产生
+
+典型 invalid 场景包括：
+
+- GitHub / 模型 / 网络依赖整体不可用；
+- 第二评测账户没有配置，而当前恢复样本必须由外部身份制造状态变化；
+- Fixture 无法准备到目标初始条件；
+- 本地 grounding 与远端 revision 不一致；
+- Recovery 想测试 pending approval 崩溃，但 durable pending 根本没有出现；
+- M3 某个 variant 无法收集足够数量的有效 measured trials。
+
+Grader 在一个 Sample 下至少需要一个 valid trial 才能继续生成确定性结果。M3 还要求 serial 和 parallel 两边都达到配置的有效重复次数。
+
+### R · 为什么必须保留 invalid
+
+invalid 既不能算通过，也不能悄悄从报告里消失。报告需要同时展示配置样本数、valid、invalid、failed 以及各指标自己的分母。
+
+这样读者能够分清“系统能力没有通过验证”和“这次实验根本没有形成有效证据”。
+
+---
+
+## 10. Deterministic Grader：先把可以用规则判断的事实判完
+
+### S · TrialRecord 已经有事件、状态和最终回答
+
+到了 Grader 阶段，评测系统已经不需要继续驱动 Agent。现在要把证据转成稳定的布尔事实和统计量。
+
+### T · 确定性判分负责哪些事情
+
+它主要负责身份、顺序、参数、状态关系和时间区间这类可以机械检查的内容。
+
+### A · 判分顺序可以理解成六层
+
+```mermaid
+flowchart TD
+    E[Events + Observer + Label] --> P[1. 配对 Tool / Agent 事件]
+    P --> R[2. 检查 Route 与必需调用]
+    R --> C[3. 检查 Decision / Forbidden]
+    C --> A[4. 检查 Approval]
+    A --> O[5. 检查 External State]
+    O --> S[6. 专项 M2 / M3 / M6]
+    S --> H[hard_constraints_ok]
+```
+
+#### 第一层：Tool protocol
+
+Tool call 和 terminal result 会按 `call_id` 配对。Grader 会识别：
+
+- tool call 缺失终止结果；
+- 孤立 tool result；
+- 同一调用出现额外 terminal result；
+- approval retry 后调用是否仍能正确配对。
+
+#### 第二层：Agent protocol
+
+Agent start / completed 使用 `run_id` 配对。这样同名 Coding Agent 多次运行时仍能区分不同 invocation。
+
+#### 第三层：Route 与必需 Capability
+
+Grader 根据 `label.route` 检查实际 Agent 路径，再从 semantic trace 中提取可以确定性识别的 Capability，检查调用次数是否满足要求。
+
+#### 第四层：Decision、禁止行为与 Approval
+
+对于带 ASK / DENY / ALLOW 语义的 concrete capability，Grader 会检查运行结果是否和 label 对应。
+
+WRITE / DESTRUCTIVE GitHub 操作还会检查：
+
+- 是否出现 pending proposal / approval queue；
+- 成功 mutation 的参数是否和提案精确匹配；
+- 用户拒绝后有没有继续写入；
+- 重复批准有没有错误重放旧操作。
+
+CodingWorkspace 内部允许的 `native.*` mutation 有单独隔离边界，因此不会被当成 GitHub Approval 流程处理。
+
+#### 第五层：External State
+
+Observer diff 会判断：
+
+- 需要副作用的样本是否出现目标 mutation；
+- 只读样本是否保持无 mutation；
+- mutation 类型和数量是否符合 `final_state`；
+- 是否出现未授权 mutation；
+- 是否存在重复副作用 fingerprint。
+
+#### 第六层：专项事实
+
+最后再根据 metric group 增加 compaction、并发 overlap 或 recovery state 检查。
+
+### R · 为什么 Judge 前面先放确定性 Grader
+
+Approval 是否绑定同一组 arguments、PR 有没有真的 merge、两个调用时间是否重叠，这些事实都适合规则判断。
+
+先把硬事实固定下来，可以减少语义模型对安全和状态问题的自由解释空间。Judge 后面主要补自然语言质量与语义轨迹判断。
+
+---
+
+## 11. M2：Context Compaction 是怎样评测的
+
+### S · M2 关注“压缩后还能不能正确工作”
+
+一个长任务即使回答正确，只要没有发生 auto compaction，就没有形成“压缩后继续工作”的证据。
+
+因此，M2 的起点是先观察真实 compaction event。
+
+### T · M2 需要同时确认压缩发生、协议完整、任务正确
+
+M2 主要观察四个层次：
+
+1. auto compaction 是否真实出现；
+2. 压缩前后 token 数怎样变化；
+3. 压缩以后 tool protocol 是否仍完整；
+4. 最终任务和回答是否仍正确。
+
+### A · compaction 证据怎样进入指标
+
+Grader 从 `auto_compact` event 中提取：
+
+- `before_tokens`；
+- `after_tokens`；
+- `context_window_tokens`；
+- 当前 Agent；
+- compression ratio。
+
+压缩比例按 `1 - after_tokens / before_tokens` 计算。
+
+随后 M2 会同时保留 event-level 与 task-level 统计：
+
+| 统计层次 | 含义 |
+|---|---|
+| event-level | 每次 compaction 自己缩减了多少 |
+| task-level | 先在每个任务内部汇总，再让不同任务获得更接近的权重 |
+| peak context | 每个样本 compaction 前后峰值 context 的变化 |
+| post-compaction protocol | 发生 compaction 的样本中 tool protocol 是否仍有效 |
+| post-compaction case pass | Judge finalize 后，发生 compaction 的样本最终通过率 |
+
+M2 的 `resume_metric_ready` 还要求配置的 20 个样本都形成有效结果，并且每个样本都有可用于 peak context 的 compaction 证据。
+
+### R · 这样设计能避免哪些误判
+
+只看 compression ratio 会把“上下文变短”误当成“上下文治理成功”。M2 把压缩事件、工具协议、任务完成和语义回答放在一起，才能说明压缩没有破坏后续工作。
+
+区分 event-level 与 task-level 还能避免某个特别长的 Sample 因为触发十几次 compaction，就在总体平均值中获得十几倍权重。
+
+---
+
+## 12. M3：serial / parallel 是怎样做 A/B 对比的
+
+### S · “更快”和“真的并发”是两个不同事实
+
+parallel 版本可能因为漏掉必要工作而变快，也可能只是顺序执行得更快。单看 wall-clock latency 无法确认调度策略是否按预期生效。
+
+### T · M3 要同时验证任务正确性、真实 overlap 和性能
+
+每个 M3 Sample 都要在 serial 与 parallel 两侧运行。两侧都需要完成相同任务契约，然后才比较调度和时间。
+
+### A · Grader 怎样证明真实并发
+
+#### 1. 先把 Tool / Agent 事件配成 interval
+
+```mermaid
+flowchart LR
+    TS[tool_call start] --> TI[Tool Interval]
+    TE[tool_result end] --> TI
+    AS[agent_started] --> AI[Agent Interval]
+    AE[agent_completed] --> AI
+    TI --> STATS[Overlap Statistics]
+    AI --> STATS
+```
+
+Tool 使用 `call_id` 和 `run_id`，Agent 使用 `run_id` 和 `parent_run_id`。这样能知道哪些调用属于同一父运行下的 sibling work。
+
+#### 2. 统计 overlap
+
+对于一组 sibling intervals，Grader 会计算：
+
+- interval 数量；
 - 最大同时活跃数量；
-- 总重叠时间；
-- 首批调用是否真的重叠；
-- child Agents 是否在预期位置 join。
+- 总 overlap 时间；
+- 是否真的出现至少两个区间同时活跃；
+- 第一批独立工作有多少项一起发起。
+
+对于 Agent concurrency，还会检查 parent 是否在 children 都完成之后再 join。
+
+#### 3. serial 与 parallel 分别满足自己的结构要求
+
+parallel 侧要求：
+
+- 至少观察到 3 个目标 interval；
+- first batch 至少包含 3 个；
+- 存在真实时间重叠；
+- Agent 并发场景还需要正确 join。
+
+serial 侧要求没有 parallel overlap。
+
+Tool concurrency 样本还会检查 parallel first batch 中是否真正包含 label 要求的关键调用。
+
+#### 4. 最后才比较 latency
+
+对每个 Sample，serial 和 parallel 都收集多次 measured latency，再分别计算 p50 与 p95。
+
+常见派生量包括：
+
+- `speedup_p50 = serial_p50 / parallel_p50`；
+- `latency_reduction_p50 = 1 - parallel_p50 / serial_p50`。
+
+### R · M3 最终证明了什么
+
+M3 的结论顺序应当是：
+
+**任务契约通过 → serial / parallel 结构符合预期 → parallel 存在真实 overlap → 再讨论 latency 差异。**
+
+这让“调度器真的并发”和“最终跑得更快”可以分别被观察。
+
+另外，每侧默认只有 5 次有效 measured trial，因此这里的 p95 只是当前小样本统计。它适合做本 benchmark 内部对比，不适合被扩展成生产 SLA。
 
 ---
 
-## 16. M3 怎样同时判断“正确”和“真的并发”
+## 13. M6：Recovery 是怎样被主动制造和验证的
 
-M3 不是只比较 latency。
+### S · 恢复能力不能依赖“碰巧崩一次”
 
-一个 parallel 版本如果因为少做了必要读取所以更快，不能算并发设计更好。因此每个 variant 先必须通过任务和 Harness 的确定性契约，再讨论性能。
+要验证 pending approval、waiting 或事件日志恢复，Harness 必须先把系统推进到目标控制点，再主动注入故障。
 
-可以把 M3 的判断拆成两层：
+如果目标控制点没有形成，后面的重启成功没有足够证据说明对应恢复机制有效。
+
+### T · M6 要验证完整的恢复链
+
+Recovery 评测至少覆盖四层：
+
+| 层次 | 要确认的事实 |
+|---|---|
+| durable state | pending / waiting 等关键控制状态已经持久化 |
+| reconstruction | 新 Application 能恢复原 Session |
+| control semantics | 新输入回到正确控制点继续处理 |
+| side-effect correctness | 没有重复写入，也没有使用已经失效的旧授权 |
+
+### A · 进程故障怎样被精确注入
+
+对于需要真实进程终止的样本，RecoveryController 会启动一个独立 GitAgent 子进程并持续观察：
+
+1. Event 中是否出现目标 trigger；
+2. StateStore 中对应 durable context 是否已经准备好。
+
+只有两边都成立，父进程才终止子进程。
 
 ```mermaid
 flowchart TD
-    S[serial / parallel Trial] --> C{任务和安全契约通过?}
-    C -->|否| F[不能进入正常性能结论]
-    C -->|是| I[计算执行 intervals]
-    I --> P{并行变体是否真正重叠?}
-    P --> M[再比较 latency]
+    R[启动真实子进程执行 Turn] --> E{目标 Event 已出现?}
+    E -->|否| W[继续观察]
+    W --> E
+    E -->|是| D{Durable Context 已落盘?}
+    D -->|否| W
+    D -->|是| K[Terminate Process]
+    K --> N[构造新 LiveApplication]
+    N --> S[resume_session]
+    S --> U[继续后续用户输入]
+    U --> G[检查事件与外部状态]
 ```
 
-serial variant 应该符合串行预期；parallel variant 需要观察到样本要求的调用/Agent 重叠，同时最终任务仍然正确。
+当前恢复组还包含几类不同故障：
 
-这把“跑得快”和“调度器按预期并发”分成两个可以分别验证的事实。
+- **pending approval 崩溃**：等待 proposal 已持久化后终止进程；
+- **waiting_for_user 崩溃**：等待普通用户输入的 durable 节点出现后终止进程；
+- **active siblings 崩溃**：多个 sibling Agent 活跃时中断，再看后续 Turn 能否正常完成；
+- **malformed event tail**：在事件文件尾部追加损坏内容，验证有效事件前缀仍可读取；
+- **external state change**：Approval waiting 后，由第二账户修改 PR head、关闭 PR 或改变默认分支；
+- **post-compaction restart**：复用之前自然发生过 auto compaction 的 Session，再执行干净重启。
+
+### R · 为什么 M6 一定要检查副作用
+
+恢复后“程序还能回答”只覆盖 reconstruction 的一部分。真正危险的问题通常发生在副作用边界：旧 proposal 被重复执行、外部状态变化后仍消费旧授权、网络或重启导致同一 mutation 再写一次。
+
+因此 M6 会把 fault 记录、Action Log、Event、Approval 和 Observer Diff 一起交给 Grader，并单独统计 duplicate side effect。
+
+这里的 duplicate 检测覆盖当前 Harness 能观察和 fingerprint 的 mutation 类型。它提供的是当前评测范围内的重复副作用证据，不代表对所有外部系统给出 exactly-once 保证。
 
 ---
 
-## 17. 性能 Trial 的时间到底从哪里算到哪里
+## 14. 用 REC-01 把一条 Recovery Sample 从头走一遍
 
-当前 M3 计时围绕一次用户输入真正进入应用执行的主要区间。
+前面的组件已经讲清楚，现在用 `recovery:REC-01` 串成一条完整故事。
 
-Fixture 准备、baseline observer、运行后的清理等评测 Harness 开销不全部算进 Agent latency。
+### S · 场景
 
-所以这里的 latency 更接近“当前 GitAgent 执行这次输入用了多久”，不是 `python run_eval.py` 从启动到退出的 wall-clock 总时间。
+用户要求找到指定 Issue，并发布固定评论 `REC-01-RESUME-COMMENT`。样本第二步要求：pending approval 出现后终止 GitAgent 进程，随后恢复同一 Session。第三步用户批准原提案。
 
-每个 variant 默认收集 5 次有效 measured trial，并有 warmup。对单个 Sample，会分别计算 serial / parallel 的 p50、p95。
+最终状态要求目标评论只新增一次。
 
-常见比较方式可以理解为：
+### T · 本 Sample 要验证什么
 
-```text
-p50 speedup = serial_p50 / parallel_p50
+这个样本同时验证：
 
-p50 latency reduction = 1 - parallel_p50 / serial_p50
+- Issue 路由是否正确；
+- `github.post_comment` 是否进入 Approval；
+- pending proposal 是否已经 durable；
+- 进程终止后是否能恢复同一 Session；
+- 用户批准后是否只执行一次 comment mutation；
+- 最终回答是否正确描述恢复结果。
+
+### A · 实际运行步骤
+
+```mermaid
+sequenceDiagram
+    participant F as FixtureManager
+    participant R as EvalRunner
+    participant A as GitAgent Process
+    participant P as Persistence
+    participant G as GitHub
+    participant O as Observer
+
+    F->>G: 准备目标 Issue
+    O->>G: 保存 Before Snapshot
+    R->>A: 提交“发布评论”任务
+    A->>P: 持久化 pending proposal
+    R->>P: 确认 durable pending 已存在
+    R--xA: 终止进程
+    R->>A: 新建 Application 并恢复 Session
+    R->>A: 用户批准原提案
+    A->>G: 执行 post_comment
+    O->>G: 保存 After Snapshot
+    O->>O: 计算 mutation diff
 ```
 
-然后在满足条件的性能 Sample 上再进行聚合。
+随后 Deterministic Grader 会检查：
 
-需要注意：5 次重复得到的 p95 只是当前小样本统计，不能宣传成生产规模稳定尾延迟 SLA。
+1. 实际 route 是否包含 Main 和 Issues；
+2. comment capability 是否出现 ASK；
+3. proposal 与最终成功调用的 arguments 是否一致；
+4. fault 是否真的在 pending 状态形成后触发；
+5. Observer 是否只看到一条目标评论；
+6. duplicate side effect count 是否为 0；
+7. tool / agent protocol 是否闭合。
 
----
+最后 Judge 再检查回答是否说明 pending approval 成功跨进程恢复，以及批准后只执行一次。
 
-## 18. M3 的 serial / parallel 比较不是纯线程池微基准
+### R · 这个例子说明了什么
 
-当前 Runner 的不同 variant 不只是改一个底层 `max_workers` 数字，还会让运行配置和执行方式提示共同对应 serial / parallel 策略。
+REC-01 的通过条件由多份证据共同组成。单独看到“最终 Issue 上有评论”还无法说明 pending recovery 生效；单独看到“Session 恢复成功”也无法说明没有重复写入。
 
-因此得到的是**两种完整系统运行策略的 A/B 比较**，而不是严格控制所有其他变量、只切换调度器内部一个布尔开关的 microbenchmark。
-
-这个边界很重要。
-
-如果 parallel 更快，可以说“当前 parallel 系统策略在这些样本中表现出怎样的时间变化”；不能直接把全部差异归因成某一行线程池代码带来的纯收益。
-
----
-
-## 19. M2 怎样确认 Context Compaction 真正发生
-
-上下文治理评测首先需要看到真实 compaction event。
-
-如果一个任务最终回答完全正确，但从未达到 compaction 阈值，它最多说明普通长任务完成了，不能拿来证明“压缩后仍然正确”。
-
-Compaction event 会包含压缩前后的 token / size 估算等信息，Grader 可以计算缩减比例。
-
-概念上：
-
-```text
-reduction = 1 - after / before
-```
-
-但缩减比例只是第一层指标。
-
-真正的 M2 还要检查：
-
-1. compaction 确实发生；
-2. tool call / result 协议没有被破坏；
-3. Agent 仍完成任务需要的真实动作；
-4. 最终答案仍覆盖任务语义。
-
-所以“上下文变短”不等于“上下文治理成功”。
+把 durable trigger、恢复控制流、真实 mutation 和语义回答串起来后，才能形成完整的恢复证据链。
 
 ---
 
-## 20. M2 为什么还区分事件级和任务级聚合
+## 15. Judge：硬约束判完以后，再补自然语言语义判断
 
-一个特别长的 Sample 可能触发 10 次 compaction，另一个只触发 1 次。
-
-如果直接把全部 compaction events 混在一起求平均，第一个任务会拥有 10 倍权重。
-
-因此报告里需要区分：
-
-- **event-level**：一次 compaction event 平均缩减多少；
-- **sample/task-level**：每个任务整体表现怎样，再让不同任务获得相近权重。
-
-读指标时必须知道分母是 event 还是 sample，否则同一个数字很容易被误解。
-
----
-
-## 21. M6 的“恢复成功”包含哪些层次
-
-恢复不是“程序重新启动以后没有报错”。
-
-至少要区分四层：
-
-| 层 | 要确认什么 |
-|---|---|
-| durable state | 目标 waiting / context 是否真的持久化 |
-| reconstruction | 新进程是否能重建 Session 和 Agent 控制树 |
-| control semantics | 新输入是否回到正确 waiting 节点 |
-| side-effect correctness | 有没有重复写、复用旧授权或越过已变化前提 |
-
-例如一次 Approval recovery 只有重新打开 Session 还不够。系统还需要在用户批准以后继续原 pending call，并在远端状态已经变化时正确拒绝旧计划。
-
-因此恢复指标必须结合事件、故障记录和 Observer Diff。
-
----
-
-## 22. Duplicate Mutation 为什么单独值得统计
-
-恢复和网络异常场景最危险的问题之一是重复副作用。
-
-Grader 会根据 mutation identity / fingerprint 检查同一逻辑写入是否出现重复成功执行。
+### S · 有些问题很难写成稳定规则
 
 例如：
 
-- 相同评论出现两次；
-- 同一远端动作被恢复后重新提交；
-- 原计划已经完成，却又消费一次旧调用。
+- 最终解释有没有真正回答用户的问题；
+- 仓库调查是否正确组织了事实；
+- Recovery 后的回答有没有准确说明当前状态；
+- semantic gold trace 中较抽象的步骤是否在整体语义上得到满足。
 
-这个指标只能覆盖评测观察范围和当前支持识别的 mutation 类型。
+这类问题更适合交给 LLM Judge。
 
-“没有发现 duplicate mutation”不能扩大解释为 GitAgent 对所有外部系统都提供 exactly-once guarantee。
+### T · Judge 需要看到足够上下文，又不能重新接管硬约束
 
----
+Judge Request 会把当前 Sample 的任务、参考答案和已经确定的运行事实一起打包。
 
-## 23. Judge 为什么放在确定性 Grader 之后
-
-确定性规则很适合检查：
-
-- 是否调用了禁止能力；
-- Approval 是否匹配参数；
-- 外部状态是否发生目标变化；
-- tool protocol 是否闭合；
-- recovery fault 是否真正触发。
-
-但它不擅长判断一段自然语言解释是否完整、结论是否真正回答用户问题。
-
-因此语义质量交给 Judge。
+### A · Judge 实际收到什么
 
 ```mermaid
 flowchart TD
-    A[Final Answer] --> J[Judge]
-    R[Answer Reference] --> J
-    D[Deterministic Facts] --> J
+    U[user_input] --> J[Judge Request]
+    G[gold label + answer_reference] --> J
+    F[Final Answer] --> J
     T[Compact Trace Summary] --> J
+    A[Approval Summary] --> J
     O[Observer Diff] --> J
-    J --> S[Semantic judgment]
+    H[Deterministic Hard Facts] --> J
 ```
 
-Judge 不是只看到最终答案。它会得到用户请求、参考要点、精简后的轨迹事实、Approval 摘要和外部状态证据。
+不同指标组要求的 Judge 字段也不同：
 
-这样 Judge 更难因为一段语言很自信，就忽略实际发生的未授权 mutation。
+| 指标组 | Judge 重点 |
+|---|---|
+| M2 | `answer_facts_ok`、`semantic_trace_ok` |
+| M3 | `answer_facts_ok`、`semantic_trace_ok` |
+| M6 | `answer_facts_ok`、`recovery_semantics_ok` |
+
+M3 有多次重复 Trial。Judge Request 不会把所有重复都逐条完整评审。系统会选择代表 Trial，并且为 M3 同时附上 serial 与 parallel 两侧的代表性答案和 trace summary。
+
+Judge 输出采用结构化 response schema，并通过 `judge_id` 绑定 Sample。
+
+### R · 为什么采用“导出 → 外部 Judge → finalize”
+
+主 Runner 先完成确定性评测并生成 `judge-input.jsonl`。外部 Judge 生成结果后，再通过 finalize 合并成最终指标。
+
+这样运行评测和语义评审可以分阶段进行，也方便更换 Judge 执行环境。finalize 会严格检查 Judge id：缺失、重复或混入当前 run 之外的结果都会直接报错。
+
+最终 Sample pass 需要同时满足：
+
+**hard constraints 通过 + 当前 Sample 要求的 Judge 字段全部通过。**
+
+在 Judge 结果尚未回填时，语义指标保持 pending。
 
 ---
 
-## 24. 为什么 Judge 采用导出 / 回填协议
+## 16. Aggregate Metrics：最后汇总时一定保留“分母”
 
-当前 Eval Runner 并不会在主执行流程里自动把所有 Sample 再调用一次 Judge 模型。
+### S · 不同指标依赖的有效样本集合不同
 
-Grader 可以先导出结构化 Judge Requests；外部评审完成后生成对应 JSONL，再通过 finalize 流程合并。
+M2 的 compaction ratio 只对真实发生 compaction 的事件有意义；M3 speedup 需要 serial / parallel 两边都有足够有效 Trial；M6 recovery success 需要目标故障场景真正成立；Judge 指标还需要外部语义结果已经回填。
+
+### T · 汇总层要让每个数字都能解释自己的覆盖范围
+
+总报告会保留：
+
+- samples total / executed；
+- valid / invalid / failed；
+- judge pending；
+- 每个 metric group 的 configured samples；
+- 每个专项自己的有效样本数和指标分母。
+
+### A · 三个指标组分别怎样聚合
+
+#### M2
+
+主要汇总 compaction event 数、sample compaction rate、token 前后均值、compression ratio、peak context、post-compaction tool protocol 等。
+
+#### M3
+
+按 Sample 先得到 serial / parallel 的 p50、p95、speedup、latency reduction、overlap rate，再跨有效 Sample 求整体统计。
+
+Judge finalize 后再形成 official task completion rate。
+
+#### M6
+
+先统计 structured recovery success 和 duplicate side effect，再在 Judge finalize 后形成 official recovery success rate。
+
+### R · 保留分母解决了什么问题
+
+一个“100%”如果只来自 2 个有效样本，和 20 个样本全部有效后得到的“100%”含义差别很大。
+
+因此评测报告不能只展示百分比。configured、valid、invalid、pending 和 metric-specific denominator 必须和指标一起阅读。
+
+---
+
+## 17. Eval 自己也支持 Resume：恢复的是 benchmark 进度
+
+### S · 完整评测可能运行很久
+
+M3 每个 Sample 有两侧 warmup 和多次 measured trials，真实 GitHub / 模型调用也可能使完整 suite 持续很久。
+
+### T · Runner 中断后需要知道哪些 Trial 可以复用
+
+Runner 会持续落盘 manifest、trial records、events、observer results 和 error records。
+
+### A · Resume 时怎样防止“接着跑了另一个实验”
+
+重新启动时，Runner 会校验 manifest 中的关键身份，包括：
+
+- dataset hash；
+- base config hash；
+- repetitions；
+- sample / group 选择范围；
+- selected sample keys。
+
+只有这些条件一致，已有 Trial 才会被重新加载并计入当前 run。缺失 Trial 继续执行。
 
 ```mermaid
 flowchart LR
-    G[Deterministic grading] --> Q[Judge Requests JSONL]
-    Q --> E[External Judge]
-    E --> A[Judge Answers JSONL]
-    A --> F[finalize_metrics]
+    R[--resume] --> M[读取 Manifest]
+    M --> V{关键配置一致?}
+    V -->|否| E[拒绝继续]
+    V -->|是| T[加载已有 Trials]
+    T --> C[只补缺失 Trial]
 ```
 
-回填时会检查：
+### R · Eval Resume 和 Agent Recovery 的边界
 
-- sample identity；
-- 必需字段；
-- 是否缺失；
-- 是否重复；
-- 是否混入不属于当前 run 的判断。
+两者处理的对象不同：
 
-因此“用 LLM Judge”也不是无结构自由评论，仍然有输入输出协议。
-
-Judge 尚未完成时，对应语义指标应该保持 pending，而不是默认为通过。
-
----
-
-## 25. 为什么 Judge 不一定逐个评审所有重复 Trial
-
-M3 会重复运行同一个 Sample 很多次。如果把每次回答都完整发送给 Judge，语义评审成本会快速增加。
-
-当前系统会在样本 / variant 层选择代表性 Trial，导出对应答案和摘要用于 Judge。
-
-确定性规则仍然可以对多次有效 Trial 进行聚合，但语义 Judge 并不是对每一个重复生成都独立做一次完整评审。
-
-所以最终结果应理解为：
-
-- 多次运行的 Harness 硬约束有重复证据；
-- 语义质量主要由代表 Trial 的 Judge 结果补充。
-
-不能把它描述成“所有五次回答都被 Judge 单独确认正确”。
-
----
-
-## 26. aggregate_metrics 为什么必须保留分母
-
-不同指标不是用同一批 Trial 计算的。
-
-例如：
-
-- performance latency 只使用满足要求的有效 M3 runs；
-- compaction reduction 只在真正发生 compaction 的事件/样本上有意义；
-- recovery success 只在目标故障确实触发的有效 Sample 上有资格判断；
-- Judge semantic pass 只对已经拿到 Judge 结果的样本成立。
-
-因此报告需要同时保存：
-
-- 配置样本数；
-- valid / invalid / failed trial 数量；
-- metric-specific denominator；
-- pending Judge 数量；
-- coverage shortfall。
-
-一个 100% 成功率如果分母只有 2/20，和 20/20 的 100% 不是同一个结论。
-
----
-
-## 27. Eval Runner 自己怎样支持中断后继续
-
-完整评测可能运行很久。Runner 会持续写入 manifest、trial records 和必要中间产物。
-
-重新启动评测时，会检查当前 run 的关键条件是否仍然一致，例如：
-
-- dataset identity；
-- 样本选择范围；
-- variant；
-- repetitions；
-- 基础运行配置；
-- 已经存在的 Trial 身份。
-
-满足条件的已完成 Trial 可以复用，缺失部分继续运行。
-
-这和 GitAgent 自己的 Agent recovery 是两件不同的事：
-
-| 恢复 | 恢复什么 |
+| 机制 | 恢复对象 |
 |---|---|
-| GitAgent Recovery | 某个用户业务 Session 中等待的 Agent 控制状态 |
-| Eval Resume | 一整套 benchmark 已经完成了哪些 Trial |
+| Agent Recovery | 某个用户 Session 内的 Agent 控制状态 |
+| Eval Resume | 一整套 benchmark 已经完成到哪些 Trial |
 
-不要因为两个地方都有 resume 就把它们当成同一个机制。
-
----
-
-## 28. 评测产物为什么也要做 secret sanitation
-
-真实 Eval 会接触 GitHub token、模型配置和可能包含敏感内容的运行数据。
-
-Runner 在写报告和错误记录前会对已知 secret values 做清洗，并在产物收束时检查报告中是否仍包含秘密值。
-
-这不表示它能自动识别所有可能的业务敏感文本，但至少避免把运行配置中的已知 token 直接写入共享评测结果。
-
-评测系统本身也是生产 Harness 的一部分，不能为了可观测性把安全边界完全关闭。
+把这两个层次分开后，M6 可以专门测试 GitAgent 的业务恢复能力，而 Eval Runner 自己仍能处理 benchmark 执行中断。
 
 ---
 
-## 29. 一次 Sample 从数据集到最终指标怎样完整流动
+## 18. 评测产物也要经过 Secret Sanitation
 
-现在把整章压缩成一条故事线。
+### S · 真实 Eval 会接触敏感配置
 
-假设一个 M6 Sample 要验证“Approval waiting 后进程退出，恢复后用户拒绝，远端不能产生副作用”。
+模型服务配置、GitHub token 和运行状态都有可能包含不适合进入共享报告的信息。
 
-**第一步：加载 Sample。** 数据集定义多轮 user_input、领域 route、必须出现的 Proposal、禁止的远端 mutation 和 final state。
+### T · 可观测性不能扩大 secret 暴露面
 
-**第二步：生成 TrialPlan。** Runner 确定这是 M6 recovery trial。
+Runner 在写 JSON / JSONL 产物前会通过已有 redaction 能力清洗已知 secret values。
 
-**第三步：准备 Fixture。** 创建/重置测试对象，Observer 捕获 before snapshot。
+### A · 清洗覆盖哪些产物
 
-**第四步：通过 LiveApplication 执行。** Agent 真实走到 Approval waiting。
+包括：
 
-**第五步：RecoveryController 确认 durable pending call。** 条件不成立则 Trial invalid，不能伪装成恢复测试。
+- events；
+- observer snapshots；
+- manifest；
+- trials；
+- deterministic results；
+- metrics；
+- judge input；
+- errors。
 
-**第六步：注入进程故障。** 旧应用退出，新应用读取持久状态恢复 Session。
+产物生成完成后，Runner 还会再次扫描这些报告文件，确认已知 secret 原值没有残留。
 
-**第七步：继续用户输入。** 用户明确拒绝，Service 把输入送回原 waiting Approval。
+当一次 run 已经顺利进入最终产物生成阶段，评测专用 runtime state 目录会被移除，避免长期保留私有 Session / Memory 状态。若进程被硬终止，状态目录可以留下供 `--resume` 使用。
 
-**第八步：捕获 after snapshot 和 event slice。** Observer 检查没有目标 mutation，EventTracker 检查拒绝和控制流。
+### R · 这样安排的原因
 
-**第九步：Deterministic Grader。** 校验 route、Approval、tool protocol、fault、恢复和副作用。
-
-**第十步：Judge。** 判断最终回复有没有正确说明当前结果。
-
-**第十一步：Aggregate。** 只有评测前提有效、硬约束和语义条件都满足，才进入对应 success 统计。
-
-这条链才是 GitAgent 所谓 Harness evaluation 的完整含义。
-
----
-
-## 30. STAR 复盘：为什么最终答案评分远远不够
-
-### S — Situation
-
-GitAgent 不只是聊天机器人。它会读取真实仓库、并发运行工具、暂停等待用户、恢复 Session，并可能修改 GitHub。
-
-一个最终回答可以看起来完全正确，但运行过程可能没有读取证据、绕过 Approval、重复写入或使用了已经失效的候选。相反，系统拒绝旧计划有时正是正确行为。
-
-### T — Task
-
-评测必须同时判断三件事：
-
-1. 这次测试前提是否真的成立；
-2. GitAgent 是否遵守 Harness 协议和外部副作用约束；
-3. 最终语义是否真正满足用户任务。
-
-另外，并发、上下文压缩和恢复这些机制还需要自己的专项证据，不能只从总耗时或最终文本推断。
-
-### A — Action
-
-GitAgent 评测使用带 route / trace / must_not / final_state 的 EvalSample；Fixture Manager 建立受控测试环境；Runner 通过真实 LiveApplication 执行 Trial；Observer 独立记录前后状态；EventTracker 收集调用区间和控制事件；RecoveryController 在明确控制点主动注入故障；Deterministic Grader 检查协议、权限、Approval、并发和副作用；Judge 再检查语义质量；Aggregate Metrics 保留 valid/invalid/pending 与每个指标自己的分母。
-
-### R — Result
-
-这套框架可以比较有根据地回答：compaction 是否真正发生且没有破坏任务、parallel 策略是否真的产生执行重叠、waiting / crash 后是否恢复到正确控制点，以及用户授权有没有被副作用路径绕过。
-
-代价是评测 Harness 本身也比较复杂，需要维护真实 fixture、外部服务、故障控制、运行事件和 Judge 产物。
-
-核心收益是：**GitAgent 的评测不相信 Agent 说“我完成了”，而是要求运行轨迹、真实状态和最终语义共同证明它完成了。**
+Eval Harness 自己同样属于系统安全边界的一部分。保存更多证据有利于调试，但证据产物不能直接变成 secret 泄漏通道。
 
 ---
 
-## 31. 这一章最容易混淆的地方
+## 19. 现在再回头看：为什么整套设计需要三层证据
 
-| 误解 | 正确理解 |
+到这里，各组件怎样工作已经讲完。现在再讨论整体设计取舍会更容易理解。
+
+### S · GitAgent 的成功包含多种事实
+
+一个任务可能同时包含：
+
+- 正确理解用户意图；
+- 正确路由；
+- 获取真实仓库证据；
+- 遵守 Capability 与 Approval 约束；
+- 对外部世界产生正确且唯一的副作用；
+- 在并发、压缩或恢复场景下保持这些性质。
+
+### T · 单一评分源无法覆盖所有事实
+
+最终文本适合判断解释质量，却看不到完整内部调用和外部状态；Event 很适合判断执行路径，却不能独立确认 GitHub 最终状态；Observer 能确认状态变化，却不一定知道这次 mutation 有没有经过正确授权。
+
+### A · 因此把职责拆成三层
+
+| 证据层 | 最擅长回答的问题 | 典型例子 |
+|---|---|---|
+| Event Trace | 系统怎样运行 | 路由、tool protocol、Approval、并发区间、compaction |
+| Observer Diff | 外部世界怎样变化 | 评论是否新增、PR 是否 merge、默认分支是否变化 |
+| Judge | 最终语义是否满足任务 | 解释是否完整、恢复语义是否正确 |
+
+Deterministic Grader 位于中间，把前两类证据转成稳定硬事实，再把这些事实提供给 Judge。
+
+### R · 最终得到的评测能力
+
+这套 Harness 可以对下面这些结论给出较清晰的证据链：
+
+- compaction 真实发生，并且后续工具协议和任务仍成立；
+- parallel 策略真的产生 sibling overlap，同时任务正确；
+- 进程故障发生在目标 durable 控制点之后；
+- Session 恢复后继续了正确控制语义；
+- Approval 没有被恢复流程或外部状态变化绕过；
+- 目标 mutation 真实发生，并且没有出现可观察到的重复副作用；
+- 最终回答在语义上覆盖了用户任务。
+
+这就是本评测系统最重要的设计思想：**先把一次任务运行成可审计的实验，再让不同类型的证据分别证明对应事实。**
+
+---
+
+## 20. 复习时怎样快速讲清这一章
+
+如果需要在面试或复习中快速说明，可以按下面顺序画图并讲述：
+
+```mermaid
+flowchart LR
+    S[Sample 契约] --> P[TrialPlan]
+    P --> F[Fixture + Baseline]
+    F --> A[LiveApplication]
+    A --> E[Event Trace]
+    A --> O[Observer Diff]
+    E --> D[Deterministic Grader]
+    O --> D
+    D --> J[Judge]
+    J --> M[Metrics]
+```
+
+讲解时抓住四个层次：
+
+1. **先定义成功**：EvalSample 用 route、trace、must_not、final_state 和 answer_reference 把任务变成判分契约；
+2. **再真实运行**：TrialPlan 展开实验，Fixture 建立前提，Runner 通过 LiveApplication 执行；
+3. **然后收证据**：Event 看内部路径，Observer 看真实状态，TrialRecord 把一次运行固化；
+4. **最后分层判分**：Deterministic Grader 判硬事实，Judge 判语义，Aggregate 保留有效分母。
+
+三个专项可以各用一句话继续展开：
+
+| 专项 | 复习时最应该记住的主线 |
 |---|---|
-| 最终答案 Judge 通过 = Sample 一定通过 | 不一定，硬约束和副作用检查同样必须满足 |
-| Trial invalid = GitAgent 行为失败 | 不一定，可能是评测前提或外部依赖没成立 |
-| parallel latency 更低 = 证明并发正确 | 不够，还要真实 interval overlap 和任务正确性 |
-| compaction reduction 很高 = 上下文治理成功 | 不够，还要协议完整和答案正确 |
-| 程序重启成功 = recovery 成功 | 不够，还要恢复 waiting/control semantics 并避免重复副作用 |
-| 没发现 duplicate mutation = 全系统 exactly-once | 不能这样扩大结论，只覆盖当前观察和样本范围 |
-| 5 次运行的 p95 = 生产尾延迟保证 | 不是，只是当前小样本统计 |
-| Judge 会逐个评审每一次重复 Trial | 当前主要使用代表 Trial 做语义评审 |
-| Eval resume 和 Agent resume 是同一个机制 | 不是，一个恢复 benchmark 进度，一个恢复用户业务 Session |
+| M2 | 先确认 auto compaction 真实发生，再检查压缩比例、tool protocol 和最终任务 |
+| M3 | 同一 Sample 跑 serial / parallel；先证明任务正确和 interval overlap，再比较 latency |
+| M6 | 先确认 durable control point，再注入故障；恢复后检查控制语义和重复副作用 |
 
 ---
 
-## 32. 复习时怎样讲这一章
-
-推荐先画出三种证据：
-
-> **Event Trace 说明 GitAgent 怎么做，Observer Diff 说明真实世界发生了什么，Judge 说明最终回答是否满足用户语义。**
-
-然后沿“Sample → Fixture → LiveApplication → Event/Observer → Deterministic Grader → Judge → Aggregate”讲一次。
-
-如果面试官继续追问，可以分别举三个专项：
-
-- M2：必须真实触发 compaction，再检查协议和答案；
-- M3：必须先任务正确，再用 interval overlap 证明并发，最后比较 serial / parallel latency；
-- M6：必须先进入目标 durable control point，再注入故障，并检查恢复后副作用语义。
-
-这样比直接背成功率、p50 或样本数量更能说明你理解的是评测 Harness，而不是指标表。
-
-## 33. 代码定位
+## 21. 代码定位：想核对实现时去哪里看
 
 | 想核对的问题 | 主要位置 |
 |---|---|
-| 56 条样本与 gold trace | `eval/gitagent-evaluation-dataset.json` |
+| Dataset schema、56 条样本、semantic gold trace | `eval/gitagent-evaluation-dataset.json` |
 | EvalSample / TrialPlan / TrialRecord / ObserverSnapshot | `eval/models.py` |
-| Fixture、Observer、RecoveryController | `eval/environment.py` |
-| Trial 执行、serial/parallel、recovery、resume | `eval/runner.py` |
-| tool/agent interval、确定性判分、Judge、指标聚合 | `eval/grader.py` |
-| CLI 运行与 finalize 入口 | `eval/run_eval.py` |
+| RuntimeConfig 派生、Fixture、Observer、RecoveryController | `eval/environment.py` |
+| Trial 编排、M3 variant、M6 执行、EventTracker、Eval Resume | `eval/runner.py` |
+| Tool / Agent interval、硬约束、M2/M3/M6 指标、Judge 请求、finalize | `eval/grader.py` |
+| CLI 执行与 finalize 入口 | `eval/run_eval.py` |
 
-到这里，GitAgent 的教学主线就完整闭合了：从一次用户请求如何进入系统，一直到怎样用独立评测证据验证这条 pipeline 的行为。
+到这里，评测模块可以被看成一条完整工程流水线：**先定义实验，再建立前提，再通过真实应用执行，再采集独立证据，最后把硬事实和语义判断合并。** 复习这部分时，优先掌握这条数据流，再去记具体指标字段，会更容易把整个设计串起来。
