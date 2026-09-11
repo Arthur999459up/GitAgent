@@ -1,1066 +1,489 @@
-# 05 Capability 与工具系统：GitAgent 怎样把不同工具组织成一套统一能力
+# 05 Capability 与工具系统：不同工具怎样被组织成一套统一能力
 
-上一章已经讲清楚：模型最终会产出结构化调用。接下来真正要解决的问题是，模型写出的这个调用名称怎样找到实际工具、当前 Agent 是否有资格使用、参数怎样检查、底层动作怎样执行，以及不同来源的错误怎样统一返回。
+上一章停在 StructuredCall：模型已经明确表达“想调用什么、参数是什么”，但它还没有真正接触文件系统、GitHub、MCP 服务、Skill 或 RAG。接下来要解决的是：这个调用怎样找到真实实现；当前 Agent 能不能看到和执行；输入输出怎样校验；不同底层错误怎样统一；动态来源变化以后运行时怎样更新。
 
-GitAgent 把这些事情集中放进 Capability 系统。
-
-这一章先建立完整执行链，再分别理解 Catalog、Registry、Provider、PermissionPolicy 等组件。正文会直接解释每个机制解决的问题、运行边界和代价，复习时可以沿 Capability 的生命周期把这些设计串起来。
+GitAgent 用 Capability 系统处理这些问题。本章先把 Capability 的运行结构和生命周期讲清楚，再分别看 Native、GitHub/MCP、Skill、RAG 四类 Provider 怎样适配进来，最后讨论为什么要这样设计。
 
 ---
 
-## 1. 先建立整体认识：Capability 系统处在调用链的什么位置
+## 1. Capability 位于模型调用和真实工具之间
 
-先把 Capability 系统放回整个 Agent 执行流程里看。
-
-模型不会直接调用 GitHub Client、文件系统函数或者 MCP HTTP 接口。模型先看到一批经过筛选的“可调用能力”，随后返回结构化调用。Harness 再把模型调用还原成内部 Capability id，经过 Capability 层完成校验、授权和执行。
+模型不会直接调用 GitHub Client、文件系统函数或 MCP HTTP 接口。应用启动时，系统先把不同来源的动作整理成统一 Capability；每个 Agent 只能看到自己允许发现的那部分。模型返回调用以后，Harness 再把模型函数名还原成内部 Capability id，经过工作流检查、schema、权限和执行调度，最后交给绑定的 Provider。
 
 ```mermaid
 flowchart LR
-    U[用户任务] --> A[Agent]
-    A --> D[discover 可见 Capability]
-    D --> T[转换成模型 function tools]
-    T --> M[模型选择工具并生成参数]
-    M --> SC[StructuredCall]
-    SC --> H[Harness / Dispatcher]
+    A[不同工具来源] --> P[Provider 适配]
+    P --> R[Capability Registry]
+    R --> D[按 Agent discover 过滤]
+    D --> T[模型 tools]
+    T --> M[StructuredCall]
+```
+
+真正执行时再走另一段：
+
+```mermaid
+flowchart LR
+    M[StructuredCall] --> H[Harness preflight]
     H --> C[Capability Layer]
-    C --> P[Permission Policy]
-    C --> R[Registry]
-    C --> V[Provider]
-    V --> X[本地文件 / GitHub / MCP / Skill / RAG]
-    X --> CR[CapabilityResult]
-    CR --> A
+    C --> A[权限与 schema]
+    A --> E[Execution]
+    E --> P[绑定 Provider]
+    P --> X[真实系统]
+    X --> R[统一 CapabilityResult]
 ```
 
-从这张图先记住一句话：
-
-> Capability 系统负责把“模型想做一个动作”转换成“系统确认这个动作当前存在、允许执行、参数有效，并通过正确的底层实现完成调用”。
-
-它位于模型协议和真实执行资源之间，是一层稳定的控制边界。
-
-### 1.1 本章需要分清的六个对象
-
-| 对象 | 可以把它理解成什么 | 主要职责 |
-|---|---|---|
-| `CapabilityDefinition` | 配置中的能力说明书 | 声明稳定 id、provider、source、访问等级、静态绑定信息 |
-| `Capability` | 当前运行时的一项能力 | 保存描述、状态、输入输出 schema、访问等级等模型可见和执行所需信息 |
-| `CapabilityBinding` | 能力到实现的连接线 | 记录这项能力应该交给哪个 Provider，以及 Provider 内部目标是什么 |
-| `CapabilityRegistration` | Capability 与 Binding 的组合 | Registry 实际保存和解析的注册单元 |
-| `CapabilityRegistry` | 当前运行时能力表 | 保存此刻真正存在的能力，并根据 capability id 找到绑定 |
-| `CapabilityLayer` | 能力系统总入口 | 负责加载、发现、授权、调用、错误恢复和 Failure Guard |
-
-其中还有两个会贯穿整章：
-
-- `PermissionPolicy` 决定某个 Agent 能看到什么、能调用什么、哪些动作需要审批。
-- `Provider` 负责把统一的 Capability 调用真正翻译到底层系统。
-
-先理解这些对象之间的关系，后面的 Native、MCP、Skill、RAG 就会非常自然。
+这层的核心价值不是“给函数再包一层名字”，而是建立一个稳定动作契约：上层 Agent 只认识 Capability，底层 Provider 负责把这个契约翻译成具体实现。
 
 ---
 
-## 2. 一项 Capability 到底包含哪些信息
+## 2. 一项 Capability 需要描述哪些事情
 
-### 2.1 先看它怎样设计
+一项运行时能力既要给模型看，又要给权限、执行和结果校验使用，所以仅有函数名不够。可以把 Capability 信息分成四组。
 
-在 GitAgent 里，一项能力需要同时服务模型层和执行层，因此它不能只有一个函数名称。
+| 信息组 | 主要内容 | 用途 |
+|---|---|---|
+| 身份与来源 | 稳定 id、类型、source | 让运行时明确这是什么能力、来自哪里 |
+| 模型可见合同 | 描述、input schema | 告诉模型什么时候用、参数怎样组织 |
+| 执行约束 | READ / WRITE / DESTRUCTIVE、当前状态 | 参与权限、审批和调度 |
+| 结果合同 | output schema | 检查 Provider 返回是否满足统一协议 |
 
-运行时的 `Capability` 主要保存下面这些信息：
+同时，GitAgent 把“能力是什么”和“能力具体由谁实现”分开。
 
-| 信息 | 用途 |
-|---|---|
-| `id` | 系统内部稳定标识，例如 `native.read`、`github.get_pr` |
-| `kind` | 标记能力属于 Native Tool、MCP Tool、Skill 或 RAG |
-| `description` | 告诉模型这项能力适合完成什么任务 |
-| `source_id` | 标记它属于哪个能力来源，例如 `native`、`github`、`context7`、`rag` |
-| `status` | 表示当前是 AVAILABLE、UNAVAILABLE 还是 DISABLED |
-| `access` | 表示 READ、WRITE、DESTRUCTIVE 访问等级 |
-| `input_schema` | 约束模型传入的参数结构 |
-| `output_schema` | 约束 Provider 返回的数据结构 |
-
-与此同时，系统把“能力本身是什么”和“能力具体怎样执行”分开保存。
-
-`CapabilityBinding` 负责连接实现，它保存 capability id、provider id，以及 Provider 自己能够识别的 target。两者组合成 `CapabilityRegistration` 后进入 Registry。
+- **Capability** 描述稳定动作契约。
+- **Binding** 描述它应该交给哪个 Provider，以及 Provider 内部要调用哪个目标。
+- 二者组合成运行时 registration，放入 Registry。
 
 ```mermaid
 flowchart LR
-    C[Capability<br/>能力契约] --> R[CapabilityRegistration]
-    B[CapabilityBinding<br/>执行绑定] --> R
-    R --> REG[Registry]
+    C[Capability 契约] --> R[Registration]
+    B[Provider Binding] --> R
+    R --> G[Runtime Registry]
 ```
 
-这种拆法很重要。模型关心的是名称、描述和参数；Provider 关心的是自己的 handler、远端工具名、Skill 路径或知识库对象。两部分可以各自变化，又能通过 registration 保持明确对应关系。
+以文件精确编辑为例：对模型来说，它是“用旧文本定位并替换”的写能力；对权限系统来说，它属于本地 WRITE；对 Native Provider 来说，它绑定到真实文件编辑实现；对 Execution 来说，它会占用当前 workspace 的写资源。统一 Capability 让这些层围绕同一个动作身份协作。
 
-### 2.2 用一个具体例子理解
+---
 
-以 `native.edit` 为例。
+## 3. 应用启动时，Capability 系统怎样组装
 
-对模型来说，它是一项“精确修改文件内容”的能力，模型需要知道文件路径、旧文本、新文本这些参数。
+理解调用之前，先看运行时能力从哪里来。启动过程可以分成“读取静态策略”和“让 Provider 生成当前快照”两段。
 
-对权限系统来说，它属于 WRITE。
+### 3.1 静态配置先定义固定能力和 Agent 权限
 
-对 NativeProvider 来说，它需要绑定到真正执行文本替换的 handler。
+`capabilities.yaml` 主要保存三类内容：固定 Capability 定义、每个 Agent 的 discover / invoke 策略，以及 MCP server 配置。
 
-对执行调度来说，它会修改工作区，因此应该按写资源处理。
+加载时会先做结构校验。例如：默认 discover 和 invoke 必须采用 deny；固定 Native 能力必须有本地 handler；MCP 能力必须能找到 server 和 remote tool；Skill 必须指向允许的 Skill 文件；未知 Provider 或 transport 会在启动阶段直接报错。
 
-同一个 Capability 在不同层承担不同意义，这也是 Capability 对象需要携带结构化元数据的原因。
+这里得到的是“系统配置上认识哪些能力、希望怎样授权”，还不是当前进程真正可用的运行时快照。
 
-## 3. 启动阶段：Capability 系统怎样被组装起来
+### 3.2 再创建 Permission Policy、Registry 和 Provider
 
-理解运行时调用之前，先看应用启动时这一整套系统怎样建立。
+应用根据权限配置创建 Permission Policy，再创建 Capability Layer。Capability Layer 持有运行时 Registry、权限策略、Failure Guard、Trace，以及已经装配的 Provider。
 
-### 3.1 第一步：读取 `capabilities.yaml`
+当前主要有四类 Provider：
 
-应用通过 `CapabilityCatalog.from_file()` 读取 `capabilities.yaml`。
-
-这里的 Catalog 主要保存两类静态信息：
-
-1. 固定 Capability 的定义；
-2. 每个 Agent 的 discover / invoke 权限规则，以及 MCP server 配置。
-
-Catalog 在读取时就会做结构检查，例如：
-
-- 默认策略必须是 discover deny、invoke deny；
-- capability id 必须落在对应 source 下；
-- Native Capability 必须配置 handler；
-- MCP Capability 必须配置 server 和 remote name；
-- Skill Capability 必须配置 Skill 文件路径；
-- 不支持的 provider 或 transport 会直接被拒绝。
-
-这一步处理的是“配置本身是否合法”。此时还没有真正得到运行时可调用能力。
-
-### 3.2 第二步：创建 PermissionPolicy 和 CapabilityLayer
-
-应用把 Catalog 中的 Agent 权限配置交给 `PermissionPolicy`，随后创建 `CapabilityLayer`。
-
-CapabilityLayer 内部拥有：
-
-- 一个 Registry；
-- 一个 PermissionPolicy；
-- 一个 FailureGuard；
-- Trace；
-- 当前已经添加的 Providers。
-
-可以把它看成 Capability 系统的总控制器。
-
-### 3.3 第三步：根据配置创建不同 Provider
-
-当前应用启动时会加入四类 Provider：
-
-| Provider | 负责的来源 |
+| Provider | 适配的真实来源 |
 |---|---|
-| `NativeProvider` | 本地工作区文件、搜索、编辑、Bash、时间等 |
-| `MCPProvider` | GitHub 本地 adapter 和 Context7 远端 MCP 工具 |
-| `SkillProvider` | 固定可信目录中的 `SKILL.md` |
-| `RAGProvider` | 已注册的本地知识库 |
+| Native Provider | 本地工作区文件、查找、编辑、Bash、时间等 |
+| MCP Provider | GitHub 本地 adapter，以及 Context7 等远端 MCP 工具 |
+| Skill Provider | 可信目录中的 `SKILL.md` |
+| RAG Provider | 当前 Knowledge Base Manager 中已注册的知识库 |
 
-这里有一个很容易混淆的点：MCPProvider 同时可以持有不同类型的 client。
+其中 GitHub 和 Context7 都经过 MCP Provider，但连接方式不同：GitHub 使用本地 adapter，实际请求由本地 GitHub Client 完成；Context7 使用 Streamable HTTP 连接真正的远端 MCP server。也就是说，MCP Provider 在这里承担的是统一工具绑定和协议适配，不代表所有 MCP 类型能力都一定经过远端 HTTP。
 
-GitHub 在当前实现里通过 `local_adapter` 连接本地 GitHub Client；Context7 使用 `streamable_http` 连接远端 MCP 服务。它们在 Capability 层共享 MCPProvider 的绑定和调度方式，底层连接方式仍然不同。
+### 3.3 Provider 生成 registration 快照
 
-### 3.4 第四步：调用 `layer.load()` 收集 Provider 快照
-
-每个 Provider 都实现 `load()`，返回自己当前的 `CapabilityRegistration` 列表。
-
-CapabilityLayer 收到这些 registration 后会先验证 Provider 所有权。例如，一个由 `native` Provider 返回的 binding，其 `provider_id` 也必须是 `native`。
-
-随后 Layer 按 `source_id` 把结果写入 Registry。
+每个 Provider 在 `load` 时返回自己当前拥有的 registration。Layer 会检查 registration 是否确实归属于这个 Provider，然后按 source 把整个快照写入 Registry。
 
 ```mermaid
 sequenceDiagram
-    participant App as Application
-    participant Cat as CapabilityCatalog
-    participant L as CapabilityLayer
+    participant A as Application
+    participant L as Capability Layer
     participant P as Providers
     participant R as Registry
-    participant Pol as PermissionPolicy
 
-    App->>Cat: 读取 capabilities.yaml
-    App->>L: 创建 Layer + Policy
-    App->>P: 创建 Native / MCP / Skill / RAG Provider
-    App->>L: add_provider(...)
-    L->>P: load()
-    P-->>L: CapabilityRegistration 快照
-    L->>L: 校验 Provider 与 Binding
-    L->>R: replace_source(...)
-    L->>Pol: validate_capabilities(...)
+    A->>L: 装配权限和 Providers
+    L->>P: load
+    P-->>L: 当前 registrations
+    L->>L: 校验 binding / provider 归属
+    L->>R: 按 source 替换快照
 ```
 
-### 3.5 第五步：对运行时能力和权限做交叉检查
+所有 Provider 加载完成以后，权限层还会做交叉校验，确认“运行时真实存在的能力”和“Agent 权限规则”没有明显冲突。例如普通远端写操作不能被误配置成无条件 allow；Coding Agent 的本地写能力则走专门的 workspace 规则。
 
-Provider 都加载完成以后，PermissionPolicy 会检查当前 Registry 中的能力是否与 Agent 权限配置一致。
+这样启动失败会尽量发生在真正执行任务之前，而不是等模型选中某个工具时才发现配置根本不成立。
 
-例如：
+---
 
-- READ 能力如果被 discover，通常需要位于 invoke.allow；
-- 普通 WRITE / DESTRUCTIVE 能力不能随意放进 allow；
-- `native.bash` 使用单独的命令级策略；
-- Coding Agent 的工作区文件写操作有专门规则。
+## 4. Catalog 和 Registry 为什么同时存在
 
-所以启动阶段不仅确认“工具能不能加载”，还会确认“权限配置能不能和这些工具正确配合”。
+这两个概念看起来都像“工具表”，但作用不同。
 
-## 4. Catalog 与 Registry：一个保存配置意图，一个保存当前运行状态
+### 4.1 Catalog 表达配置意图
 
-这两个名字很接近，也是复习时最容易混淆的一组概念。
+Catalog 来自 `capabilities.yaml`，更接近稳定配置。对于固定 MCP 能力，它会保存本地 Capability id、所属 source、目标 MCP server、远端工具名、访问等级和启用状态。
 
-### 4.1 Catalog 怎样工作
+因此 Catalog 主要回答：**GitAgent 这份应用配置认识并允许映射哪些固定能力。**
 
-Catalog 来自 `capabilities.yaml`，主要描述人工维护的稳定配置。
+RAG 是一个例外：知识库可能运行时动态注册，所以 `rag.<knowledge_base_id>` 不要求提前在 Catalog 为每个知识库写一条固定定义。
 
-例如一项 MCP 能力会在配置里固定：
+### 4.2 Registry 表达当前运行时事实
 
-- 本地 capability id；
-- 属于哪个 source；
-- 交给哪个 MCP server；
-- 对应哪个 remote tool name；
-- 访问等级；
-- 是否启用。
+Registry 保存当前进程真实注册成功的 registration。它需要支持按 id 解析能力、列出当前能力，以及按 source 整体替换快照。
 
-这里表达的是“系统允许并认识哪些固定能力”。
-
-RAG 稍微特殊。知识库是动态注册的，因此 `rag.<knowledge_base_id>` 由 RAGProvider 根据 KnowledgeBaseManager 当前状态生成，不依赖固定 CapabilityDefinition。
-
-### 4.2 Registry 怎样工作
-
-Registry 保存当前进程里真实注册成功的 `CapabilityRegistration`。
-
-它提供三类核心操作：
-
-- `resolve(id)`：根据 id 找到 Capability 和 Binding；
-- `list()`：得到当前所有 Capability；
-- `replace_source(source_id, registrations)`：整体替换某个来源的能力快照。
-
-`replace_source` 很关键。
-
-假设 Context7 上一次有两项已经配置映射的远端工具，刷新以后其中一项消失。系统会用新的 source 快照覆盖旧快照，对应能力也就从 Registry 中消失。这样 Registry 能反映“此刻实际有什么”。
-
-```mermaid
-flowchart TD
-    OLD[Registry 中旧 source 快照] --> REF[Provider refresh / load]
-    REF --> NEW[新的 registrations]
-    NEW --> REP[replace_source]
-    REP --> CUR[Registry 当前快照]
-```
-
-替换过程还具有回滚保护。新 registration 注册过程中一旦出现异常，Registry 会恢复之前的内容，避免留下半更新状态。
-
-### 4.3 为什么两层都需要存在
-
-理解方法很简单：
-
-- Catalog 更接近“管理员希望系统提供什么”；
-- Registry 更接近“运行过程中此刻真正能解析到什么”。
-
-远端服务临时离线、Skill 文件缺失、知识库状态变化，都可能让运行时状态和静态配置不同。
-
-## 5. Provider：不同底层工具怎样接入统一 Capability 协议
-
-### 5.1 Provider 的公共职责
-
-从 CapabilityLayer 的视角看，Provider 需要完成的核心事情非常少。
-
-最主要的是：
-
-1. `load()`：告诉系统“我当前有哪些 registration”；
-2. `invoke()`：根据 binding 执行一次真实调用；
-3. 可选的 `refresh()`：重新发现或更新来源状态；
-4. 可选的 `reconnect()`：在连接故障后恢复连接；
-5. `describe_execution()`：告诉 Execution 这次调用适合并发还是需要独占资源。
-
-这套接口把底层差异收在 Provider 内部。
+按 source 替换很重要。假设 Context7 上一次有两个已配置映射，刷新后其中一个远端工具消失，新快照会覆盖旧快照，消失的能力也会从 Registry 退出。替换过程中如果某个新 registration 本身非法，会恢复原快照，避免运行时停在“只更新了一半”的状态。
 
 ```mermaid
 flowchart LR
-    L[CapabilityLayer] -->|统一 invoke| N[NativeProvider]
-    L -->|统一 invoke| M[MCPProvider]
-    L -->|统一 invoke| S[SkillProvider]
-    L -->|统一 invoke| R[RAGProvider]
+    O[旧 source 快照] --> F[Provider refresh]
+    F --> N[新 registrations]
+    N --> V{整体校验成功?}
+    V -->|是| C[替换 Registry 快照]
+    V -->|否| O
+```
 
-    N --> FS[工作区 / Bash]
+因此可以把二者简单区分为：Catalog 是“配置上希望有什么”，Registry 是“当前真正解析得到什么”。远端服务下线、Skill 文件缺失、RAG 状态变化都可能让两者暂时不同。
+
+---
+
+## 5. Provider 是怎样把四种完全不同的来源统一起来的
+
+Capability Layer 只要求 Provider 提供一组稳定能力：加载当前 registration、执行一次调用，必要时刷新或重连，并描述这次调用的执行语义。底层 target 怎么解释，由 Provider 自己负责。
+
+```mermaid
+flowchart LR
+    L[Capability Layer] --> N[Native Provider]
+    L --> M[MCP Provider]
+    L --> S[Skill Provider]
+    L --> R[RAG Provider]
+    N --> FS[文件 / Bash]
     M --> GH[GitHub Client]
     M --> HTTP[远端 MCP]
     S --> SK[SKILL.md]
-    R --> KB[KnowledgeBaseManager]
+    R --> KB[Knowledge Base]
 ```
 
-### 5.2 Provider 内部需要完成“绑定翻译”
+Provider binding 因来源而不同：Native binding 指向本地 handler；MCP binding 需要知道 server 和 remote tool；Skill binding 指向可信 Skill 定义；RAG binding 指向知识库身份和当前状态。Capability Layer 不理解这些细节，只把 binding 交回所属 Provider。
 
-每类 Provider 都会把 CapabilityBinding 中的 target 解释成自己认识的对象。
+这就是适配层的关键：统一的是上层生命周期，不是强行让底层实现长得一样。
 
-- NativeProvider 的 target 包含 handler 和 schema；
-- MCPProvider 的 target 包含静态定义、远端工具描述和 schema；
-- SkillProvider 的 target 指向受信任 Skill 定义；
-- RAGProvider 的 target 保存知识库身份和当前状态。
+---
 
-CapabilityLayer 不需要理解这些 target 的内部结构，只需要把 registration 对应的 binding 交还给正确 Provider。
+## 6. Discover：模型最终能看到哪些工具
 
-## 6. Discover：当前 Agent 怎样得到自己的工具集合
+Registry 中有一项能力，不等于所有 Agent 都能看到它。每次给 Agent 构造工具列表时，Layer 会先过滤当前 AVAILABLE 的 Capability，再结合当前 Agent 的 discover 规则。
 
-Provider 已经把能力放进 Registry，下一步才轮到 Agent 看工具。
+典型可见范围如下：
 
-### 6.1 Discover 实际做了什么
-
-`CapabilityLayer.discover(context)` 会遍历 Registry 当前能力，并保留两类条件同时满足的项：
-
-1. Capability 状态是 `AVAILABLE`；
-2. `PermissionPolicy.can_discover()` 判断当前 Agent 的 discover pattern 匹配这项能力。
-
-这里的 `InvocationContext` 至少携带当前 run、session、agent、repository，以及可能存在的 coding workspace 等信息。
-
-当前 discover 的核心过滤依据是“运行状态 + Agent discover 策略”。
-
-### 6.2 每个 Agent 得到的集合不同
-
-`capabilities.yaml` 为不同 Agent 配置不同 discover 列表。
-
-例如：
-
-| Agent | 典型可见能力 |
+| Agent | 常见可见能力 |
 |---|---|
-| Main | 少量读取能力、Context7、RAG |
-| Repository | 仓库树、代码搜索、文件读取、符号查找、历史、Skill 等 |
-| Issues | Issue 读取与写入、相关仓库读取、参考资料 |
-| Pull Requests | PR 信息、diff、review、merge 相关能力、代码审查 Skill |
+| Main | 少量只读信息、Context7、RAG 等 |
+| Repository | 仓库树、搜索、文件读取、符号、历史、Skill |
+| Issues | Issue 读取/写入、相关仓库读取、参考资料 |
+| Pull Requests | PR metadata、diff、Review、Merge 相关能力、代码审查 Skill |
 | Coding | 仓库读取、本地文件工具、精确编辑、Bash、Skill、RAG、Context7 |
 
-因此模型并不会拿到 Registry 的完整工具表。
-
-### 6.3 Discover 后怎样变成模型 function tools
-
-Harness 的 `llm_tools()` 会把 discover 的 Capability 转换成模型工具格式。
-
-模型最终看到的主要是：
-
-- function name；
-- capability description；
-- input schema。
-
-内部 capability id 还会转换成模型函数名。例如点号和连字符会被转换成安全的 function name 形式。模型返回调用后，Harness 再根据当前 discover 集合把这个函数名解析回 capability id。
+然后 Harness 把这些 Capability 转成模型 function tools，只暴露模型真正需要的三类信息：工具名、用途描述和 input schema。内部 Capability id 会转换成适合模型 function calling 的安全名字；模型返回以后，再在当前可见集合中还原成内部 id。
 
 ```mermaid
 flowchart LR
-    REG[Registry] --> D[discover]
-    D --> V[当前 Agent 可见 Capability]
-    V --> L[Harness.llm_tools]
-    L --> F[模型 function tools]
-    F --> M[LLM]
-    M --> FN[返回 function name + arguments]
-    FN --> RES[resolve_llm_name]
-    RES --> CID[内部 capability id]
+    R[Registry] --> D[discover]
+    D --> V[当前 Agent 可见能力]
+    V --> T[模型 function tools]
+    T --> M[模型返回 name + args]
+    M --> C[还原 Capability id]
 ```
 
-这里还有一层额外限制：Main Agent 构造 provider tools 时会使用 `read_only=True`，因此即使 discover 集合中出现其他访问等级的能力，模型工具生成阶段仍可以进一步只保留 READ。
+Main 在生成 tools 时还可以进一步只保留 READ，即使权限配置里存在别的能力，也不会全部暴露给 Main 模型。
 
-### 6.4 为什么 discover 和 invoke 要分开
+### 为什么 discover 和 invoke 不能合成一个检查
 
-Discover 控制“模型能看到什么”。Invoke 授权控制“系统最终允许执行什么”。
+Discover 解决“模型看见什么”。工具列表越聚焦，模型越不容易误选，也能减少 tool schema 占用。
 
-模型工具列表会影响模型行为，所以越聚焦越容易降低误选工具的概率。执行阶段仍然必须重新授权，因为模型返回的调用属于外部输入，不能只依赖先前发给模型的工具列表。
+Invoke 解决“系统现在是否真的允许执行”。模型返回的调用仍然是不可信输入，所以执行时必须重新做授权。不能因为系统之前把某个工具 schema 发给模型，就把它当成永久执行许可证。
 
-## 7. Invoke：一次 Capability 调用怎样真正执行
+---
 
-这一节是整章最重要的部分。前面的所有组件最后都会汇合到这里。
+## 7. 一次 Capability 调用怎样真正执行
 
-先看完整流程，再逐步拆开。
+这一段是整个 Capability 系统的核心。为了避免一张过长 Mermaid，把流程拆成“进入 Provider 之前”和“Provider 返回以后”两段。
 
-```mermaid
-flowchart TD
-    A[模型 StructuredCall] --> B[Harness 解析 capability id]
-    B --> C[Dispatcher preflight]
-    C --> D[准备 Invocation]
-    D --> E[CapabilityLayer.invoke]
-    E --> F{参数是 object?}
-    F -->|否| Z[返回 INVALID_INPUT]
-    F -->|是| G[FailureGuard 检查]
-    G --> H[Registry resolve]
-    H --> I[Capability 状态检查]
-    I --> J[input schema 校验]
-    J --> K[PermissionPolicy.authorize]
-    K -->|DENY| KD[返回 PERMISSION_DENIED]
-    K -->|ASK| KA[返回 approval_required]
-    K -->|ALLOW| L[找到绑定 Provider]
-    L --> M[Provider.invoke]
-    M --> N{执行异常?}
-    N -->|可恢复的只读错误| O[最多一次恢复后重试]
-    O --> M
-    N -->|其他错误| P[归一为 CapabilityError]
-    N -->|成功| Q[output schema 校验]
-    Q --> R[CapabilityResult]
-    R --> S[按执行顺序 commit]
-    S --> T[更新 FailureGuard / Context / Audit]
-```
-
-### 7.1 Dispatcher 先做执行前检查
-
-CapabilityLayer 之前还有 Harness 的 Structured Call Dispatcher。
-
-Dispatcher 会先检查这次调用是否满足工作流层面的前置条件，例如 protected capability 的业务约束，以及是否刚刚重复提交了完全相同的调用。
-
-这一层掌握的是 Agent 工作流状态，因此适合处理“当前流程走到这里能不能做”的问题。
-
-### 7.2 CapabilityLayer 先检查参数容器类型
-
-进入 `CapabilityLayer.invoke()` 后，系统首先要求 arguments 必须是对象结构。
-
-如果模型传入列表、字符串等形态，会直接得到 `INVALID_INPUT`，Provider 完全不会执行。
-
-### 7.3 检查 FailureGuard
-
-Layer 会根据下面三部分生成调用身份：
-
-- 当前 agent id；
-- capability id；
-- 经过稳定序列化的 arguments。
-
-如果同一个 run 中，这个完全相同的调用已经被 FailureGuard 记录为失败，并且当前调用没有经过对应的 preflight 放行，系统可以直接返回 `REPEATED_FAILURE`。
-
-### 7.4 从 Registry 解析 registration
-
-接着系统使用 capability id 调用 Registry `resolve()`。
-
-找不到时返回 `CAPABILITY_NOT_FOUND`。
-
-找到以后还要检查状态。状态未达到 `AVAILABLE` 时会返回 `UNAVAILABLE`，并尽量附带 Provider 给出的不可用原因。
-
-### 7.5 校验 input schema
-
-如果 Capability 定义了 `input_schema`，Layer 会在 Provider 执行前校验 arguments。
-
-这一层保证模型虽然能生成 JSON 参数，也必须满足能力契约要求，例如：
-
-- 必填字段存在；
-- 字段类型正确；
-- 数值范围满足限制；
-- 不允许的额外字段不会混入调用。
-
-输入不合法时依然不会触发底层副作用。
-
-### 7.6 执行 PermissionPolicy.authorize
-
-参数通过以后，Layer 才进行 invoke 授权。
-
-授权结果有三种：
-
-| 决策 | 含义 | 后续行为 |
-|---|---|---|
-| `ALLOW` | 当前上下文允许执行 | 继续调用 Provider |
-| `ASK` | 需要明确审批 | 返回 `approval_required` |
-| `DENY` | 当前上下文禁止调用 | 返回权限错误 |
-
-这里会再次检查 Agent invoke 配置，因此 discover 通过并不能替代 invoke 授权。
-
-### 7.7 找到正确 Provider 并执行
-
-Registration 的 Binding 保存 `provider_id`。
-
-Layer 会从已加载 Provider 表中找到对应 Provider，并再次确认 Provider id 与 Binding 一致。确认完成后调用 `provider.invoke(binding, arguments, context)`。
-
-到这一刻，真实文件操作、GitHub API、HTTP 请求、Skill 读取或者 RAG 检索才真正发生。
-
-### 7.8 只读调用允许非常有限的自动恢复
-
-Provider 抛出异常后，Layer 会先把异常归一成统一 CapabilityError。
-
-当前自动恢复范围非常保守，只针对 READ Capability：
-
-- TIMEOUT 可以重试一次；
-- UNAVAILABLE 可以尝试 reconnect / refresh 后重试一次；
-- RATE_LIMITED 只有在 `retry_after` 很短时才允许等待后重试。
-
-WRITE 和 DESTRUCTIVE 不进入这套自动重试逻辑。
-
-原因会在错误处理章节集中解释。
-
-### 7.9 Provider 成功后还要检查 output schema
-
-底层调用成功返回数据，并不代表整个 Capability 调用已经成功。
-
-如果定义了 `output_schema`，Layer 还要验证 Provider 返回的数据是否符合约定。
-
-这里尤其需要关注写操作：Provider 已经执行以后才发现输出结构错误，外部副作用可能已经发生。因此系统会在错误 details 中记录 `provider_executed` 和 `side_effect_possible`，供后续恢复逻辑判断。
-
-### 7.10 最后返回统一 CapabilityResult
-
-成功时结果会根据 Capability kind 分类：
-
-- Native / MCP → `data`；
-- Skill → `context`；
-- RAG → `retrieval`。
-
-失败时统一返回失败状态和 CapabilityError。
-
-Agent Loop 因而可以用同一种结果协议处理不同 Provider。
-
-### 7.11 FailureGuard 在 commit 阶段更新
-
-FailureGuard 的失败事实并不会在任意工作线程结束时立即写入。
-
-`commit_failure_guard()` 明确放在有序 commit 路径中：
-
-- 成功调用会清掉对应失败记录；
-- 普通失败会记录调用身份和错误类型；
-- `REPEATED_FAILURE`、`DUPLICATE_CALL` 这类已经属于重复控制的错误不会再次登记。
-
-这样做可以让并发执行时的“实际完成顺序”和“Agent 观察到的提交顺序”保持清晰边界。
-
-## 8. PermissionPolicy：系统怎样控制“看得见”和“真的能执行”
-
-### 8.1 权限配置采用默认拒绝
-
-`capabilities.yaml` 顶层要求：
-
-- discover 默认 deny；
-- invoke 默认 deny。
-
-因此某项能力只有明确出现在 Agent 的规则里才有机会被看见或调用。
-
-Agent 规则分成两层。
-
-第一层是 `discover`，控制模型工具集合。
-
-第二层是 `invoke`，进一步分成：
-
-- allow；
-- ask；
-- deny。
-
-规则支持 pattern，例如 `context7.*` 或 `rag.*`。
-
-### 8.2 启动时先检查权限配置有没有自相矛盾
-
-PermissionPolicy 不会等到运行中才发现配置冲突。
-
-启动阶段会检查同一 Capability 是否同时落在 allow / ask / deny 多个桶里，也会检查访问等级和权限桶是否匹配。
-
-例如 READ Capability 应进入 allow；普通远端 WRITE / DESTRUCTIVE 动作通常需要 ask。
-
-### 8.3 Coding Workspace 的本地修改是一个专门分支
-
-Coding Agent 在隔离工作树中执行本地修改时，`native.write`、`native.edit`、`native.delete` 这类带 path 的 Native 写能力可以配置为 allow。
-
-PermissionPolicy 仍会要求 `InvocationContext` 中存在 active workspace root。缺少工作区时直接拒绝。
-
-这说明权限判断不仅看 capability id，也会结合当前执行上下文。
-
-### 8.4 Bash 还有第二层命令策略
-
-`native.bash` 在 capability 级别进入 allow 后，还要经过 `BashCommandPolicy`。
-
-策略会解析命令 token，并识别：
-
-- 只读 Git 观察命令；
-- 测试、lint、typecheck、build 等真实验证命令；
-- package manager 中可能修改依赖或发布内容的命令；
-- 管道、重定向、命令连接、子 shell 等复杂 shell 结构。
-
-因此 `native.bash` 的 capability 权限只解决“这个 Agent 有没有 Bash 入口”，命令策略继续解决“这一条具体命令能不能执行”。
-
-需要特别注意：当前 Native Bash 是宿主机进程执行机制。工作树范围和命令策略可以降低误操作风险，但它们不等同于操作系统级文件系统或网络 sandbox。
-
-## 9. NativeProvider：本地文件与命令能力怎样设计
-
-NativeProvider 是最适合理解“结构化工具”价值的一组能力。
-
-### 9.1 它先把本地动作拆成明确职责
-
-当前 NativeProvider 包含：
-
-| Capability | 主要用途 |
-|---|---|
-| `native.read` | 读取已知文件的有限行范围 |
-| `native.glob` | 按路径模式找文件 |
-| `native.grep` | 按正则搜索文本位置 |
-| `native.now` | 获取本地时间 |
-| `native.write` | 创建或完整覆盖文本文件 |
-| `native.edit` | 对唯一旧文本做精确替换 |
-| `native.delete` | 删除普通文件 |
-| `native.bash` | 执行通过策略检查的单条命令 |
-
-这些工具各自拥有自己的 input schema 和 output schema。
-
-模型需要显式表达“我要找路径”“我要读这个范围”“我要把这一段替换成另一段”，系统就能获得更清楚的操作意图和结构化结果。
-
-### 9.2 文件路径怎样限制在授权范围内
-
-NativeProvider 会把工作区路径解析到授权 root 下，并拒绝：
-
-- 绝对路径；
-- 包含 `..` 的逃逸路径；
-- resolve 后离开授权 root 的路径；
-- 运行时保留的 blocked path；
-- 通过 workspace 入口绕到 Memory root 的访问。
-
-Memory root 只能通过被授权的命名 root 读取，并且保持只读。
-
-当 Coding Agent 拥有独立 worktree 时，`InvocationContext.workspace_root` 会让 NativeProvider 把当前调用范围切换到这棵工作树。
-
-### 9.3 为什么查找、读取、修改要拆开
-
-先看推荐的文件操作路径：
+### 7.1 执行前：先证明这次调用有资格进入 Provider
 
 ```mermaid
 flowchart LR
-    Q[还不知道文件在哪] --> S[glob / grep]
-    S --> R[read 已知文件和范围]
-    R --> D{需要修改吗}
-    D -->|局部变更| E[edit 精确替换]
-    D -->|完整创建或覆盖| W[write]
-    E --> V[bash 验证]
-    W --> V
+    S[StructuredCall] --> P[工作流 preflight]
+    P --> F[Failure Guard]
+    F --> R[Registry resolve]
+    R --> I[输入 schema]
+    I --> A[Permission authorize]
+    A --> E[Execution 调度]
+    E --> V[绑定 Provider]
 ```
 
-每一步都给下一步提供更明确证据。
+第一步是工作流层的 preflight。Dispatcher 掌握当前 Agent 流程，所以适合检查一些单靠 Capability id 无法判断的业务前提，例如 protected mutation 是否与当前 PR、候选补丁或 workflow stage 对应，以及模型是否刚刚重复提交同一动作。
 
-`glob/grep` 负责定位；`read` 负责建立当前文件事实；`edit/write` 负责修改；`bash` 负责运行项目自己的验证命令。
+进入 Capability Layer 后，参数首先必须是对象结构。随后 Failure Guard 会根据当前 Agent、Capability id 和规范化参数判断，这个完全相同的调用是否已经在当前 run 中稳定失败过。
 
-这样 Harness 和 Agent 都更容易知道“读了什么、改了什么、验证了什么”。
+接着 Registry 解析 registration。能力不存在会得到“找不到能力”，当前状态不是 AVAILABLE 会得到“能力不可用”，这些情况都不会进入底层 Provider。
 
-### 9.4 `native.edit` 怎样处理并发变化和定位歧义
+找到能力以后才校验 input schema，确保必填字段、类型、范围和额外字段都符合契约。schema 通过后，再执行 Permission Policy，结果只有 ALLOW、ASK、DENY 三种。ASK 会形成 approval required，DENY 直接停止；只有 ALLOW 才会继续。
 
-`native.edit` 要求模型提供：
+最后 Execution 根据这次调用的执行描述安排并发、资源和 lane，然后才真正进入 Provider。
 
-- 文件路径；
-- `old_text`；
-- `new_text`。
-
-Provider 会统计 `old_text` 在当前文件里的出现次数。
-
-| 匹配次数 | 含义 | 行为 |
-|---|---|---|
-| 0 | 模型依据的旧内容已经不符合当前文件 | 返回冲突，让 Agent 重新读取 |
-| 1 | 修改位置唯一 | 执行替换 |
-| 多次 | 修改目标存在歧义 | 返回冲突，让 Agent 提供更长上下文 |
-
-```mermaid
-flowchart TD
-    A[old_text + new_text] --> C{old_text 出现次数}
-    C -->|0| R[重新读取当前文件]
-    C -->|1| E[执行唯一替换]
-    C -->|多次| M[扩大 old_text 上下文重新定位]
-```
-
-这里没有让工具自动猜测模型想修改哪一处。修改前提需要由模型通过上下文明确表达。
-
-### 9.5 执行调度信息也由 Provider 提供
-
-NativeProvider 的 `describe_execution()` 会告诉 Harness：
-
-- READ Capability 可以并发；
-- WRITE / DESTRUCTIVE Capability 对当前 workspace 申请独占写资源。
-
-因此 Capability 除了负责“能不能执行”，还向下一章的 Execution 层提供“应该怎样调度”的语义。
-
-## 10. MCPProvider：GitHub 本地适配和远端 MCP 怎样共用一套接入方式
-
-### 10.1 先理解 MCPProvider 自己负责什么
-
-MCPProvider 保存两类东西：
-
-- MCP server 定义；
-- 每项固定 Capability 对应的 `MCPToolBinding`。
-
-Binding 中保留：
-
-- 静态 CapabilityDefinition；
-- 对模型展示的描述；
-- input schema；
-- output schema。
-
-执行时，MCPProvider 根据 definition 中的 `server_id` 找到 client，再根据 `remote_name` 调用对应工具。
-
-### 10.2 GitHub 使用 local adapter
-
-当前 `github` server 在配置里使用 `local_adapter`。
-
-应用会把已经创建好的 GitHub Client 注入 MCPProvider。
-
-对于这种 client，MCPProvider 会直接根据 `remote_name` 找到 GitHub Client 方法，并从 Python 方法签名推导 input schema 和 output schema。
-
-调用时如果 server 配置要求 `inject_repository`，Provider 会从 `InvocationContext.repository` 补入 repository 参数。
+### 7.2 Provider 返回后：仍然没有立刻算成功
 
 ```mermaid
 flowchart LR
-    C[github.get_pr] --> B[MCPToolBinding]
-    B --> P[MCPProvider]
-    P --> G[本地 GitHub Client.get_pr]
+    P[Provider invoke] --> E{异常?}
+    E -->|可恢复 READ| R[最多一次恢复重试]
+    R --> P
+    E -->|其他错误| N[统一 Capability Error]
+    E -->|成功| O[输出 schema 校验]
+    O --> C[CapabilityResult]
+    C --> K[ordered commit]
+```
+
+READ Capability 遇到少量瞬时故障时允许非常有限的自动恢复：timeout 可以再尝试一次；unavailable 可以在 Provider 支持时先 reconnect / refresh；短时间 rate limit 可以按很小的 retry-after 等待后再尝试。WRITE 和 DESTRUCTIVE 不进入这条通用自动重试路径，因为第一次请求是否已经产生副作用可能无法判断。
+
+Provider 正常返回以后，还要做 output schema 校验。这个检查的位置很重要：如果底层是写操作，Provider 可能已经执行了副作用，随后才发现返回格式不符合契约。此时错误会记录“Provider 已执行”和“可能存在副作用”，让恢复逻辑知道这不是一个可以无脑重放的普通格式错误。
+
+成功结果最终被整理成统一 CapabilityResult。Native 和 MCP 主要返回结构化 data；Skill 返回上下文文本；RAG 返回检索结果，但 Agent Loop 看到的仍是同一套成功/失败外壳。
+
+Failure Guard、read cache、workspace revision、Audit 等逻辑状态不会由哪个 worker 先结束就先更新，而是在 ordered commit 时统一推进。这样并发完成顺序不会悄悄改变 Agent 观察到的历史。
+
+---
+
+## 8. Permission Policy：控制“能看见”和“真能执行”
+
+权限采用默认拒绝：没有明确规则的能力既不会自然出现在工具箱里，也不会自然获得执行资格。
+
+每个 Agent 有 discover 规则和 invoke 规则；invoke 再分 allow、ask、deny。规则支持 pattern，所以一组相关能力可以集中表达，但启动时仍会检查一项 Capability 是否错误地同时落入多个冲突桶。
+
+### 8.1 Coding Workspace 的本地写是专门例外
+
+Coding Agent 需要真正修改隔离工作区，所以本地 write / edit / delete 可以被配置成直接 allow。但这个 allow 不是“随便写宿主机”：调用上下文必须存在 active coding workspace，Native Provider 还会继续做路径限制。
+
+也就是说，权限判断不仅看动作名字，还要结合“当前是不是处在合法工作区”这一运行状态。
+
+### 8.2 Bash 还有第二层命令策略
+
+Coding Agent 拥有 Bash 入口，也不意味着任意 shell 字符串都能执行。命令还要经过 Bash Command Policy，区分只读 Git 观察、测试/lint/typecheck/build 等验证、可能修改依赖或发布内容的命令，以及 pipe、重定向、命令连接、subshell 等复杂 shell 结构。
+
+Capability 权限回答“这个 Agent 有没有 Bash 入口”，命令策略回答“这一条具体命令能不能执行”。
+
+这里必须保持一个实现边界：Native Bash 最终仍然是宿主机进程。workspace root 和命令策略能约束常见路径和命令，但不等于容器、namespace、seccomp 这类操作系统级 sandbox。
+
+---
+
+## 9. Native Provider：本地文件和 Bash 怎样适配成 Capability
+
+Native Provider 直接面向当前工作区，是最典型的“结构化工具”实现。
+
+### 9.1 工具按职责拆开
+
+当前本地能力包括有限范围读文件、glob、grep、当前时间、完整写文件、精确 edit、删除普通文件，以及经过策略检查的 Bash。
+
+这样模型需要明确表达自己在做哪一步：先定位文件，再读取当前事实，再修改，最后验证。相比一个“万能 shell”，Harness 能更清楚地知道哪些动作属于读取、哪些动作真正改变文件。
+
+```mermaid
+flowchart LR
+    Q[不知道文件位置] --> G[glob / grep]
+    G --> R[bounded read]
+    R --> E[edit / write]
+    E --> V[bash validation]
+```
+
+### 9.2 文件路径怎样被限制
+
+文件类能力会把模型给出的相对路径解析到授权 root 下。绝对路径、包含 `..` 的逃逸路径、解析后离开 root 的路径、运行时 blocked path 都会被拒绝。Memory 等受保护目录也不会因为模型从 workspace 路径绕过去就失去边界。
+
+Coding Agent 有独立 worktree 时，调用上下文会把 Native Provider 的根切换到当前 Coding Workspace。于是同一套 read/edit 工具可以复用，但实际操作范围由 Harness 提供的 workspace 决定，而不是模型自己随意选择 cwd。
+
+### 9.3 精确 edit 怎样避免改错位置
+
+精确编辑要求模型提供当前文件中的旧文本和替换后的新文本。Provider 会在真实文件里统计旧文本出现次数：没有匹配通常说明模型依据的内容已经过时；只有一次匹配才执行；出现多次则说明定位有歧义，需要模型给出更多上下文。
+
+```mermaid
+flowchart LR
+    O[old text] --> C{当前文件中出现几次?}
+    C -->|0| R[冲突，重新读取]
+    C -->|1| E[唯一位置替换]
+    C -->|多次| M[冲突，扩大定位上下文]
+```
+
+工具不会替模型猜“你大概想改哪一处”。这样能把并发变化和定位歧义显式暴露出来。
+
+### 9.4 Native Provider 也提供执行语义
+
+只读能力通常可以进入 concurrent group；写和破坏性能力会声明当前 workspace 的写资源。因此 Provider 不只负责“怎么执行”，还负责告诉 Execution“这次调用会碰什么共享资源、能不能并发”。
+
+---
+
+## 10. MCP Provider：GitHub 本地 adapter 与远端 MCP 怎样共用一层
+
+MCP Provider 负责把已经配置的 MCP-style 工具映射成 Capability。它维护 server 定义和每项能力的 tool binding；执行时先根据 binding 找到目标 server，再根据 remote tool 名称调用对应 client。
+
+### 10.1 GitHub：本地 adapter，不经过远端 MCP HTTP
+
+GitHub server 当前配置为 local adapter。应用已经有一个 GitHub Client，MCP Provider 把它作为 client 注入。
+
+对于这种本地 client，Provider 根据固定能力定义里的 remote name 找到 GitHub Client 方法，并从本地方法签名推导参数和返回 schema。某些 GitHub 调用还要求 Provider 从 Invocation Context 自动补入当前 repository，这样模型不需要重复提供由 Session 已经确定的仓库身份。
+
+```mermaid
+flowchart LR
+    C[github.get_pr Capability] --> M[MCP binding]
+    M --> P[MCP Provider]
+    P --> G[本地 GitHub Client]
     G --> API[GitHub API]
 ```
 
-所以这里的 MCPProvider 更像统一适配层。真实 GitHub 请求仍由 GitHub Client 完成。
+所以 GitHub 在 Capability 层复用了 MCP Provider 的统一 binding 和错误处理，但真实网络请求仍由本地 GitHub Client 发出。
 
-### 10.3 Context7 使用 Streamable HTTP
+### 10.2 Context7：真正的 Streamable HTTP MCP
 
-Context7 server 使用 `streamable_http`。
-
-应用会创建 `StreamableHTTPTransport` 作为 client 交给 MCPProvider。
-
-第一次调用远端工具时，Transport 会先初始化 MCP 会话，然后调用 `tools/list` 或 `tools/call`。
+Context7 使用远端 Streamable HTTP transport。Transport 首次使用时会建立 MCP 会话，完成 initialize / initialized，再进行 tools/list 或 tools/call，并处理 JSON / SSE 响应。
 
 ```mermaid
 sequenceDiagram
-    participant P as MCPProvider
-    participant T as StreamableHTTPTransport
+    participant P as MCP Provider
+    participant T as HTTP Transport
     participant S as Remote MCP Server
 
-    P->>T: list_tools / call_tool
+    P->>T: list / call tool
     T->>S: initialize
-    S-->>T: initialize result + optional session id
-    T->>S: notifications/initialized
-    T->>S: tools/list 或 tools/call
-    S-->>T: JSON / SSE response
-    T-->>P: structuredContent / text / object
+    S-->>T: capabilities + session
+    T->>S: initialized
+    T->>S: tools/list or tools/call
+    S-->>T: structured response
+    T-->>P: 归一结果
 ```
 
-Transport 负责会话和 HTTP 协议细节，MCPProvider 继续负责 capability binding、状态、schema 和异常翻译。
+Transport 负责 HTTP 和 MCP 会话，MCP Provider 继续负责本地 Capability binding、schema、状态和错误翻译。这样网络协议变化不会直接泄漏到 Capability Layer。
 
-### 10.4 Refresh 怎样更新远端工具信息
+### 10.3 Refresh 只更新已授权映射，不自动扩大工具面
 
-当 client 支持 `list_tools()` 时，MCPProvider 可以 refresh。
+远端 MCP server 支持 tools/list 时，Provider 可以刷新当前工具描述。远端仍存在的已配置工具可以更新 description 和 schema；已配置工具消失时会从新快照退出。
 
-它会读取远端当前工具列表，然后只处理已经存在本地 CapabilityDefinition 的映射：
+但远端突然新增的陌生工具不会因为出现在 tools/list 里就自动获得本地 Capability 身份。没有本地固定映射，就不会自然进入 Agent 工具箱。
 
-- 远端仍存在的已配置工具，可以更新 description、input schema、output schema；
-- 已配置工具在远端消失时，会从新的 Provider 快照中消失；
-- 远端新出现但本地从未配置映射的工具，不会自动生成新的固定 Capability。
+这层选择很重要：远端服务可以动态变化，但 GitAgent 的本地授权边界不会跟着远端列表自动扩张。
 
-随后 CapabilityLayer 再按 source 使用 `replace_source()` 更新 Registry。
+### 10.4 MCP 错误先在 Provider 边界转成稳定语义
 
-这让“远端工具状态变化”和“本地授权边界变化”成为两件独立的事情。
+认证失败、not found、conflict、rate limit、timeout、连接不可用等 transport / client 异常会先在 Provider 边界归类，再由 Capability Layer 进一步转成统一 Capability Error。
 
-### 10.5 MCP 错误怎样先在 Provider 边界归类
+对于写操作还要记录请求是否可能已经发出。网络断开时，如果无法证明远端没有收到请求，就不能把它当成普通“未执行失败”自动重试。
 
-MCPProvider 会把常见 transport / client 异常转换成 Provider 级错误，例如：
+---
 
-- 401 → authentication；
-- 404 → resource not found；
-- 409 → conflict；
-- 429 → rate limit；
-- timeout → provider timeout；
-- 连接不可用 → provider unavailable。
+## 11. Skill Provider：把工作方法接入，但不扩大权限
 
-对于写操作，它还会关注请求是否可能已经发出。连接断开时如果远端副作用存在不确定性，会按更谨慎的超时语义处理。
+Skill 与普通可执行工具不同。它的作用是给模型补充“这类任务应该怎么做”的方法知识。
 
-## 11. SkillProvider：怎样把“做事方法”接入 Capability 系统
-
-### 11.1 Skill 的运行方式
-
-SkillProvider 从固定可信目录读取配置允许的 `SKILL.md`。
-
-每项 Skill Capability：
-
-- input schema 为空对象；
-- access 为 READ；
-- 文件存在且配置启用时状态为 AVAILABLE；
-- 调用后返回 Skill 文本内容。
-
-Skill 路径还必须位于 trusted root 内，并且目标文件名必须是 `SKILL.md`。
+Skill Provider 只从固定可信目录读取允许的 `SKILL.md`。Skill Capability 通常没有业务参数，属于 READ；目标文件必须位于 trusted root，而且必须是明确的 Skill 文件。
 
 ```mermaid
 flowchart LR
-    M[模型看到 Skill 简短描述] --> C{任务需要这套方法吗}
-    C -->|需要| S[调用 skill.xxx]
-    S --> P[SkillProvider]
+    M[模型判断需要某种方法] --> S[调用 Skill Capability]
+    S --> P[Skill Provider]
     P --> F[读取可信 SKILL.md]
-    F --> G[返回方法指导文本]
-    G --> M2[模型按指导继续调用普通 Capability]
+    F --> G[方法指导进入上下文]
+    G --> N[后续继续调用普通工具]
 ```
 
-### 11.2 Skill 在系统里产生什么效果
+例如 Debug Skill 可以告诉 Coding Agent 应该先稳定复现、确认因果、做聚焦修复、再独立验证。但真正读文件、编辑代码、运行测试，仍然要分别经过 Repository / Native / Bash Capability。
 
-Skill 调用只给模型增加一段方法上下文。
-
-例如 Debug Skill 可以指导 Coding Agent先建立故障覆盖、确认因果链、做聚焦修复、再独立验证。后续真正读取文件、编辑代码、运行测试时，Agent 仍然需要调用相应 Native 或 Repository Capability。
-
-Skill 本身不会因此获得新的文件、GitHub 或 Bash 权限。
-
-## 12. RAGProvider：动态知识库怎样表现成普通只读能力
-
-### 12.1 RAG Capability 怎样生成
-
-RAGProvider 和固定 Catalog 能力有一点区别。
-
-它会询问 `KnowledgeBaseManager` 当前已经注册的知识库，并为每个知识库动态生成 `rag.<knowledge_base_id>` Capability。
-
-每项 RAG Capability 都有统一查询 schema，模型需要传入一个聚焦的 `query`。
-
-状态根据知识库运行状态决定：
-
-- READY / STALE 可以作为 AVAILABLE 暴露；
-- ERROR 等状态会表现为 UNAVAILABLE。
-
-### 12.2 调用结果怎样统一
-
-Provider 调用 KnowledgeBaseManager 完成检索，并返回结构化结果，其中包含：
-
-- knowledge base id；
-- stale 标记；
-- hits；
-- hit count；
-- 可选 notice 和耗时信息。
-
-对 Agent Loop 来说，RAG 仍然按照 discover → schema → authorize → invoke → CapabilityResult 这条主流程执行。
-
-RAG 的索引和知识库生命周期适合单独深入，本章只关注它怎样接入 Capability 层。
+所以加载 Skill 不等于获得任何新执行权限。它增加的是方法上下文，不是运行能力。
 
 ---
 
-## 13. 错误系统：不同 Provider 的失败怎样变成统一语义
+## 12. RAG Provider：动态知识库怎样表现成普通 READ Capability
 
-### 13.1 Provider 先抛出接近底层事实的错误
+RAG 不要求每个知识库都提前写进固定 Catalog。Provider 会询问 Knowledge Base Manager 当前有哪些知识库，然后为每个可用库动态生成 `rag.<knowledge_base_id>`。
 
-不同来源会出现不同异常：
+每项 RAG Capability 使用统一的聚焦 query 参数。READY 和 STALE 知识库可以作为 AVAILABLE 暴露；ERROR 等无法可靠查询的状态会表现为 UNAVAILABLE。
 
-- 文件冲突；
-- HTTP 超时；
-- 认证失败；
-- 速率限制；
-- 资源不存在；
-- 远端服务不可用；
-- 工具执行失败；
-- 输入或输出不合法。
+调用时，RAG Provider 把 query 交给 Knowledge Base Manager，返回知识库身份、stale 状态、hits、命中数量以及必要 notice。对上层 Agent 来说，它仍然只是一个普通 READ Capability：discover、schema、authorize、Execution、Provider、CapabilityResult 的生命周期完全复用。
 
-Provider 边界先尽量把 SDK / transport 异常翻译成 Provider 错误。
+RAG 的 Dense/BM25/Rerank、版本过滤和知识库 sync 放在第 12 章；本章只需要理解它怎样接回统一工具系统。
 
-### 13.2 CapabilityLayer 再归一成 CapabilityError
+---
 
-Layer 捕获 Provider 异常后通过 `normalize_provider_error()` 转成有限的 CapabilityErrorType。
+## 13. 错误为什么要经过 Provider 和 Capability 两层归一
+
+不同底层会抛出完全不同的异常：文件冲突、GitHub HTTP 错误、MCP transport timeout、RAG unavailable、输入错误等。Agent Loop 如果直接看到这些 SDK 和系统异常，就必须知道每个 Provider 的实现细节。
+
+因此 Provider 先尽量把底层异常翻译成接近业务事实的 Provider Error，Capability Layer 再把它们收束成有限的 Capability Error 类型。
 
 ```mermaid
 flowchart LR
-    G[GitHub / MCP 异常] --> P[Provider 错误归类]
-    N[Native 文件 / Bash 异常] --> P
-    R[RAG 异常] --> P
-    P --> L[CapabilityLayer normalize]
-    L --> E[CapabilityError]
-    E --> CR[CapabilityResult failed]
+    X[文件 / GitHub / MCP / RAG 异常] --> P[Provider 归类]
+    P --> C[Capability Error 归一]
+    C --> R[统一 failed result]
 ```
 
-Agent Loop 因此不需要认识 `urllib`、GitHub SDK、文件系统或知识库内部异常类型。
+这样上层只需要区分 authentication、not found、conflict、timeout、unavailable、rate limited、invalid input 等稳定语义，不需要认识 urllib、GitHub Client 或知识库内部异常。
 
-### 13.3 为什么自动重试只覆盖少量 READ 错误
+### 为什么 WRITE 不参加普通自动 retry
 
-READ 调用通常没有外部写副作用，所以一次超时或临时不可用后进行有限恢复，风险相对容易判断。
+READ 一般不会创建远端副作用，所以 timeout 或短暂 unavailable 可以在严格限制下再尝试一次。WRITE / DESTRUCTIVE 不同：请求可能已经到达远端，只是响应丢失。自动再发一次可能重复创建评论、Review、分支或提交。
 
-WRITE / DESTRUCTIVE 调用情况复杂得多。
-
-例如“发布评论”的 HTTP 请求发出后连接中断，本地只知道响应没有收到，却无法直接确定远端到底有没有成功创建评论。此时自动重试可能产生重复副作用。
-
-因此当前 CapabilityLayer 只对少量 READ 错误做最多一次自动恢复。
-
-## 14. FailureGuard：系统怎样阻止模型反复撞同一个错误
-
-### 14.1 FailureGuard 怎样记录一次失败
-
-FailureGuard 为失败调用构造稳定身份：
-
-`agent id + capability id + 规范化 arguments`
-
-arguments 会排序并序列化，所以字段顺序变化不会被误认为新的调用。
-
-失败事实按 `run_id` 保存，只影响当前运行。
-
-### 14.2 为什么记录动作放到 ordered commit
-
-Execution 可能并行运行多个只读 Capability。
-
-如果哪个线程先结束就立刻修改 Agent 可见状态，后续行为会依赖线程完成时机。GitAgent 因此把 FailureGuard 更新放进 ordered commit。
-
-这时系统已经决定哪些结果按什么顺序正式提交给 Agent，上下文状态和失败状态可以一起前进。
-
-### 14.3 Dispatcher 的 duplicate call 与 FailureGuard 有什么区别
-
-两者关注的时间尺度不同。
-
-- Dispatcher 会检查模型是否紧接着又提交了完全相同的调用，给出 duplicate / repeated correction 反馈；
-- FailureGuard 记住当前 run 中已经正式提交的失败事实，可以阻止后面再次盲试同一 capability + arguments。
-
-Provider 自己的网络重试又属于另一层，它处理的是单次调用内部的临时连接失败。
-
-## 15. 把所有部分串起来：一次“查资料并修改代码”的完整 Capability 链
-
-现在用一个实际任务把前面所有组件连起来。
-
-假设 Coding Agent 需要修复一个第三方 Python 库 API 使用错误。
-
-### 第 1 步：Agent 获取当前工具集合
-
-CapabilityLayer 从 Registry 中筛出 AVAILABLE 能力，再根据 coding Agent 的 discover 配置过滤。
-
-Coding Agent 可以看到仓库读取、本地文件、Context7、RAG、Skill 和验证工具。
-
-Harness 把这些 Capability 转换成模型 function tools。
-
-### 第 2 步：模型先加载 Debug Skill
-
-模型判断当前任务需要系统化排障，于是调用 `skill.debug`。
-
-SkillProvider 读取固定可信 `SKILL.md`，返回方法指导文本。
-
-这一步只增加上下文，不修改仓库。
-
-### 第 3 步：模型查询第三方库资料
-
-如果库 id 未知，模型先调用 Context7 的 resolve capability，再调用文档查询 capability。
-
-MCPProvider 把调用交给 StreamableHTTPTransport，Transport 建立 MCP 会话并访问远端工具。
-
-返回资料仍然封装成 CapabilityResult。
-
-### 第 4 步：定位当前仓库代码
-
-Agent 可以用 repository search 查远端仓库事实，也可以在 active coding workspace 使用 `native.grep` / `native.glob` 定位文件。
-
-找到目标路径以后，再通过 bounded read 读取相关范围。
-
-### 第 5 步：精确修改文件
-
-模型根据刚刚读到的文本生成 `native.edit` 调用。
-
-CapabilityLayer 先做 schema 和权限检查；NativeProvider 再确认路径位于 active workspace，并要求 `old_text` 唯一匹配。
-
-修改成功后返回结构化 diff 和 changed 状态。
-
-### 第 6 步：运行真实验证
-
-模型调用 `native.bash` 执行项目测试、lint 或 typecheck。
-
-PermissionPolicy 先确认 coding Agent 具有 Bash 入口，BashCommandPolicy 再判断这条命令属于允许的真实验证命令。
-
-命令在当前 coding workspace 中执行，结果以受限输出返回。
-
-### 第 7 步：结果按顺序提交回 Agent
-
-Execution 负责调度调用，Dispatcher / Context 负责 ordered commit。
-
-Capability 的成功、失败、FailureGuard 更新和审计信息在提交路径中形成稳定的 Agent 观察结果。
-
-整条链可以画成：
-
-```mermaid
-flowchart LR
-    D[discover] --> SK[Skill 方法指导]
-    SK --> DOC[Context7 文档查询]
-    DOC --> LOC[glob / grep / repository search]
-    LOC --> READ[bounded read]
-    READ --> EDIT[exact edit]
-    EDIT --> TEST[bash verification]
-    TEST --> COMMIT[ordered result commit]
-```
-
-这条链包含 Skill、远端 MCP、Repository、本地 Native 等多种来源，但上层一直使用同一套 Capability 协议。
+因此远端写失败更关注“请求是否已发送、结果是否确定”，而不是简单的“异常类型能不能重试”。这部分在第 08、09 章会结合 Approval 和恢复继续讲。
 
 ---
 
-## 16. 到这里再讨论设计原因：Capability 层解决了哪些系统问题
+## 14. Failure Guard：阻止模型反复撞同一个已经稳定失败的动作
 
-前面已经完整走过“怎样设计”和“怎样执行”，现在再回头看这一层存在的原因会更容易理解。
+Provider retry 只处理一次调用内部的短暂故障。模型收到失败以后，还可能在下一轮原样提交同一个 Capability 和完全相同参数。Failure Guard 用来处理这种跨 step 的无效循环。
 
-### 16.1 把模型协议和底层 SDK 解耦
+它用当前 Agent、Capability id 和规范化参数构造稳定调用身份，并按 run 保存失败记录。只有失败沿 ordered commit 正式进入 Agent 历史以后，记录才生效；成功调用则会清理对应失败身份。
 
-模型只需要认识 capability name、description 和 schema。
+这样并发执行时，不会因为某个 worker 恰好先失败就提前改变后续模型可见状态。
 
-GitHub Client 怎样发送 API、Context7 怎样握手、Skill 怎样读文件、RAG 怎样查索引，都留在 Provider 内部。
-
-这样上层 Agent 不会被某个 SDK 的方法名和异常类型绑死。
-
-### 16.2 把“发现权限”和“执行权限”集中管理
-
-如果每个 Agent 自己维护一套工具列表和权限判断，很容易出现角色之间规则漂移。
-
-Capability 系统通过 Catalog + PermissionPolicy 集中配置，启动时还会做交叉校验。
-
-### 16.3 给动态外部服务保留稳定本地边界
-
-远端 MCP 可以变化，RAG 知识库也可以变化。
-
-Provider refresh 和 Registry snapshot 允许运行状态更新，本地固定映射和权限配置仍然由 GitAgent 控制。
-
-### 16.4 给 Execution 提供统一调度语义
-
-Provider 还能描述 invocation 的并发和资源声明。
-
-READ 通常可以并发；对 workspace 或 repository 的写操作通常申请独占资源。
-
-这样工具来源差异不会阻止 Execution 做统一批处理和并发控制。
-
-### 16.5 给错误处理提供统一语言
-
-CapabilityError 把底层异常压缩成有限、可推理的错误类别。
-
-Agent 能据此判断应该换参数、重新读取、等待、停止调用还是请求用户审批。
+Dispatcher 的 duplicate-call 检查和 Failure Guard 处理的时间尺度不同：前者更关注模型紧接着重复提交同一调用；后者记住当前 run 中已经正式提交的失败事实。Provider retry 则更底层，只处理单次网络/服务故障。
 
 ---
 
-## 17. 复习时应该怎样讲这套系统
+## 15. 为什么 Capability 要这样设计
 
-如果面试或复习时需要在几分钟内讲清楚，建议按下面顺序。
+前面已经先按运行顺序讲完实现，现在再看设计取舍。
 
-先说整体职责：Capability 层位于模型 StructuredCall 和真实工具之间，负责统一能力发现、授权、执行和结果协议。
+第一，它把模型协议和底层 SDK 解耦。Agent 只认识稳定 id、描述和 schema；文件系统、GitHub Client、远端 MCP、Skill 文件和知识库索引分别留在 Provider 内部。
 
-然后画四个核心盒子：Catalog、Registry、PermissionPolicy、Provider。
+第二，它把“模型可见性”和“真实执行权限”集中管理。每个 Agent 不需要自己维护一套工具注册与授权代码；discover 和 invoke 分开后，既可以让模型工具箱保持聚焦，又不会把“看见过 schema”误当成执行许可证。
 
-接着沿一项能力的生命周期讲：
+第三，它允许动态来源变化而不自动扩大权限。Registry 可以跟着 Provider refresh 更新当前可用快照，但远端 MCP 新工具不会绕过本地配置直接出现，RAG 动态库也仍然经过统一权限和状态判断。
 
-`配置定义 → Provider load → Registry → discover → LLM tool schema → StructuredCall → preflight → invoke 校验与授权 → Provider → CapabilityResult → ordered commit`
+第四，它给 Execution 提供统一语义。不同 Provider 都能描述并发模式和资源声明，于是上层可以统一处理 READ 并发、workspace 写冲突和有序提交，而不需要为每一种工具来源写独立调度器。
 
-再举两个来源不同的例子：
+第五，它给错误和恢复提供共同语言。底层异常最终会变成有限的 Capability Error，写操作还会保留“是否可能已经产生副作用”这类信息，后续恢复不需要重新猜测底层 SDK 到底发生了什么。
 
-- `native.edit`：说明本地工具怎样做路径约束和唯一匹配；
-- `context7.query-docs`：说明远端 MCP 怎样通过 stable capability id 接入。
-
-最后补充两个容易拿分的设计点：
-
-- discover 和 invoke 分层，模型可见性不能代替真实授权；
-- WRITE / DESTRUCTIVE 调用不会参与通用自动重试，因为远端副作用可能存在不确定性。
-
-如果还能继续展开，再讲 Skill、RAG、FailureGuard 和 ExecutionProfile。
+代价是多了一层 Capability / Binding / Registry / Provider 抽象，但这些对象分别对应稳定契约、执行连接、运行时快照和底层适配，变化方向并不相同。把它们合成一个巨大工具表，短期代码更少，长期会把权限、动态刷新和 Provider 差异重新耦合起来。
 
 ---
 
-## 18. 常见混淆点
+## 16. 代码定位
 
-| 容易混淆的说法 | 更准确的理解 |
-|---|---|
-| Capability 只是函数包装 | Capability 还承载 id、schema、状态、访问等级、来源等执行契约 |
-| Catalog 就是当前工具列表 | Catalog 保存静态配置意图，Registry 保存当前运行时 registration |
-| 模型没有看到某个工具就已经完成安全控制 | invoke 阶段还会重新执行真实授权 |
-| MCPProvider 里的 GitHub 每次都经过远端 MCP HTTP | 当前 GitHub server 使用 local adapter，真实 API 由本地 GitHub Client 调用 |
-| 远端 MCP 新增工具后会自动出现在 Agent 工具箱 | refresh 只更新已有本地映射，新的远端名称没有固定映射就不会自动获得能力身份 |
-| Skill 会直接完成调试或代码审查 | Skill 返回工作方法文本，后续动作仍通过普通 Capability 完成 |
-| RAG 需要 Agent Loop 使用专门检索协议 | RAGProvider 把知识库包装成普通 READ Capability |
-| worktree + Bash policy 等于完整 OS sandbox | 当前实现仍运行宿主机进程，工作区和命令策略主要提供范围与命令约束 |
-| Provider 返回成功就一定完成 Capability 调用 | 返回数据还可能需要经过 output schema 校验 |
-| FailureGuard 在 Provider 报错时立刻修改全局状态 | 它通过 ordered commit 更新当前 run 的失败记录 |
-
----
-
-## 19. 代码定位：复习某个问题时应该看哪里
-
-本章不通过大段代码解释设计。真正需要核对实现时，可以按问题定位文件。
+下面用于需要核对实现时定位，不要求靠源码变量才能理解正文。
 
 | 想核对的问题 | 主要位置 |
 |---|---|
-| 应用怎样组装整套 Capability 系统 | `gitagent/application/capabilities.py` |
-| 固定能力和 MCP server 配置怎样读取 | `gitagent/capability/catalog.py` |
-| Capability / Binding / Registration / Result 数据结构 | `gitagent/capability/models.py` |
-| 当前运行时 registration 怎样保存和按 source 替换 | `gitagent/capability/registry.py` |
-| load / refresh / discover / invoke / retry / FailureGuard | `gitagent/capability/layer.py` |
-| Agent discover / invoke / Bash 权限策略 | `gitagent/capability/policy.py` |
+| 应用怎样装配 Capability 系统 | `gitagent/application/capabilities.py` |
+| 固定能力和 MCP server 配置 | `gitagent/capability/catalog.py` |
+| Capability / Binding / Registration / Result | `gitagent/capability/models.py` |
+| 运行时 Registry 和按 source 替换 | `gitagent/capability/registry.py` |
+| load / refresh / discover / invoke / retry / Failure Guard | `gitagent/capability/layer.py` |
+| discover / invoke / Bash 权限策略 | `gitagent/capability/policy.py` |
 | schema 定义和运行时校验 | `gitagent/capability/schema.py` |
 | Capability 错误归一 | `gitagent/capability/errors.py` |
-| Native 文件与 Bash 工具 | `gitagent/capability/providers/native.py` |
-| GitHub local adapter 和远端 MCP binding | `gitagent/capability/providers/mcp.py` |
-| Skill 文件加载 | `gitagent/capability/providers/skill.py` |
+| Native 文件与 Bash | `gitagent/capability/providers/native.py` |
+| GitHub local adapter 与远端 MCP binding | `gitagent/capability/providers/mcp.py` |
+| Skill 加载 | `gitagent/capability/providers/skill.py` |
 | RAG 动态 Capability | `gitagent/capability/providers/rag.py` |
-| MCP Streamable HTTP 会话与 RPC | `gitagent/infra/mcp/transport.py` |
-| Capability 怎样转换成模型 function tools | `gitagent/harness/execution.py` |
-| StructuredCall preflight、batch 执行与 commit | `gitagent/harness/structured_call_dispatcher.py` |
+| MCP Streamable HTTP 会话 | `gitagent/infra/mcp/transport.py` |
+| Capability 转成模型 function tools | `gitagent/harness/execution.py` |
+| StructuredCall preflight、batch 与 commit | `gitagent/harness/structured_call_dispatcher.py` |
 | 固定能力、server 和 Agent 权限配置 | `capabilities.yaml` |
 
----
-
-## 20. 一句话收尾
-
-> GitAgent 的 Capability 系统先把各种底层动作注册成统一的运行时能力，再按 Agent 角色筛选给模型；模型发起调用后，系统继续经过工作流检查、schema 校验、权限授权和 Provider 执行，最后用统一结果协议提交回 Agent。
-
-掌握这一条主线以后，再看 Native、MCP、Skill、RAG，都可以理解成“不同来源怎样接入同一条 Capability 生命周期”。
-
-下一章进入 Execution 层，继续回答一个新的问题：模型一次提出多个 Capability 后，系统怎样决定并发、串行、资源冲突和最终提交顺序。参见 [06-execution-and-concurrency.md](06-execution-and-concurrency.md)。
+下一章进入 Execution：当模型一次提出多个 Capability 或子 Agent 调用后，系统怎样决定哪些能并行、哪些需要独占资源，以及为什么物理完成顺序不能直接变成 Agent 的逻辑提交顺序。→ [06 执行与并发](06-execution-and-concurrency.md)

@@ -348,28 +348,7 @@ flowchart TD
 
 ---
 
-## 9. 用一次完整 patch 串起所有步骤
-
-假设用户要求修复缓存过期判断，并补上对应测试。
-
-| 阶段 | Workspace 状态 | Harness 做的事情 | 此时能得出的结论 |
-|---|---|---|---|
-| 1. 准备请求 | 尚未创建 | `ChangeRequest` 确定仓库、描述、source_ref | 修改起点已经固定 |
-| 2. 创建 workspace | revision=0 | 准备 cache，创建 detached worktree，核对 HEAD | 有一块基于精确 commit 的临时工作区 |
-| 3. 读取代码 | revision=0 | read/grep/glob 都绑定当前 workspace | 已找到需要修改的位置 |
-| 4. 修改实现 | revision=1 | edit 真实改变文件，Commit 推进 revision | 候选出现第一轮变化 |
-| 5. 补测试 | revision=2 | 再次真实修改 | 当前候选已经走到 revision 2 |
-| 6. 跑目标测试 | revision=2 | 记录真实验证事件，exit code 非零 | revision 2 的验证失败 |
-| 7. 修复实现 | revision=3 | 新 mutation 使旧验证退出当前证据范围 | 需要针对 revision 3 重新验证 |
-| 8. 再跑测试和 lint | revision=3 | 记录新的验证事件 | 如果检查全通过，report 可以得到 passed=true |
-| 9. finish | revision=3 | snapshot、确定性检查、生成候选与报告 | 得到真实 CandidatePatch 和 VerificationReport |
-| 10. 返回上层 | workspace 已清理 | Domain Agent 接收结构化结果 | 可以继续判断是否进入远端变更流程 |
-
-这个例子中最值得记住的地方是：**验证描述的是某个候选版本的证据，它会随着真实修改的出现而需要重新建立。**
-
----
-
-## 10. 这个模块实际提供了哪些保证
+## 9. 这个模块实际提供了哪些保证
 
 前面已经把实现走完，现在可以把设计能力边界集中整理一下。
 
@@ -383,21 +362,11 @@ flowchart TD
 | 区分验证尝试与验证通过 | event 记录执行结果，report 根据 FAIL 汇总 passed | 当前 revision 有验证记录仍可能得到 passed=false |
 | 生成候选事实 | final snapshot 读取 Git 状态、diff 和最终文件内容 | 上层仍需结合业务语义、人审与远端计划继续处理 |
 
-这张表也解释了为什么本章只叫“Coding Workspace 与验证”。它负责把本地候选做成可检查的结构化事实，远端写入权限和业务审批由下一层继续负责。
+这些保证对应了本章的职责边界：Coding Workspace 负责把本地修改整理成“基线明确、变化可追踪、验证与版本绑定、最终内容可重新计算”的候选事实；它不负责决定用户是否同意发布，也不把 worktree 误当成操作系统级 sandbox。远端写入资格继续由下一章的 Mutation Plan、Approval 和 Provider 版本检查负责。
 
 ---
 
-## 11. 复习时建议按这条主线讲
-
-面试或复习时，不需要从类名开始背。先讲状态流会更容易说明白：
-
-> Domain Agent 先用 `ChangeRequest` 固定 source SHA，Coding Agent 再基于这个 SHA 创建独立 detached worktree。所有文件能力都绑定这块 workspace。每次真实文件变化都会推进 workspace revision，真实验证命令会把结果记录到当时的 revision。后续只要再次修改，旧验证就退出当前证据范围。finish 时 Harness 从真实 Git 工作树重新计算 changed files 和 patch，再加入确定性检查形成 `VerificationReport`。验证通过以后，上层 Domain Agent 才会继续准备远端变更。
-
-如果还要再展开，就按“基线 → workspace → 路径 → revision → verification → snapshot → Domain Agent gate”这个顺序继续讲。
-
----
-
-## 12. 代码定位
+## 10. 代码定位
 
 | 想核对的问题 | 主要位置 |
 |---|---|

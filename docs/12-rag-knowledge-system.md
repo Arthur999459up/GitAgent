@@ -368,46 +368,19 @@ Dense 和 BM25 可以互补，但需要同时维护向量模型、稀疏索引�
 
 ---
 
-## 17. 用一个查询把整条链串起来
+## 17. 当前实现需要特别注意的边界
 
-假设 Coding Agent 遇到第三方库 API 兼容问题，需要查项目内部维护的技术资料。
+前面的链路已经把索引、召回、重排、组装和生命周期分别讲清楚。复习时还需要把几个容易被“简化过头”的边界保留下来。
 
-第一步，Agent 根据当前可见 Capability 发现对应的 `rag.<kb>`，生成一个聚焦查询。完整聊天历史不会直接作为 query 塞进 RAG。
+Qdrant 只是索引和查询基础设施，不等于整个 RAG：Markdown 结构切分、本地 Embedding、Cross-Encoder Rerank、多样性选择、邻接/父 section 扩展、token assembly 和知识库状态都在其他组件中完成。Hybrid Retrieval 也只是高召回阶段，RRF 融合以后仍然要经过 Reranker；Rerank 排名前几的 chunk 也不会直接塞进 Prompt，还要继续做去重、上下文扩展和独立预算分配。
 
-第二步，RAGProvider 进入 KnowledgeBaseManager。Manager 检查知识库没有处于 ERROR，确认 Qdrant collection 存在，并执行 freshness check。
+STALE 表示“源文档已经变化，但上一份成功索引仍可作为带警告的参考”，不是知识库完全不可用。文件 mtime/size 变化后还会比较内容哈希，正文没变时不需要重新 Embedding。查询时又会按 Registry 当前认可的 document id + content hash 过滤，因此版本正确性不完全依赖旧 chunk 已经物理删除干净。
 
-第三步，本地 Embedding 模型编码 query。Qdrant 同时进行 Dense 和 BM25 召回，只允许 Registry 当前认可的文档版本参与查询。
-
-第四步，两路排名通过 RRF 融合成 coarse candidates。
-
-第五步，本地 Qwen3 Reranker 对 query 和候选逐一评分，低相关候选被过滤。
-
-第六步，Assembly 优先选择来自不同文档和 section 的候选，再围绕中心 chunk 补前后邻接内容和父 section 线索，同时按 chunk id / content hash 去重。
-
-第七步，所有最终正文受 RAG 独立 token budget 限制，形成结构化 RetrievalResult。如果知识库已经 STALE，结果同时带上 stale 标记和同步提示。
-
-第八步，结果通过 CapabilityResult 和 ordered commit 回到 Agent。Agent 可以把这些资料用于理解方案，同时继续使用 Repository / GitHub 工具确认当前项目事实。
-
-这一条链里，检索模型负责找相关材料，Manager 负责知识库状态，Qdrant 负责索引查询，RAGProvider 负责 Harness 接入，Agent 负责把检索证据放回当前任务推理。
+最后，RAG 提供的是文档证据，不是当前 Repository / GitHub 状态。即使资料里写着某个 branch 或配置，真正执行当前任务仍要重新读取权威外部事实。RAGProvider 把知识库包装成普通 READ Capability，所以 Agent Loop 不需要一套特殊“RAG 协议”；它继续服从 discover、permission、execution 和 ordered commit。
 
 ---
 
-## 18. 复习这一章时最值得抓住的几个边界
-
-| 容易混淆的点 | 准确理解 |
-|---|---|
-| Qdrant 等于整个 RAG | Qdrant 主要承担 Dense/BM25 索引和查询；切分、Embedding、Rerank、Assembly、生命周期都在其他组件 |
-| Hybrid Retrieval 已经完成最终排序 | Hybrid 更偏粗召回，后面还有本地 Cross-Encoder Rerank |
-| Rerank Top-K 可以直接放进 Prompt | 还要做多样性、上下文扩展、去重和 token budget |
-| STALE 代表完全不可用 | STALE 会继续读取上一份成功索引，并明确提示需要同步和核验 |
-| mtime 变化就一定重新 Embedding | 元数据变化后还会比较内容哈希，正文相同时无需重新索引 |
-| 旧 chunk 删除是版本正确性的唯一保障 | 查询还会按 Registry 当前 `document_id + content_hash` 过滤有效版本 |
-| RAG 能代替 Repository 读取当前事实 | RAG 提供文档知识；当前仓库和 GitHub 状态仍应通过实时 Capability 获取 |
-| RAG 需要 Agent Loop 增加特殊协议 | RAGProvider 将知识库包装成普通 READ Capability，继续走统一 Harness 调用链 |
-
----
-
-## 19. 代码定位
+## 18. 代码定位
 
 理解设计以后，按问题回源码核对即可：
 
@@ -421,11 +394,5 @@ Dense 和 BM25 可以互补，但需要同时维护向量模型、稀疏索引�
 | Cross-Encoder Rerank、Diversity、Expansion、Token Assembly | `gitagent/capability/rag/retrieval.py` |
 | RAG 怎样注册成普通 READ Capability | `gitagent/capability/providers/rag.py` |
 | RAG Provider 怎样加入统一 Capability Layer | `gitagent/application/capabilities.py` |
-
----
-
-## 20. 一条主线收束整章
-
-GitAgent 的 RAG 先把 Markdown 按标题结构和 token 大小切成带版本、section 与邻接关系的 chunk，再同时建立 Dense 与 BM25 索引；查询时两路召回经过 RRF 融合，再由本地 Qwen3 Cross-Encoder 精排；最终结果还要经过多样性选择、邻接与父 section 扩展、内容去重和独立 token budget。Knowledge Base 用 Registry、content hash 和 READY / STALE / ERROR 管理版本与可用性，RAGProvider 再把每个知识库接成统一的 READ Capability，让 Agent 在 Harness 的权限、并发和结果协议里按需获取文档证据。
 
 下一章进入应用装配与 Prompt：[这些 Harness 模块怎样在真实进程、Session 和模型请求里被组装起来](13-application-config-and-prompts.md)。

@@ -608,128 +608,23 @@ flowchart LR
 
 因此，一个 Agent 在暂停前已经读过 `a.py` 1–200，恢复后仍然知道这段范围已经覆盖。
 
-# 第六部分：把两套机制放回一次真实长任务
+# 第六部分：为什么上下文治理和读取状态要分开维护
 
-## 18. 一个 Coding Agent 连续工作时，系统内部发生了什么
+前面已经分别走完模型消息和文件读取的实现，现在再看为什么这两套状态不能合并成一个“大缓存”。
 
-假设 Coding Agent 要修改一个中型仓库，它连续读取文件、调用模型、修改代码并运行验证。
+模型历史记录的是“过去模型已经看到过什么”。即使某段旧文件内容后来过时，它仍然是当时真实发生过的 tool result，不能因为文件被修改就从历史中抹掉。Context Governance 处理的是如何在保持 tool call/result 协议的前提下压缩这些历史，并把压缩决定持久化成可重放的 compaction event。
 
-下面按时间顺序走完整个过程。
+FileReadLedger 处理的是另一个问题：**下一次还要不要真的访问 Provider。** 它只记录 repository、path、ref 对应的 coverage 和 EOF，不保存正文。文件内容一旦可能被 WRITE / DESTRUCTIVE 或 Bash 改变，旧 coverage 就不再能证明当前文件已经被观察过，因此读取状态需要失效；但历史消息仍然保留为过去的事实。
 
-### 阶段 1：Agent 第一次读取文件
+这也解释了为什么 read cache、FileReadLedger 和 workspace revision 不能混为一个概念。read cache 复用一般 READ 的完整结果；FileReadLedger 只管理仓库文件的行覆盖；workspace revision 则表示当前候选是否真的形成了新的代码版本。成功写操作会保守地清理读取状态，而 revision 还会根据真实变化进一步判断是否推进。
 
-Agent 请求：
+等待恢复时，两套状态也从不同来源回来：消息和 compaction 从 Event History 重放，read cache 与 FileReadLedger 随暂停控制树恢复。这样恢复后的 Agent 既知道模型之前看过什么，也知道哪些文件范围在当前可恢复状态下仍然可以视为已读取。
 
-- `service.py` 1–200；
-- `models.py` 1–200。
-
-FileReadLedger 里还没有 coverage，所以两次读取都会真实访问 Provider。成功返回后，`service.py` 和 `models.py` 都记录 `[1, 200]` 这一段覆盖范围。
-
-这些正文作为 tool result 进入 Agent 的模型消息线程。
-
-### 阶段 2：Agent 再次请求重叠范围
-
-Agent 又请求 `service.py` 150–350。
-
-Ledger 发现 150–200 已经覆盖，新的缺口从 201 开始，因此只会把缺失区间交给 Provider。
-
-Agent 继续探索时，coverage 会逐步向后扩展。
-
-### 阶段 3：模型历史逐渐变大
-
-随着几十次文件读取、搜索和工具调用累积，`model_messages()` 每次都会计算当前请求 token。
-
-低于 50% 时，消息保持完整。
-
-达到 Light 压力后，旧的大 tool result 开始被替换成短说明。
-
-如果仍然继续增长，Summary 会把较早的完整 span 收进 checkpoint。
-
-### 阶段 4：发生代码修改
-
-Coding Agent 成功执行写操作。
-
-Harness 在 commit capability 时清空通用 read cache 和 FileReadLedger。下一次再读取 `service.py` 时，会重新访问当前 worktree，建立新的 coverage。
-
-此前模型历史里的旧 tool result 仍然属于“当时发生过的历史事实”；读取状态清空解决的是“以后再读时要基于当前文件重新取事实”。
-
-### 阶段 5：Agent 等待用户后进程退出
-
-Pause Snapshot 保存当前控制树，同时保存 read cache 与 FileReadLedger。
-
-Event History 保存模型消息和已经发生的 compaction event。
-
-恢复时：
-
-```mermaid
-flowchart TD
-    E[Event History] --> P[Projector]
-    P --> M[恢复模型消息与 compaction 视图]
-    S[Pause Snapshot] --> C[恢复 Agent 控制状态]
-    S --> R[恢复 read cache / FileReadLedger]
-    M --> A[AgentContext]
-    C --> A
-    R --> A
-```
-
-恢复完成以后，模型历史、等待控制点和读取状态各自从对应的持久化来源回来，再组合成可继续运行的 AgentContext。
+理解本章时要特别注意几个边界：Light 主要缩短大型 tool result，而不是删除整个调用；Summary 只能在 atomic span 边界折叠；Emergency 必须优先保留最近用户消息和 open tool span；FileReadLedger 不是正文缓存，完全命中 coverage 时返回的是“已覆盖”状态而不是拼回旧正文；Bash 只要改变 worktree，同样会让读取状态失效。
 
 ---
 
-这一章可以用一条关系收束：**消息侧用 atomic span 守住模型协议，用 compaction event 守住恢复一致性；读取侧用 coverage 记录“读过哪里”，用失效清理保证后续读取重新面对当前事实。**
-
----
-
-## 19. 最容易混淆的概念
-
-| 容易混淆的说法 | 应该怎样理解 |
-|---|---|
-| Context 等于完整运行状态 | 模型消息只是运行状态的一部分；waiting、child、读取 ledger 等由 Harness 单独维护 |
-| Light 会删除整个工具调用 | Light 主要替换较大的 tool result 正文，`tool_call_id` 仍然保留 |
-| Summary 可以从任意消息位置截断 | Summary 先构造 atomic span，再从 span 边界折叠早期历史 |
-| Emergency 只保留最近几条 | 它先保留最近 user message 和 open tool span，再从最近历史向前补 |
-| Checkpoint 只存在内存 | compaction plan 会写成 `compaction_checkpoint` event，恢复时重新应用 |
-| FileReadLedger 是文件正文缓存 | 它保存 coverage 和 EOF，不保存正文 |
-| 文件读过一次就整体标记已读 | 状态精确到行区间，还会计算缺口 |
-| 完全命中 coverage 后会返回旧正文 | 当前实现返回 `already_read + coverage`，并跳过底层读取 |
-| 只有 `changed=true` 才清读取状态 | 成功 WRITE / DESTRUCTIVE capability 会清读取状态；`changed=true` 还参与 workspace revision 的推进 |
-| bash 不经过结构化写工具，所以读取状态不会变化 | Harness 会比较 bash 前后的 worktree state，检测到变化后清空读取状态 |
-| Pause Snapshot 只保存 waiting | 当前 AgentContext 的 read cache 与 FileReadLedger 也会随暂停状态序列化和恢复 |
-
----
-
-## 20. 复习时建议按这条顺序讲
-
-如果面试或复盘时需要在几分钟内讲清楚本章，可以沿着下面这条链：
-
-```mermaid
-flowchart LR
-    E[Event History] --> P[Projector]
-    P --> M[Canonical Messages]
-    M --> X[Current System / Ephemeral Guidance]
-    X --> B[Token Budget]
-    B --> C[Light → Summary → Emergency]
-    C --> D[Compaction Event]
-    D --> P
-
-    R[Repository Read] --> L[FileReadLedger]
-    L --> G[Coverage / EOF]
-    G --> I[只读缺口]
-    W[Workspace Mutation] --> Z[清空 Read State]
-    Z --> L
-```
-
-讲述时抓住五个关键词就够了：
-
-**Projection → Ephemeral → Span → Compaction Event → Coverage**
-
-可以这样组织口头答案：
-
-> GitAgent 先从事件历史投影出当前 Agent 的标准消息线程，再加入当前 system 和本轮临时 guidance。发送模型前统一计算 token 压力，50%、70%、90% 分别进入 Light、Summary、Emergency；涉及工具调用的历史先按 atomic span 分组，避免压缩破坏 call/result 协议。压缩计划会写成事件，所以恢复时可以重放同一份模型视图。文件读取另外维护 FileReadLedger，用 repository、path、ref 区分文件身份，用 coverage 和 EOF 记录已经观察过的范围，只把缺口交给 Provider。成功写操作或 worktree 变化后会清空读取状态，暂停恢复时则从 snapshot 重新装载。
-
----
-
-## 21. 代码定位：复习时应该去哪里核对
+## 18. 代码定位：复习时应该去哪里核对
 
 | 想核对的问题 | 主要位置 |
 |---|---|

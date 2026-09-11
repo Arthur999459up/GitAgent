@@ -15,35 +15,39 @@
 
 ---
 
-## 先用一张图认识 GitAgent
+## 先用两张图认识 GitAgent
+
+第一张只看“任务怎样找到正确的 Agent，并形成领域结果”：
 
 ```mermaid
 flowchart LR
-    U[用户输入] --> APP[应用层 / Session]
+    U[用户输入] --> APP[Application / Session]
     APP --> MAIN[Main Agent]
     MAIN --> DOMAIN[Repository / Issue / PR Agent]
-    DOMAIN --> CODE[需要时委派 Coding Agent]
-    MAIN --> LOOP[Agent Loop]
-    DOMAIN --> LOOP
-    CODE --> LOOP
-    LOOP --> MODEL[模型请求]
-    MODEL --> LOOP
-    LOOP --> CAP[Capability 层]
-    CAP --> EXEC[执行与并发调度]
-    EXEC --> TOOL[Native / GitHub / MCP / RAG / Skill]
-    TOOL --> EXEC
-    EXEC --> LOOP
-    CODE --> WS[隔离 Coding Workspace]
-    WS --> VERIFY[真实验证]
-    VERIFY --> CAND[CandidatePatch]
-    CAND --> PLAN[Mutation Plan]
-    PLAN --> APPROVAL[用户审批]
-    APPROVAL --> REMOTE[受保护远端写入]
-    LOOP --> STATE[事件历史 / 暂停状态 / Trace]
-    STATE --> APP
+    DOMAIN --> CODE{需要代码语义?}
+    CODE -->|是| CODING[Coding Agent]
+    CODE -->|否| RESULT[领域结果]
+    CODING --> RESULT
 ```
 
-这张图可以先记成五层：
+第二张再看“一项模型决定怎样真正执行，并在需要时形成远端副作用”：
+
+```mermaid
+flowchart LR
+    A[Agent Loop] --> M[模型决定]
+    M --> C[Capability / Child Agent]
+    C --> E[Execution]
+    E --> P[Native / GitHub / MCP / RAG / Skill]
+    P --> E
+    E --> A
+    A --> W[Coding Workspace / 业务状态]
+    W --> V[Verification / CandidatePatch]
+    V --> R[Mutation Plan + Approval]
+    R --> G[受保护远端写入]
+    A --> S[Event History / 暂停状态 / Trace]
+```
+
+这两张图可以再归纳成五层：
 
 | 层 | 负责什么 | 不负责什么 |
 |---|---|---|
@@ -76,13 +80,14 @@ flowchart LR
 | [13 应用装配、配置与 Prompt](13-application-config-and-prompts.md) | 各模块怎样在真实 CLI / Session 中被组装起来 | 讲生命周期与行为指导，不把 Prompt 当安全边界 |
 | [14 Harness 评测设计](14-evaluation-design.md) | 怎样证明“任务完成了，而且约束没有被绕过” | 讲判分证据与指标口径 |
 
-### 面试速查附录
+### 面试衍生材料
 
-14 章正文讲的是 **GitAgent 自己**。如果已经完整复习过主线，再看下面这篇横向对比，用来回答“为什么你的 Harness 这么设计，其他 Coding Agent/Harness 又怎么做”：
+01—14 是实现主线，也是后续维护技术事实时的唯一正文来源。完整复习主线以后，再按需要看两份面试材料：
 
-- [GitAgent、Claude Code、Codex、Pi、DeepSeek Harness 设计思路快速对比](appendix-harness-design-comparison.md)
+- [Agent Harness 高频八股与 GitAgent 追问速背](15-agent-harness-jd-interview-review.md)：把主线压成面试问答，允许重复，但不新增实现事实。
+- [GitAgent、Claude Code、Codex、Pi、DeepSeek Harness 设计思路快速对比](appendix-harness-design-comparison.md)：用于解释不同 Harness 的设计取舍。
 
-这篇附录不是第 15 个技术模块，也不要求背功能列表。重点是用 **Agent Loop、Tools、Context、Multi-Agent、Execution/Sandbox、Approval、Recovery** 这些 GitAgent 已经熟悉的维度理解不同 Harness 的设计取舍。
+这两份材料都属于**衍生复习材料**，不是新的技术模块。如果它们和 01—14 的实现描述发生冲突，应以对应主章节为准；需要更新实现机制时，也优先只修改主章节，再同步必要的面试摘要。
 
 ---
 
@@ -127,8 +132,8 @@ flowchart LR
 
 ## 旧章节文件说明
 
-当前正式维护的 GitAgent 教学正文仍然只有上面的 **01—14 共十四章**。面试速查附录属于横向复习材料，不计入 GitAgent 技术主线。
+当前正式维护的 GitAgent 实现正文只有上面的 **01—14 共十四章**。`15-agent-harness-jd-interview-review.md` 和横向 Harness 对比都属于面试衍生材料，不计入技术主线。
 
 目录中仍保留少量旧文件名，例如 `01-agent-loop-and-architecture.md`、`08-safety-approval-workspace.md`，它们只是一页很短的迁移入口，用来避免仓库里已有链接突然失效。
 
-旧文件不再承载重复正文。阅读、复习和后续维护都应以本 README 列出的十四个新章节为准；完成主线以后，再按需阅读面试速查附录。
+旧文件不再承载重复正文。阅读、复习和后续维护实现细节都应以本 README 列出的十四个主章节为准；完成主线以后，再按需阅读两份面试衍生材料。

@@ -470,125 +470,25 @@ flowchart TD
 
 ---
 
-## 13. 用一个完整例子串起来：读取、编辑、验证怎样执行
+## 13. 为什么执行层不能只做“开线程并发”
 
-假设 Coding Agent 的工作分成两轮。
+前面已经先走完了 Profile、Group、Prepare、Admission、Run、Quiesce 和 Ordered Commit，现在再看这些机制为什么需要同时存在。
 
-第一轮，模型同时提出三个互不冲突的读取调用：read A、read B、read C。
+线程池只能回答“什么时候有 worker”，不知道一次调用会不会修改同一个 workspace、某个 Provider 能承受多少并发，也不知道模型原始调用顺序和 Approval waiting。ExecutionProfile 把这些调用语义显式交给 Coordinator；ResourceClaims 再比简单 READ/WRITE 更细地表达具体共享资源冲突。
 
-第二轮，模型提出 edit A，随后运行测试。
+Group 内的兼容检查和真正 Run 前的资源申请也不是重复工作。前者解决“这一批连续调用内部能不能一起跑”，后者还要协调其他 batch、嵌套 Agent 和直接 Runtime lease。类似地，Capability / Domain lane 控制 Runtime 自己的 worker 容量，Provider semaphore 控制某个底层服务的容量，两层限制的对象也不同。
 
-### 13.1 第一轮：三个读取
+Ordered Commit 则负责隔离并发带来的完成顺序不确定性。worker 可以因为网络或磁盘速度以任意顺序结束，但 AgentContext 仍按模型原调用顺序推进。这样 read cache、workspace revision、Failure Guard、tool result 和 waiting 都有稳定的逻辑历史。
 
-Native READ 会得到 concurrent profile。三个调用的 claims 兼容，所以它们进入同一个 execution group。
+waiting 进一步说明了为什么“执行完成”和“逻辑提交”必须分开：后面的调用可以已经产生物理结果，却因为前面的 Approval 让 Context 暂停而暂时不能提交。系统会保存这类未提交结果，恢复后继续按 open-call 顺序处理，而不是重复执行。
 
-Coordinator 依次 Prepare 三项调用，然后把它们提交到 capability lane。每项调用还会经过 native provider semaphore 与 ResourceClaimManager。
+最后，CancellationHandle 需要覆盖 future、资源等待和 child Agent，是因为 Agent 调 Agent 后已经形成一棵运行树。取消能收束尚未完成的本地工作，但不能撤销已经产生的远端副作用；远端写仍要依赖 Approval 和 mutation recovery。
 
-三项读取可以任意顺序完成。等 group 稳定后，Coordinator 仍按模型给出的 read A → read B → read C 顺序 Commit。
-
-```mermaid
-flowchart LR
-    A[read A] --> G[Concurrent Group]
-    B[read B] --> G
-    C[read C] --> G
-    G --> R[并发 Run]
-    R --> Q[Group quiesce]
-    Q --> O[按 A → B → C Commit]
-```
-
-### 13.2 第二轮：edit A
-
-Native 写操作会得到 exclusive profile，并声明当前 workspace 写资源。它单独形成一个 group。
-
-Run 阶段真正修改文件。Commit 阶段会根据结果清理读取状态；如果工具报告文件实际发生变化，coding workspace revision 会推进。
-
-### 13.3 接着运行测试
-
-测试通过 `native.bash` 执行。由于它位于 edit 后面的调用位置，前一个 exclusive group 完成并 Commit 后才会进入后续 group。
-
-验证命令成功后，Commit 会记录当前 revision 对应的 validation 信息。于是验证结论明确对应“编辑之后的工作树版本”。
-
-```mermaid
-flowchart LR
-    R[并发读取 group] --> E[edit A exclusive group]
-    E --> V[test group]
-    V --> C[记录当前 revision 的 validation]
-```
-
-这个例子把本章最重要的关系串了起来：**并发发生在语义允许的 group 内；涉及 mutation 和验证时，group 边界与 ordered commit 会把状态变化固定在明确位置。**
+理解本章时还要注意几个当前实现边界：`CONCURRENT` 只表示有资格进入并发组，后面仍有 lane、Provider 和资源 admission；Capability 与 Domain Agent 没有共用一个全局并发槽；`ISOLATED` 与 `FENCE` 是当前两种 failure scope；READ 通常可并发，但最终仍以具体 ExecutionProfile 和资源声明为准。
 
 ---
 
-## 14. 这套设计解决了哪些具体问题
-
-到这里再讨论设计原因会更容易理解，因为每个机制已经有了明确位置。
-
-### 14.1 只用线程池会缺少调用语义
-
-线程池知道任务什么时候有 worker，却不知道 repository、workspace、approval、FailureScope 和模型调用顺序。ExecutionProfile 与 Coordinator 补上了这层 Harness 语义。
-
-### 14.2 只按 READ/WRITE 分类仍然太粗
-
-READ/WRITE 是 Capability 的访问级别；执行并发还要考虑 Provider 容量、具体逻辑资源、Agent 类型以及分类失败后的保守策略。ResourceClaims 提供了比单一 access level 更细的冲突表达。
-
-### 14.3 只按完成顺序写回会让上下文变得不稳定
-
-并发 worker 的完成顺序受网络、磁盘和调度影响。ordered commit 把这些不确定性隔离在 Run 阶段，AgentContext 仍然保持可重复解释的调用顺序。
-
-### 14.4 waiting 需要区分“执行完成”和“逻辑提交”
-
-一个后续调用可能已经跑完，但前面的审批调用让上下文暂停。`uncommitted_capability_results` 提供了中间承接点，使系统可以保存真实结果，同时守住 open call 的顺序。
-
-### 14.5 取消需要覆盖嵌套 Agent
-
-Agent 调 Agent 后会形成运行树。CancellationHandle 把 futures、资源等待者和 child handles 连接起来，使父任务停止时可以沿调用树传播取消信号。
-
----
-
-## 15. 复习时最容易混淆的概念
-
-| 容易混淆的说法 | 更准确的理解 |
-|---|---|
-| `CONCURRENT` 就会立刻并行 | 它只获得进入并发组的资格，后面还有 lane、provider 和 resource admission |
-| 所有并发共用一个全局槽位 | Capability 与 Domain Agent 当前使用不同线程池，Provider 还有各自的 semaphore |
-| group 已经检查 claims，运行时就不用再检查 | group 处理当前批次内部兼容性，ResourceClaimManager 还要协调跨 batch 与嵌套执行 |
-| worker 先完成，Agent 就先看到结果 | worker 结果先暂存，group 稳定后按原调用顺序 Commit |
-| approval 在 Prepare 时直接把 Agent 挂起 | 调度前会先收紧 profile；正式 pending/waiting 在 `approval_required` 结果被 ordered commit 时建立 |
-| FailureScope 有“调用 / group / batch”三档 | 当前实现只有 `ISOLATED` 与 `FENCE` 两档 |
-| cancel future 可以撤销已经发生的远端写 | cancellation 负责停止和收束运行工作，已经发生的外部副作用需要单独确认和恢复 |
-| READ 一定可以并发 | 当前 Provider 通常给 READ concurrent profile，但最终仍以 ExecutionProfile、claims 和 admission 为准 |
-
----
-
-## 16. 面试或复述时怎样讲这一章
-
-建议先画下面这条主线，再展开细节：
-
-```mermaid
-flowchart LR
-    A[Profile] --> B[Group]
-    B --> C[Prepare]
-    C --> D[Lane / Provider / Resource Admission]
-    D --> E[Run]
-    E --> F[Quiesce]
-    F --> G[Ordered Commit]
-```
-
-然后按三层解释：
-
-第一层讲**执行语义**：`ExecutionProfile = ConcurrencyMode + ResourceClaims + FailureScope`。
-
-第二层讲**并发落地**：连续兼容调用组成 group，Capability/Domain 有独立 lane，Capability 还有 provider semaphore，运行前统一申请资源。
-
-第三层讲**正确性收束**：group 先稳定，再按模型顺序 Commit；waiting 暂存未提交结果；FENCE 截断后续调用；cancellation tree 收束嵌套任务。
-
-一句话总结可以说：
-
-> GitAgent 把“能不能同时跑”和“什么时候算进入 Agent 逻辑历史”分成两层管理：安全的调用可以并发 Run，所有结果仍通过 group quiescence 与 ordered commit 按模型顺序进入 AgentContext。
-
----
-
-## 17. 代码定位
+## 14. 代码定位
 
 | 想核对的问题 | 主要位置 |
 |---|---|

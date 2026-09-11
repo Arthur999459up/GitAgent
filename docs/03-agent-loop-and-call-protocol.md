@@ -1,356 +1,250 @@
 # 03 Agent Loop 与调用协议：模型的一步决定怎样变成下一步状态
 
-上一章讲的是 Agent 之间怎样分工。这一章把镜头拉进一个 Agent 内部：**模型每推理一次以后，运行时到底怎样解析它的决定、执行调用、写回结果、创建子 Agent、进入等待，最后结束这一轮 Agent。**
+上一章讲的是 Agent 之间怎样分工。本章把镜头拉进一个 Agent 内部：模型每推理一次以后，运行时怎样解释它的决定、执行调用、写回结果、创建 child、进入 waiting，最后结束当前 Agent。
 
-这里先讲控制循环本身。具体工具权限在第 05 章，并发调度在第 06 章，审批恢复在第 08、09 章。
+这里先讲控制循环本身。模型消息格式放在第 04 章，具体 Capability 权限在第 05 章，并发调度在第 06 章，Approval 和跨进程恢复在第 08、09 章。
 
 ---
 
-## 1. 先看 Agent Loop 的基本形状
+## 1. Agent Loop 是一台显式状态机
 
-一个 Agent 运行起来以后，会反复执行“构造上下文 → 模型推理 → 解释结果 → 推进状态”。
+一个 Agent 运行以后，会反复执行“构造本轮模型输入 → 模型推理 → 解释结果 → 推进状态”。
 
 ```mermaid
 flowchart TD
     A[AgentContext] --> B[构造模型输入]
     B --> C[模型推理]
-    C --> D{响应类型}
-    D -->|文本结束| E[build_result]
-    D -->|CapabilityCall| F[执行 capability]
-    D -->|AgentCall| G[创建 child Agent]
-    D -->|等待| H[进入 waiting]
-    F --> I[把结果写回当前 Context]
-    G --> J[child 完成后写回父 Context]
+    C --> D{模型决定}
+    D -->|最终文本| E[构造 Agent 结果]
+    D -->|Capability 调用| F[交给 Harness 执行]
+    D -->|Child Agent 调用| G[创建 child]
+    D -->|等待用户| H[进入 waiting]
+    F --> I[结果提交回 Context]
+    G --> J[child 结果回父 Context]
     I --> B
     J --> B
-    H --> K[等待下一次用户输入]
 ```
 
-从 Agent Loop 自己的视角，它只认识几类“可推进的决定”：
+从 Loop 视角，模型只能产生几类会改变控制状态的决定：结束当前 Agent、调用 Capability、调用固定拓扑允许的 child Agent、等待用户。
 
-| 决定 | 含义 |
-|---|---|
-| 普通文本结束 | 当前 Agent 已经形成可交付结果 |
-| `CapabilityCall` | 要执行一个运行时能力 |
-| `AgentCall` | 要调用固定拓扑允许的子 Agent |
-| `WaitForUser` | 当前任务必须暂停，等待用户提供信息或授权 |
-
-模型返回的原始文本和 provider 格式会先被适配成这些内部对象，Agent Loop 再处理。
+模型 Provider 的原始响应不会直接驱动 Runtime，而是先被模型边界归一成这些内部决定。这样 Loop 不需要理解每个模型 SDK 的格式，也不会把任意自然语言当成运行指令。
 
 ---
 
-## 2. AgentContext 是 Loop 的“工作台”
+## 2. AgentContext 是 Loop 的运行工作台
 
-Agent Loop 不直接拿一串聊天消息工作，它围绕 `AgentContext` 维护当前运行。
+Agent Loop 不是只维护一串聊天消息。当前 Agent 还需要知道自己的身份、父调用、waiting、open calls、child 状态和已经产生的领域结果。
 
-可以先把 AgentContext 看成四类东西的集合。
-
-| 内容 | 作用 |
+| 状态 | 主要作用 |
 |---|---|
-| 身份 | 当前是什么 Agent、run_id、父调用是谁 |
-| 消息线程 | 模型已经看过哪些系统/用户/助手/工具消息 |
-| 控制状态 | 是否 waiting、有哪些 open calls、子 Agent 状态 |
-| 领域产物 | 当前任务已经得到哪些结构化事实或结果 |
+| Agent / run identity | 区分当前是哪一次 Agent 运行 |
+| 消息线程 | 保存模型已经看到的 assistant / tool 等消息 |
+| 父子调用关系 | 知道 child 来自父层哪一次 Agent call |
+| 控制状态 | open calls、waiting、steps、active children |
+| 领域产物 | Review、CandidatePatch、Verification 等已确认结果 |
 
-例如 PR Agent 的 Context 里可能已经有当前 PR 证据和 code review；Coding patch Context 里可能有 ChangeRequest、工作区状态和验证结果。
+例如 PR Agent 的 Context 可以已经有 PR metadata 和 code review；Coding patch Context 还会关联当前 Coding Workspace 和验证状态。
 
-这些数据不是都塞进下一次 Prompt。下一次模型真正看到什么，还会由上下文构建器按规则投影。AgentContext 是运行时状态，model messages 是它面向模型的一种视图。
+这些内容并不会全部转成 Prompt。AgentContext 是 Runtime 的完整状态，model messages 只是它面向模型的一种视图。第 04 章会继续解释模型真正看到什么。
 
 ---
 
-## 3. 第一次启动和后续继续使用同一条推进逻辑
+## 3. start、工具返回、child 返回和 resume 最终回到同一条推进逻辑
 
-一个新的 Agent 被创建以后，Loop 会初始化必要状态并进入推进过程。后续工具执行完成、child Agent 返回，或者用户从等待中恢复，本质上都要回到同一个问题：
-
-> 现在这个 Context 已经拥有了哪些新事实，下一步还能不能继续推理？
-
-因此 Agent Loop 的核心是一台显式状态机，“调用一次 LLM”只是其中一个推进步骤。不同入口最终都回到 `_advance` 这一类推进逻辑中。
+新 Agent 第一次启动、Capability 执行完、child 返回，或者用户从 waiting 中恢复，看起来入口不同，但本质都在回答同一个问题：**当前 Context 已经多了哪些新事实，现在下一步是什么。**
 
 ```mermaid
 flowchart LR
-    S[start] --> A[advance]
-    R[resume] --> A
-    U[resume_user_input] --> A
-    T[工具结果提交] --> A
-    C[child Agent 完成] --> A
+    S[start] --> A[推进 Context]
+    T[工具结果已提交] --> A
+    C[child 已完成] --> A
+    R[从 waiting 恢复] --> A
+    A --> M[需要时再次调用模型]
 ```
 
-这样启动、工具返回和恢复不用各自实现一套不同的“下一步算法”。
+这样不同入口不用分别实现一套“接下来怎么办”的算法。Loop 始终围绕同一个 Context 状态推进，waiting 和恢复只是状态机的不同入口，而不是另一套工作流。
 
 ---
 
-## 4. 模型响应先变成 StructuredCall
+## 4. 模型工具调用先归一成带稳定身份的 Structured Call
 
-模型可能返回文本，也可能返回一项或多项工具调用。运行时会先把工具调用归一成内部 `StructuredCall`，至少保留：
+模型一轮可以返回普通文本，也可以提出一个或多个 tool call。工具调用会先被整理成内部 Structured Call，至少保留稳定 call identity、调用名称和参数对象。
 
-- `call_id`；
-- 调用名称；
-- 参数对象。
-
-这里的 `call_id` 不是装饰字段。它是后面把“助手提出的调用”和“对应工具结果”闭合起来的身份。
+call identity 是整个工具协议的连接点：assistant message 里的调用、Harness 真正执行的动作、后续 tool result 都使用同一个身份。
 
 ```mermaid
 sequenceDiagram
     participant M as Model
     participant L as Agent Loop
-    participant T as Tool
-    M->>L: call_id = c17, 调用 A
-    L->>T: 执行 A
-    T-->>L: 结果
+    participant X as Runtime
+
+    M->>L: call c17
+    L->>X: 执行 c17
+    X-->>L: c17 的真实结果
     L-->>M: tool result for c17
 ```
 
-如果恢复以后把这个调用重新编号，模型历史里的工具协议就会断开。因此调用身份从响应归一、消息持久化到恢复都要保持稳定。
+如果恢复时给旧调用重新编号，模型历史中的 assistant call 和 tool result 就无法配对。因此这个身份会贯穿响应归一、消息持久化、Execution 和恢复。
 
 ---
 
-## 5. Loop 怎样判断这是 Capability 还是 Child Agent
+## 5. Loop 怎样区分 Capability Call 和 Agent Call
 
-结构化调用进入 Agent Loop 后，会根据当前 Agent 可见的命名和 schema 判断它属于哪类调用。
+结构化调用进入 Loop 后，会根据当前 Agent 允许的调用集合判断它属于哪一类。
 
-### Capability 调用
+Capability Call 表示读取文件、查询 PR、运行测试、加载 Skill 等 Runtime 能力，后续交给 Dispatcher 和 Execution。
 
-例如读取文件、查询 PR、执行验证、加载 Skill。Loop 会把它交给 Harness 的 structured call dispatcher 和 execution 层。
+Agent Call 表示父 Agent 想调用固定拓扑中的 child，例如 Main → Repository、PR → Coding。Loop 会先验证这条父子关系是否合法，再创建新的 child Context。
 
-### Agent 调用
-
-例如 Main 调 Repository，PR 调 Coding。Loop 会先验证当前父 Agent 是否真的允许创建这个 child，再建立新的 AgentContext。
-
-这种区分很重要：Agent 调用不是普通 provider 工具的另一种名字。它意味着创建一段新的子运行、独立消息线程和返回产物。
+这两个调用虽然在模型侧都可以表现成结构化 function call，但 Runtime 含义不同：Capability 访问某个 Provider；Agent Call 会启动一段新的 Agent run、独立消息线程和结构化结果生命周期。
 
 ---
 
-## 6. 一批模型调用怎样进入执行阶段
+## 6. 一批调用的逻辑生命周期是 Prepare → Run → Commit
 
-模型一次可以返回多个调用。Agent Loop 会先把整批调用准备好，再统一交给执行协调器处理，避免把每类调用写成独立硬编码分支。
-
-可以把一次 batch 理解成三步：
+模型一次可以提出多个调用。Agent Loop 不会简单按列表逐个直接执行，而是把当前 batch 交给统一执行协议。
 
 ```mermaid
 flowchart LR
-    A[模型调用批次] --> P[Prepare]
+    A[模型调用 batch] --> P[Prepare]
     P --> R[Run]
     R --> C[Commit]
 ```
 
-### Prepare
+Prepare 先把调用身份、目标、参数、权限和执行描述整理好；如果某些失败已经可以在执行前确定，就形成结构化结果，不再访问真实 Provider。
 
-此时检查调用身份、能力是否存在、输入是否符合结构、权限是否允许，以及这项调用属于什么执行类型。
+Run 才真正访问 Provider、工作区或 child Agent。安全且资源兼容的调用可以并发，因此物理完成顺序可能和模型原顺序不同。
 
-### Run
+Commit 负责把结果按模型原始顺序写回 AgentContext，闭合对应 call，并更新依赖逻辑顺序的状态。
 
-真正访问 provider、创建 child Agent 或执行本地动作。互不冲突的调用可以在这里并行。
-
-### Commit
-
-把结果按模型原始调用顺序写回 AgentContext，闭合对应 `call_id`，并更新依赖逻辑顺序的状态。
-
-详细的并发和资源管理放到第 06 章。本章只需要记住：**Agent Loop 负责模型调用的逻辑生命周期，不把“线程返回了”直接等同于“Context 已经接受这个结果”。**
+详细的 ResourceClaims、execution group、provider semaphore 和 ordered commit 算法在第 06 章。本章只需要抓住一点：**worker 完成只代表物理执行结束，不代表结果已经进入 Agent 的逻辑历史。**
 
 ---
 
-## 7. open tool call 为什么必须被闭合
+## 7. 每个 open call 最终都必须闭合
 
-模型消息中一旦出现工具调用，后面的上下文就需要一个与 call_id 对应的 tool result。否则下一次发送给模型的消息协议是不完整的。
+模型消息中一旦出现 tool call，后续消息协议就需要一个对应的 tool result。否则下一轮模型看到的历史是不完整的。
 
-GitAgent 因此维护 open tool calls。每项调用最终要落入一种终止结果：
+因此已经出现的调用不能因为失败、取消或等待就从历史里直接删掉。它最终需要落入一种可解释状态：成功结果、结构化失败、取消结果，或者被正式保存为可恢复的等待状态并在后续继续闭合。
 
-- 成功结果；
-- 结构化失败；
-- 取消结果；
-- 进入受支持的等待状态，并在恢复后继续闭合。
+这也是为什么取消一个 future 还不够。执行器可以阻止尚未开始的物理工作，但 Agent Loop 仍要给已经出现在 assistant message 中的 call 一个逻辑终态。
 
-不能简单删除一个已经出现在 assistant message 里的调用，因为那会让持久历史与运行事实不一致。
-
-这也是为什么取消剩余 batch 不能只 `future.cancel()`：逻辑协议还需要一个可解释的终止记录。
+open call protocol 同时服务三件事：保证下一轮模型消息合法；让并发结果知道应该写回哪里；让恢复时可以证明哪些动作仍未完成。
 
 ---
 
-## 8. 子 Agent 调用怎样创建、等待和返回
+## 8. Child Agent 调用怎样创建和返回
 
-父 Agent 提出一个 child Agent 调用以后，Loop 会创建新的 AgentContext，并记录父 `call_id`。父任务会等待 child 得到结果。
+父 Agent 提出 child call 后，Loop 创建新的 AgentContext，并保存父 run 和父 call 的关联。child 可以在自己的线程里经历很多轮模型和 Capability 调用，但对父层来说，这一整段最终仍然对应原来的一次 Agent call。
 
 ```mermaid
 sequenceDiagram
     participant P as Parent Agent
-    participant L as Agent Loop
+    participant L as Loop
     participant C as Child Agent
-    P->>L: AgentCall(call_id=c8)
-    L->>C: 创建 child context
-    C-->>L: AgentResult
-    L-->>P: tool result for c8 + 结构化产物迁移
+
+    P->>L: Agent call c8
+    L->>C: 创建独立 child Context
+    C-->>L: AgentResult + 结构化产物
+    L-->>P: 闭合 c8，并迁移结果
 ```
 
-child 内部可以有很多轮模型和工具调用，但对父 Agent 来说，这一整段最终对应它原来的一次 `AgentCall`。
+返回父层时通常有两部分：一部分作为原 Agent call 的 tool result 回到父消息线程；另一部分是 Review、CandidatePatch 等结构化产物，被迁移到父 Context 的业务状态，供后续确定逻辑使用。
 
-如果 child 自己进入 waiting，等待状态会沿 Agent 树暴露出来。父层不能假装 child 已经完成。
+如果 child 自己进入 waiting，它仍然是 active child，父层不能把 c8 当成已完成。waiting 会沿树暴露到上层，让应用找到真正暂停的位置。
 
 ---
 
-## 9. waiting 是 Agent Loop 的正式状态，不是“暂时没返回”
+## 9. Waiting 是可持久化的控制状态，不是线程阻塞
 
-有些任务必须等用户，例如远端写审批、Issue 草稿确认，或者模型明确需要缺失信息。
-
-GitAgent 会把这种情况转换成 `WaitForUser`，并进入 waiting 状态。
+远端写审批、Issue 草稿确认，或者模型明确缺少必要信息时，当前 Agent 会进入 Wait For User 状态。
 
 ```mermaid
 stateDiagram-v2
     [*] --> Running
-    Running --> Waiting: WaitForUser
-    Waiting --> Running: 用户输入通过 resume_user_input
-    Running --> Completed: AgentResult
+    Running --> Waiting: 需要用户输入
+    Waiting --> Running: 新 Turn 恢复
+    Running --> Completed: 结果满足结束条件
     Running --> Failed: 不可恢复失败
     Running --> Cancelled: 取消
 ```
 
-waiting 有几个特征：
+waiting 有几个重要性质：当前 Agent 还没有完成；关联的 call identity 仍然存在；Runtime 知道具体哪个 Context 在等；下一条用户输入应该回到这个节点，而不是重新路由成无关任务；必要控制状态可以跨 Turn、跨进程保存。
 
-1. 当前 Agent 没有完成；
-2. 当前 open call 的身份仍然存在；
-3. 运行时知道是哪一个 context 在等待；
-4. 下次用户输入应该回到这个 context，而不是重新路由成无关任务；
-5. 进程退出时可以保存必要控制状态，在重启后重建。
-
-所以“等待用户”是一种业务控制点，而不是让线程一直阻塞在内存里。
+所以等待并不意味着保留一个线程几小时。上一 Turn 可以正常结束，Session 保存暂停控制树；用户下一次输入再创建新 Turn，从这个控制点继续。持久化细节在第 09 章展开。
 
 ---
 
-## 10. 为什么一批调用里出现等待后，还要处理其他已启动调用
+## 10. Waiting 出现在 batch 中间时，为什么不能立刻截断所有状态
 
-假设模型一次提出三个独立调用：A、B、C。其中 B 触发审批等待，而 A 和 C 已经开始执行。
+假设一个 batch 里有 A、B、C，B 在逻辑提交时触发 Approval waiting，而 A、C 的物理工作可能已经开始甚至完成。如果系统一看到 B waiting 就丢掉整个 batch，会产生几个问题：已经完成的结果没有合法去处；某些读取已经访问外部系统但历史中没有终态；恢复以后还可能重复执行本来已经跑过的调用。
 
-运行时不能简单在 B 进入 waiting 时把整个进程状态截断，否则可能出现：
+因此 Loop 和 Execution 会先让当前 group 收束到稳定边界，再按模型顺序 Commit。B 进入 waiting 后，后面已经执行但还不允许提交的结果可以保存成“未提交结果”，恢复后继续按 open call 顺序处理，而不是重新执行。
 
-- A 已经完成但结果没有提交；
-- C 产生了真实读取但协议中没有对应结果；
-- 恢复后又重复运行本来已经执行过的动作。
-
-因此 Loop 与 Execution 层会区分已经启动、已经完成、尚未开始和被取消的调用，并确保 open protocol 被妥善收束。等待点保存的是一个一致的控制状态，而不是线程池某一瞬间的随机截图。
-
-具体怎样按 group 和 commit 顺序处理，第 06 章会展开。
+这部分真正的 group quiescence、suspend 和 ordered commit 细节放在第 06 章。Loop 关心的是等待点必须对应一个一致的逻辑状态，而不是线程池某一瞬间的随机截图。
 
 ---
 
-## 11. Agent 怎样正常结束
+## 11. 模型说“完成”以后，Agent 仍要满足自己的结束条件
 
-模型给出最终文本且没有结构化调用时，Agent 仍要检查自己的结束条件，最终文本本身不能直接代表所有工作流已经完成。
+模型返回最终文本且没有结构化调用时，只表示“模型想结束这一轮”。当前 Agent 是否真的允许结束，还要由自己的结果构造逻辑判断。
 
-当前 Agent 的 `build_result` 仍会根据自己的业务类型形成结果。某些任务还要求专用结构化产物已经存在。
+例如 Coding review 需要形成可用 Review 结构；patch 模式还要求真实工作区已经产生有效修改，并且当前 revision 的验证状态满足 finalization 门槛。领域 Agent 也可能需要特定业务产物才能形成规定结果。
 
-例如 Coding Agent 的 review 模式需要可用的 `CodeReviewResult`；patch 模式更严格，最终结束动作还需要当前工作树满足修改和验证门槛。
-
-因此存在两种不同层次：
-
-- 模型表达“我想结束”；
-- 当前 Agent 的运行状态“允许结束，并且能形成规定结果”。
-
-模型不能用一句“已完成”伪造缺失的控制产物。
+因此有两个不同层次：模型表达“我完成了”；Runtime 判断“当前状态确实足以构造这个 Agent 规定的结果”。模型不能用一句自然语言绕过缺失的 CandidatePatch、Verification 或其他结构化业务状态。
 
 ---
 
-## 12. 结构化输出错误怎样重新回到模型
+## 12. 模型结构化错误怎样回到 Loop
 
-模型可能调用了不存在的函数、参数格式不对，或者需要专用结果时没有按契约返回。对于允许模型纠正的结构问题，运行时会形成明确反馈，让 Agent 在步数预算内再次推理。
+模型可能调用不存在的函数、参数结构错误，或者在需要机器可消费结果时没有按约定返回。对于允许纠正的模型协议错误，Runtime 会形成明确 observation，让模型在有限重试预算内重新表达。
 
-这与 provider 网络重试不同：
+这和 Provider 网络 retry 不是同一件事：Provider retry 是同一次外部请求是否再次尝试；结构化纠错会把错误写回消息线程，产生新的模型 step，因此属于 Agent Loop 的状态推进。
 
-- provider 网络重试是“同一次模型请求在传输层是否重新尝试”；
-- 结构化纠错是“模型收到运行时反馈后，再进行一次新的语义决定”。
-
-Agent Loop 关心的是后者，因为它改变了消息和推理步骤。
+把两者分开以后，模型格式错误不会被误处理成底层工具重放，底层网络故障也不需要让模型每次重新思考同一个语义决定。
 
 ---
 
-## 13. cancel 怎样沿 Agent 树传播
+## 13. Cancellation 怎样沿调用树收束
 
-如果当前会话被取消，不能只终止最外层 Agent。已经启动的 child 和未稳定提交的执行都需要一起处理。
+取消当前任务时，不能只停止最外层 Agent。已经启动的 child 和当前 batch 中未稳定提交的工作也要一起处理。
 
 ```mermaid
-flowchart TD
+flowchart LR
     P[父 Context 取消] --> H[Execution cancellation scope]
-    H --> C1[取消未完成 capability]
-    H --> C2[取消活动 child Agent]
-    C2 --> C3[继续向下传播]
-    H --> R[为 open calls 形成取消终态]
+    H --> C[未完成 Capability]
+    H --> A[活动 child Agent]
+    A --> D[向更深 child 传播]
+    H --> R[open calls 形成取消终态]
 ```
 
-这里的“取消”主要是运行时协作式收束。对于已经在外部系统发生的副作用，取消不能把时间倒回去。因此高风险写操作还需要第 08 章的审批和副作用语义约束。
+这是一种协作式收束。尚未开始的 future 可以取消，等待资源的调用可以被唤醒停止，child cancellation 可以沿树传播；但已经发送给外部系统的写请求可能已经产生副作用，取消不能把它撤回。
+
+所以 cancellation 解决“停止继续运行和闭合协议”，高风险副作用是否允许发生、失败后能否安全重试，仍由第 08、09 章的 Approval 和 mutation recovery 负责。
 
 ---
 
-## 14. 一次 Repository explain 怎样完整走过 Loop
+## 14. 为什么 Agent Loop 要做成显式状态机
 
-用户问：“解释一下缓存失效逻辑。”Main 已经把任务交给 Repository Agent。
+前面先看了 Loop 怎样工作，现在再讨论设计原因。
 
-**第一轮推理**：Repository Agent 发现需要代码语义分析，于是提出 Coding Agent explain 调用。
+Agent 不是一次性模型请求。真实任务会同时出现多轮 tool call、child Agent、并发 batch、用户等待、取消和跨进程恢复。如果实现只是一段“模型想调工具就继续 while”的隐式循环，运行时很快会失去几个关键事实：哪次调用还没闭合、child 属于哪个父 call、当前真正等待的是谁、恢复以后该把下一条输入交到哪里。
 
-**创建 child**：Loop 验证 Repository 可以调用 Coding，创建 Coding AgentContext，并把父 call_id 绑定上。
+GitAgent 把这些事实显式放进 AgentContext，并把模型决定限制成少数可识别状态迁移。call identity 连接 assistant call 和真实结果；child 使用独立 Context；waiting 是正式状态；每项 open call 都必须获得终态；工具执行和逻辑 Commit 分离。
 
-**Coding 第一轮推理**：模型提出搜索和文件读取。它们被归一成多个 StructuredCall。
+这让并发、压缩和恢复可以围绕同一套协议工作，而不是依赖某个线程“恰好执行到哪一行”。代价是 Loop 要维护更多身份和状态校验，但换来的核心性质是：**模型的推理路径可以开放，模型对 Runtime 造成的状态变化仍然有限、可检查、可恢复。**
 
-**执行 batch**：工具调用经过 prepare/run/commit，结果按原 call_id 写回 Coding 的消息线程。
-
-**Coding 第二轮推理**：模型基于证据提交结构化 explanation 结果，Coding Agent `build_result` 成功。
-
-**返回父层**：Loop 把 Coding 的自然语言结果闭合到父 call_id，同时把 `CodeExplanationResult` 迁移进 Repository 上下文。
-
-**Repository 再推理**：现在它已经拿到代码解释，可以补充领域上下文并结束。
-
-**Main 收束**：Repository 的结果再回到 Main 的原 AgentCall，Main 形成最终会话回答。
-
-这条链说明：每一层都可以有自己的 Loop，但父子关系依靠稳定调用身份和结构化结果连接起来。
+几个边界也由此变得清楚：Agent Loop 不等于单纯循环调 LLM；worker 完成不等于 Context 已提交；waiting 不等于线程阻塞；最终文本不一定满足 Agent 结束条件；cancel 也不能撤销已经发生的远端写。
 
 ---
 
-## 15. STAR 复盘：为什么 Agent Loop 要做成显式状态机
-
-### S — Situation
-
-Agent 不是一次性 LLM 请求。一次任务可能包含多轮工具、多个 child Agent、并行调用、审批等待和进程恢复。如果只写成“while 模型还想调工具就继续”的简单循环，工具协议、父子关系和暂停状态很快会变成隐式状态。
-
-### T — Task
-
-运行时需要明确知道每次调用是谁提出的、有没有闭合、哪个 Agent 正在等待、恢复后从哪里继续，以及取消时哪些子任务属于同一棵运行树。
-
-### A — Action
-
-GitAgent 用 AgentContext 持有运行状态，用 StructuredCall 和 call_id 表示模型动作，用固定 CapabilityCall / AgentCall / WaitForUser 路径推进；工具调用经过 prepare/run/commit；child 使用独立 context；waiting 成为正式状态；每项 open call 都必须有可解释终态。
-
-### R — Result
-
-这样恢复、压缩和并发都可以围绕显式协议工作，而不必猜某个线程执行到哪一行。代价是 Loop 需要维护更多状态检查，结构化错误也必须被妥善闭合。
-
-核心收益可以概括成：**模型推理仍然是开放式的，但模型每一步对运行时造成的状态变化是有限、可识别和可恢复的。**
-
----
-
-## 16. 这一章最容易混淆的地方
-
-| 误解 | 正确理解 |
-|---|---|
-| Agent Loop 就是 `while` 调 LLM | 不够。它还维护 call_id、open protocol、child、waiting、cancel 和结果构造 |
-| 工具线程完成后 Context 就立刻变化 | 不一定。物理执行和有序 commit 分开 |
-| waiting 等于线程阻塞 | 不是。它是可持久化的控制状态 |
-| 模型写了最终答案就一定结束 | 不一定。Agent 的结构化结果和业务结束条件仍要满足 |
-| cancel 能撤销已发生的远端写 | 不能。取消只能收束未完成执行，副作用要靠更早的安全协议控制 |
-
----
-
-## 17. 复习时怎样讲这一章
-
-推荐从一句话开始：
-
-> Agent Loop 把模型输出限制成几类可识别的状态迁移：结束、调用 capability、调用 child Agent、等待用户。每个调用都有稳定 call_id，执行结果必须闭合原调用；等待和恢复只是同一状态机的不同入口。
-
-然后用 Repository explain 的七步例子说明父子 Agent 和工具调用怎样嵌套即可。
-
-## 18. 代码定位
+## 15. 代码定位
 
 | 想核对的问题 | 主要位置 |
 |---|---|
 | Loop 的 start / resume / advance / waiting | `gitagent/agent_loop/loop.py` |
-| StructuredCall、AgentCall、CapabilityCall、WaitForUser | `gitagent/agent_loop/models.py` |
-| AgentContext 和 open tool calls | `gitagent/harness/context/state.py` |
+| Structured Call、Agent Call、Capability Call、Wait For User | `gitagent/agent_loop/models.py` |
+| AgentContext 与 open tool calls | `gitagent/harness/context/state.py` |
 | 结构化调用分派 | `gitagent/harness/structured_call_dispatcher.py` |
 | 父子 Agent 结果迁移 | `gitagent/agent_loop/loop.py`、各 `gitagent/agents/*.py` |
 

@@ -524,123 +524,23 @@ Classifier 只产生 `WorkflowTurnDecision`，说明用户当前更接近批准�
 
 ---
 
-## 12. 用一个完整例子把 Application、Config 和 Prompt 串起来
+## 12. 为什么应用装配、Session Service 和 Prompt 要保持这些边界
 
-假设用户启动 GitAgent，选择仓库以后输入：**“Review PR #45，先把 review 内容给我看。”**
+前面已经先走完配置加载、Application 装配、Session 切换、Turn 入口和 Prompt 使用，现在再看这些边界为什么要这样划分。
 
-### 阶段一：启动
+进程级基础设施尽量共享，是因为模型客户端、GitHub Client、SQLite/Event Log、Trace、Memory Store/Search 和 Context Builder 的生命周期并不依赖某个具体 Session。Session Service 则绑定当前账户、仓库和 Session scope，同时持有 Harness、Capability Layer 和 Agent 集合；切换 Session 时重新建立这层运行对象，可以避免旧 Session 的临时审批、Capability 状态或 Agent Context 继续接收新工作。
 
-CLI 读取指定的 `config.json`。
+Service 与持久化 Session 也必须分开。Service 是当前进程里的可重建对象，Session 的 Event History 和等待控制状态则可以跨 Service、跨进程存在。因此异常后重建 Service 不等于丢掉用户会话，恢复逻辑仍然可以从持久状态重组 Runtime。
 
-`RuntimeConfig` 检查字段、执行参数和路径，把相对存储路径解析成绝对路径。
+配置来源也故意分层：`config.json` 保存部署和运行参数；`capabilities.yaml` 保存应用自身的 Capability 定义和 Agent 权限策略；Prompt Markdown 保存模型行为指导。把它们混成一个总配置文件会让“部署时经常变化的参数”和“应用版本携带的可信策略资源”失去边界。
 
-`build_live_application` 校验 Prompt Library，创建模型、GitHub、State、Event、Trace、Memory 和 ContextBuilder，最后得到 `LiveApplication`。
+Prompt 只负责帮助模型理解角色、任务和自然语言，不承担真正安全边界。Schema 负责机器可解析结构，Capability/Approval/Workspace 等 Runtime Guard 决定动作是否有执行资格。Approval Intent Classifier 也是同样原则：模型可以判断用户回复更像 approve、reject 还是 revise，但它不能因此直接获得远端写权限。
 
-### 阶段二：进入 Session
-
-CLI 先通过 GitHub Token 确认当前账户，再让用户选择或创建 Session。
-
-Application 根据账户和仓库生成 scope，先准备绑定该 scope 的新 `GitAgentService`。准备成功后，当前 Application 切换到这个 Service，并使旧 Service 失效。
-
-### 阶段三：创建 Turn 和模型上下文
-
-用户输入到达 `LiveApplication.handle`。
-
-Application 先读取已有 `agent_context`，确认当前没有需要恢复的 waiting 节点，然后创建新 Turn。
-
-接着检索与这次任务相关的 Memory，取出 `system.main`，加入当前仓库和 Memory，准备 Main Agent 当前可见工具，交给 `ContextBuilder` 形成最终上下文。
-
-### 阶段四：Main 路由到 PR Agent
-
-`GitAgentService` 发现没有可恢复 Runtime，于是启动 Main Agent。
-
-Main Agent 根据 system 规则、用户目标和当前可见 Agent tool，把完整 PR 任务委派给 Pull Request Agent。
-
-PR Agent 再根据自己的 System Prompt、任务 Prompt、Capability 和运行时状态完成证据收集与 review 草稿生成。
-
-### 阶段五：进入 waiting
-
-由于用户要求先看 review 内容，工作流会停在需要用户确认的位置。Service 保存当前 Agent Runtime Context，并返回可展示结果。
-
-Application 通过 Projection 整理输出，完成当前 Turn。
-
-### 阶段六：用户回复“可以，发吧”
-
-这条输入再次进入同一个 `LiveApplication.handle`。
-
-Application 发现 Session 里已有 waiting Agent，新的 Turn 会继续这棵运行树。Service 读取保存 Context，把用户回复交给 Approval Intent Classifier。
-
-Classifier 使用 Approval Prompt 理解“可以，发吧”对应 approve。随后 Service 恢复原 Proposal 的执行流程，运行时审批和 Capability 机制继续检查真正的调用资格。
-
-这个例子把本章三个主题连成了一条线：
-
-**Config 决定运行环境 → Application 负责生命周期和 Session → Prompt 帮模型理解当前角色与语言 → Runtime 继续掌握实际执行协议。**
+当前实现还有几个明确取舍：`PromptLibrary` 是进程级缓存，运行期间修改模板不会自动热加载；Session 切换需要重建 Service、Harness 和 Capability Layer；Application composition root 因而会承担较多依赖装配和生命周期协调。换来的好处是每类对象何时共享、何时重建、谁是持久事实来源都比较明确。
 
 ---
 
-## 13. 这一层的设计取舍
-
-前面的运行链已经体现出一个核心取舍：进程级基础设施尽量共享，Session 相关 Runtime 按 scope 重建。这样可以让模型客户端、GitHub、Persistence、Trace、Memory 等基础设施稳定复用，同时让 Harness、Capability Layer 和 Agent 集合跟随当前 Session 切换，旧 Session 的事件和 waiting Context 仍由持久层保存。
-
-这套组织方式也有成本。`bootstrap.py` 和 `LiveApplication` 会承担较多依赖装配与生命周期协调；Session 切换需要重新创建 Service、Harness 和 Capability Layer；`PromptLibrary` 使用进程级缓存，模板文件在进程运行期间修改后不会自动热加载。Prompt 适合承担模型行为指导，真实权限和副作用资格继续由 Schema、Capability、Approval 等运行时机制控制。
-
----
-
-## 14. 复习时最容易混淆的几个边界
-
-| 容易混淆的概念 | 应该怎样理解 |
-|---|---|
-| `config.json` 与 `capabilities.yaml` | 前者提供运行参数，后者是应用携带的 Capability 策略资源 |
-| Application 与 Session Service | Application 共享基础设施，Service 绑定当前 Session 运行环境 |
-| Service 与持久化 Session | Service 可以重建，Session 的事件和保存 Context 可以继续存在 |
-| Prompt 与 Schema | Prompt 帮助模型理解，Schema 约束机器可解析结构 |
-| Prompt 与 Runtime Guard | Prompt 提供行为指导，Runtime Guard 决定真实动作是否具备执行资格 |
-| System Prompt 与历史消息 | System 内容按当前版本重新构造，历史事实来自 Session Event History |
-| Approval Intent 与 Approval 权限 | Intent Classifier 理解用户语言，运行时审批机制继续管理精确 Proposal |
-| CLI 与业务 Runtime | CLI 负责输入输出和选择操作，核心请求仍进入 `LiveApplication` / `GitAgentService` |
-
----
-
-## 15. 一张图复习整章
-
-```mermaid
-flowchart TD
-    CONFIG[config.json] --> RC[RuntimeConfig / ExecutionConfig]
-    RC --> BOOT[build_live_application]
-
-    PROMPTS[gitagent/prompts/*.md] --> PL[PromptLibrary]
-    CAPS[capabilities.yaml] --> CL[CapabilityLayer builder]
-
-    PL --> BOOT
-    BOOT --> APP[LiveApplication]
-    BOOT --> SHARED[共享 LLM / GitHub / Persistence / Trace / Memory]
-    SHARED --> APP
-
-    APP --> SCOPE[Account + Repository + SessionScope]
-    SCOPE --> PREP[_prepare_service]
-    CL --> PREP
-    PREP --> SVC[GitAgentService]
-    SVC --> H[AgentHarness]
-    H --> AGENTS[Main / Domain / Coding]
-
-    APP --> TURN[Start Turn]
-    TURN --> CTX[ContextBuilder]
-    PL --> CTX
-    CTX --> SVC
-
-    SVC --> RUN{新运行 / 恢复}
-    RUN --> OUT[ServiceResult]
-    OUT --> PROJ[Projection]
-    PROJ --> SAVE[Complete Turn / Working State]
-```
-
-如果只记一句话，可以记成：
-
-**RuntimeConfig 先把外部运行参数整理干净，build_live_application 再创建进程级基础设施；用户进入 Session 后，LiveApplication 为当前 scope 建立 Session Service；每个 Turn 由 Application 组织当前历史、Prompt、Memory 和工具，再交给 Service 启动或恢复 Agent Runtime。**
-
----
-
-## 16. 代码定位：理解完设计后再回源码核对
+## 13. 代码定位：理解完设计后再回源码核对
 
 | 想核对的设计 | 主要位置 |
 |---|---|
